@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package hubfuse;
+
+option go_package = "github.com/ykhdr/hubfuse/proto";
+
+service HubFuse {
+  // Unauthenticated — first-time device registration
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc UpdateShares(UpdateSharesRequest) returns (UpdateSharesResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+
+  // Server-streaming: push events to the agent
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+
+  rpc RequestPairing(RequestPairingRequest) returns (RequestPairingResponse);
+  rpc ConfirmPairing(ConfirmPairingRequest) returns (ConfirmPairingResponse);
+}
+
+// ─── Common types ────────────────────────────────────────────────────────────
+
+message Share {
+  string alias = 1;
+  string permissions = 2;           // "ro" | "rw"
+  repeated string allowed_devices = 3; // device_id or "all"
+}
+
+message DeviceInfo {
+  string device_id = 1;
+  string nickname = 2;
+  string ip = 3;
+  int32 ssh_port = 4;
+  repeated Share shares = 5;
+}
+
+// ─── Join ────────────────────────────────────────────────────────────────────
+
+message JoinRequest {
+  string device_id = 1;
+  string nickname = 2;
+}
+
+message JoinResponse {
+  bool success = 1;
+  string error = 2;
+  bytes client_cert = 3;
+  bytes client_key = 4;
+  bytes ca_cert = 5;
+}
+
+// ─── Register ────────────────────────────────────────────────────────────────
+
+message RegisterRequest {
+  repeated Share shares = 1;
+  int32 ssh_port = 2;
+  int32 protocol_version = 3;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string error = 2;
+  repeated DeviceInfo devices_online = 3;
+}
+
+// ─── Rename ──────────────────────────────────────────────────────────────────
+
+message RenameRequest {
+  string new_nickname = 1;
+}
+
+message RenameResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ─── Heartbeat ───────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {}
+
+message HeartbeatResponse {
+  bool success = 1;
+}
+
+// ─── UpdateShares ────────────────────────────────────────────────────────────
+
+message UpdateSharesRequest {
+  repeated Share shares = 1;
+}
+
+message UpdateSharesResponse {
+  bool success = 1;
+}
+
+// ─── Deregister ──────────────────────────────────────────────────────────────
+
+message DeregisterRequest {}
+
+message DeregisterResponse {
+  bool success = 1;
+}
+
+// ─── Subscribe / Events ──────────────────────────────────────────────────────
+
+message SubscribeRequest {
+  string device_id = 1;
+}
+
+message Event {
+  oneof payload {
+    DeviceOnlineEvent device_online = 1;
+    DeviceOfflineEvent device_offline = 2;
+    SharesUpdatedEvent shares_updated = 3;
+    PairingRequestedEvent pairing_requested = 4;
+    PairingCompletedEvent pairing_completed = 5;
+  }
+}
+
+message DeviceOnlineEvent {
+  string device_id = 1;
+  string nickname = 2;
+  string ip = 3;
+  int32 ssh_port = 4;
+  repeated Share shares = 5;
+}
+
+message DeviceOfflineEvent {
+  string device_id = 1;
+  string nickname = 2;
+}
+
+message SharesUpdatedEvent {
+  string device_id = 1;
+  repeated Share shares = 2;
+}
+
+message PairingRequestedEvent {
+  string from_device_id = 1;
+  string from_nickname = 2;
+}
+
+message PairingCompletedEvent {
+  string peer_device_id = 1;
+  string peer_public_key = 2;
+}
+
+// ─── RequestPairing ──────────────────────────────────────────────────────────
+
+message RequestPairingRequest {
+  string to_device = 1;
+  string public_key = 2;
+}
+
+message RequestPairingResponse {
+  string invite_code = 1;
+}
+
+// ─── ConfirmPairing ──────────────────────────────────────────────────────────
+
+message ConfirmPairingRequest {
+  string device_id = 1;
+  string invite_code = 2;
+  string public_key = 3;
+}
+
+message ConfirmPairingResponse {
+  bool success = 1;
+  string error = 2;
+  string peer_public_key = 3;
+}

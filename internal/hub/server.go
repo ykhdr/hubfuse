@@ -1,0 +1,204 @@
+package hub
+
+import (
+	"context"
+	"log/slog"
+	"net"
+
+	"github.com/ykhdr/hubfuse/internal/common"
+	pb "github.com/ykhdr/hubfuse/proto"
+	"google.golang.org/grpc/peer"
+)
+
+// Server implements the gRPC HubFuse service.
+type Server struct {
+	pb.UnimplementedHubFuseServer
+	registry *Registry
+	logger   *slog.Logger
+}
+
+// NewServer creates a new Server backed by the given Registry.
+func NewServer(registry *Registry, logger *slog.Logger) *Server {
+	return &Server{
+		registry: registry,
+		logger:   logger,
+	}
+}
+
+// Join handles first-time device registration. It does not require
+// authentication — the client will receive a signed cert it can use for
+// subsequent calls.
+func (s *Server) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
+	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname)
+	if err != nil {
+		return &pb.JoinResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &pb.JoinResponse{
+		Success:    true,
+		ClientCert: certPEM,
+		ClientKey:  keyPEM,
+		CaCert:     caCertPEM,
+	}, nil
+}
+
+// Register marks a device as online and returns the list of currently online
+// devices. The device_id is extracted from the mTLS client certificate.
+func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.RegisterResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ip := peerIP(ctx)
+
+	online, err := s.registry.Register(ctx, deviceID, ip, int(req.SshPort), req.Shares, int(req.ProtocolVersion))
+	if err != nil {
+		return &pb.RegisterResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	devices := make([]*pb.DeviceInfo, 0, len(online))
+	for _, d := range online {
+		shares, err := s.registry.store.GetShares(ctx, d.DeviceID)
+		if err != nil {
+			s.logger.Warn("register: get shares",
+				slog.String("device_id", d.DeviceID),
+				slog.Any("error", err))
+		}
+		devices = append(devices, &pb.DeviceInfo{
+			DeviceId: d.DeviceID,
+			Nickname: d.Nickname,
+			Ip:       d.LastIP,
+			SshPort:  int32(d.SSHPort),
+			Shares:   sharesToProto(shares),
+		})
+	}
+
+	return &pb.RegisterResponse{
+		Success:       true,
+		DevicesOnline: devices,
+	}, nil
+}
+
+// Rename changes a device's nickname.
+func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.registry.Rename(ctx, deviceID, req.NewNickname); err != nil {
+		return &pb.RenameResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &pb.RenameResponse{Success: true}, nil
+}
+
+// Heartbeat records that a device is still alive.
+func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.registry.Heartbeat(ctx, deviceID); err != nil {
+		return &pb.HeartbeatResponse{Success: false}, nil
+	}
+
+	return &pb.HeartbeatResponse{Success: true}, nil
+}
+
+// UpdateShares replaces a device's exported shares.
+func (s *Server) UpdateShares(ctx context.Context, req *pb.UpdateSharesRequest) (*pb.UpdateSharesResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.registry.UpdateShares(ctx, deviceID, req.Shares); err != nil {
+		return &pb.UpdateSharesResponse{Success: false}, nil
+	}
+
+	return &pb.UpdateSharesResponse{Success: true}, nil
+}
+
+// Deregister marks a device as offline.
+func (s *Server) Deregister(ctx context.Context, req *pb.DeregisterRequest) (*pb.DeregisterResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.registry.Deregister(ctx, deviceID); err != nil {
+		return &pb.DeregisterResponse{Success: false}, nil
+	}
+
+	return &pb.DeregisterResponse{Success: true}, nil
+}
+
+// Subscribe opens a server-streaming RPC that pushes events to the device
+// until the context is cancelled.
+func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.HubFuse_SubscribeServer) error {
+	deviceID := req.DeviceId
+
+	ch, unsub := s.registry.Subscribe(deviceID)
+	defer unsub()
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case event, ok := <-ch:
+			if !ok {
+				// Channel was closed (e.g. by Deregister).
+				return nil
+			}
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// RequestPairing initiates a pairing request from the authenticated device to
+// another device.
+func (s *Server) RequestPairing(ctx context.Context, req *pb.RequestPairingRequest) (*pb.RequestPairingResponse, error) {
+	fromDevice, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	code, err := s.registry.RequestPairing(ctx, fromDevice, req.ToDevice, req.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.RequestPairingResponse{InviteCode: code}, nil
+}
+
+// ConfirmPairing completes a pairing by validating an invite code.
+func (s *Server) ConfirmPairing(ctx context.Context, req *pb.ConfirmPairingRequest) (*pb.ConfirmPairingResponse, error) {
+	peerPublicKey, err := s.registry.ConfirmPairing(ctx, req.DeviceId, req.InviteCode, req.PublicKey)
+	if err != nil {
+		return &pb.ConfirmPairingResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &pb.ConfirmPairingResponse{
+		Success:       true,
+		PeerPublicKey: peerPublicKey,
+	}, nil
+}
+
+// peerIP extracts the IP address from the gRPC peer information in ctx. If
+// the peer cannot be determined an empty string is returned.
+func peerIP(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		return p.Addr.String()
+	}
+	return host
+}
