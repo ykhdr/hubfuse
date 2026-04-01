@@ -382,13 +382,6 @@ func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
 
 // ─── onConfigChange ────────────────────────────────────────────────────────────
 
-// stubHubClient is a minimal stub that records UpdateShares calls.
-type stubHubClient struct {
-	HubClient
-	updateSharesCalled bool
-	lastShares         []*pb.Share
-}
-
 func TestOnConfigChange_SharesChangedUpdatesShares(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 

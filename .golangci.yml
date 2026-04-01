@@ -8,7 +8,10 @@ linters:
     - ineffassign
     - staticcheck
     - unused
-
-issues:
-  exclude-dirs:
-    - proto
+  exclusions:
+    paths:
+      - proto
+    rules:
+      - linters:
+          - errcheck
+        source: "\\.(Close|Stop)\\("

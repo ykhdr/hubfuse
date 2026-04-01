@@ -1,6 +1,7 @@
 package common
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -28,7 +29,7 @@ func TestSetupLogger_Levels(t *testing.T) {
 			if logger == nil {
 				t.Fatal("SetupLogger returned nil logger")
 			}
-			if !logger.Enabled(nil, tc.want) {
+			if !logger.Enabled(context.TODO(), tc.want) {
 				t.Errorf("logger does not have level %v enabled", tc.want)
 			}
 		})
