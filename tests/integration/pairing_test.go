@@ -67,6 +67,12 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe B: %v", err)
 	}
+	// Wait for SubscribeReady so the server has registered B's event channel.
+	if ev, err := streamB.Recv(); err != nil {
+		t.Fatalf("Subscribe B ready: %v", err)
+	} else if ev.GetSubscribeReady() == nil {
+		t.Fatalf("Subscribe B: expected SubscribeReady, got %T", ev.GetPayload())
+	}
 
 	// A subscribes so it can receive PairingCompleted.
 	subCtxA, cancelA := context.WithCancel(context.Background())
@@ -74,6 +80,12 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	streamA, err := clientA.Subscribe(subCtxA, &pb.SubscribeRequest{DeviceId: devA})
 	if err != nil {
 		t.Fatalf("Subscribe A: %v", err)
+	}
+	// Wait for SubscribeReady so the server has registered A's event channel.
+	if ev, err := streamA.Recv(); err != nil {
+		t.Fatalf("Subscribe A ready: %v", err)
+	} else if ev.GetSubscribeReady() == nil {
+		t.Fatalf("Subscribe A: expected SubscribeReady, got %T", ev.GetPayload())
 	}
 
 	const pubKeyA = "ssh-rsa AAAA...A public key of alice"

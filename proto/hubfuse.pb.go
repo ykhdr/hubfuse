@@ -847,6 +847,7 @@ type Event struct {
 	//	*Event_SharesUpdated
 	//	*Event_PairingRequested
 	//	*Event_PairingCompleted
+	//	*Event_SubscribeReady
 	Payload isEvent_Payload `protobuf_oneof:"payload"`
 }
 
@@ -924,6 +925,13 @@ func (x *Event) GetPairingCompleted() *PairingCompletedEvent {
 	return nil
 }
 
+func (x *Event) GetSubscribeReady() *SubscribeReadyEvent {
+	if x, ok := x.GetPayload().(*Event_SubscribeReady); ok {
+		return x.SubscribeReady
+	}
+	return nil
+}
+
 type isEvent_Payload interface {
 	isEvent_Payload()
 }
@@ -948,6 +956,10 @@ type Event_PairingCompleted struct {
 	PairingCompleted *PairingCompletedEvent `protobuf:"bytes,5,opt,name=pairing_completed,json=pairingCompleted,proto3,oneof"`
 }
 
+type Event_SubscribeReady struct {
+	SubscribeReady *SubscribeReadyEvent `protobuf:"bytes,6,opt,name=subscribe_ready,json=subscribeReady,proto3,oneof"`
+}
+
 func (*Event_DeviceOnline) isEvent_Payload() {}
 
 func (*Event_DeviceOffline) isEvent_Payload() {}
@@ -957,6 +969,46 @@ func (*Event_SharesUpdated) isEvent_Payload() {}
 func (*Event_PairingRequested) isEvent_Payload() {}
 
 func (*Event_PairingCompleted) isEvent_Payload() {}
+
+func (*Event_SubscribeReady) isEvent_Payload() {}
+
+type SubscribeReadyEvent struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+}
+
+func (x *SubscribeReadyEvent) Reset() {
+	*x = SubscribeReadyEvent{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_proto_hubfuse_proto_msgTypes[16]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *SubscribeReadyEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubscribeReadyEvent) ProtoMessage() {}
+
+func (x *SubscribeReadyEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_hubfuse_proto_msgTypes[16]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubscribeReadyEvent.ProtoReflect.Descriptor instead.
+func (*SubscribeReadyEvent) Descriptor() ([]byte, []int) {
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{16}
+}
 
 type DeviceOnlineEvent struct {
 	state         protoimpl.MessageState
@@ -973,7 +1025,7 @@ type DeviceOnlineEvent struct {
 func (x *DeviceOnlineEvent) Reset() {
 	*x = DeviceOnlineEvent{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[16]
+		mi := &file_proto_hubfuse_proto_msgTypes[17]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -986,7 +1038,7 @@ func (x *DeviceOnlineEvent) String() string {
 func (*DeviceOnlineEvent) ProtoMessage() {}
 
 func (x *DeviceOnlineEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[16]
+	mi := &file_proto_hubfuse_proto_msgTypes[17]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -999,7 +1051,7 @@ func (x *DeviceOnlineEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeviceOnlineEvent.ProtoReflect.Descriptor instead.
 func (*DeviceOnlineEvent) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{16}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *DeviceOnlineEvent) GetDeviceId() string {
@@ -1049,7 +1101,7 @@ type DeviceOfflineEvent struct {
 func (x *DeviceOfflineEvent) Reset() {
 	*x = DeviceOfflineEvent{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[17]
+		mi := &file_proto_hubfuse_proto_msgTypes[18]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1062,7 +1114,7 @@ func (x *DeviceOfflineEvent) String() string {
 func (*DeviceOfflineEvent) ProtoMessage() {}
 
 func (x *DeviceOfflineEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[17]
+	mi := &file_proto_hubfuse_proto_msgTypes[18]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1075,7 +1127,7 @@ func (x *DeviceOfflineEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeviceOfflineEvent.ProtoReflect.Descriptor instead.
 func (*DeviceOfflineEvent) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{17}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *DeviceOfflineEvent) GetDeviceId() string {
@@ -1104,7 +1156,7 @@ type SharesUpdatedEvent struct {
 func (x *SharesUpdatedEvent) Reset() {
 	*x = SharesUpdatedEvent{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[18]
+		mi := &file_proto_hubfuse_proto_msgTypes[19]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1117,7 +1169,7 @@ func (x *SharesUpdatedEvent) String() string {
 func (*SharesUpdatedEvent) ProtoMessage() {}
 
 func (x *SharesUpdatedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[18]
+	mi := &file_proto_hubfuse_proto_msgTypes[19]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1130,7 +1182,7 @@ func (x *SharesUpdatedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SharesUpdatedEvent.ProtoReflect.Descriptor instead.
 func (*SharesUpdatedEvent) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{18}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SharesUpdatedEvent) GetDeviceId() string {
@@ -1159,7 +1211,7 @@ type PairingRequestedEvent struct {
 func (x *PairingRequestedEvent) Reset() {
 	*x = PairingRequestedEvent{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[19]
+		mi := &file_proto_hubfuse_proto_msgTypes[20]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1172,7 +1224,7 @@ func (x *PairingRequestedEvent) String() string {
 func (*PairingRequestedEvent) ProtoMessage() {}
 
 func (x *PairingRequestedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[19]
+	mi := &file_proto_hubfuse_proto_msgTypes[20]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1185,7 +1237,7 @@ func (x *PairingRequestedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PairingRequestedEvent.ProtoReflect.Descriptor instead.
 func (*PairingRequestedEvent) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{19}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PairingRequestedEvent) GetFromDeviceId() string {
@@ -1214,7 +1266,7 @@ type PairingCompletedEvent struct {
 func (x *PairingCompletedEvent) Reset() {
 	*x = PairingCompletedEvent{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[20]
+		mi := &file_proto_hubfuse_proto_msgTypes[21]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1227,7 +1279,7 @@ func (x *PairingCompletedEvent) String() string {
 func (*PairingCompletedEvent) ProtoMessage() {}
 
 func (x *PairingCompletedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[20]
+	mi := &file_proto_hubfuse_proto_msgTypes[21]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1240,7 +1292,7 @@ func (x *PairingCompletedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PairingCompletedEvent.ProtoReflect.Descriptor instead.
 func (*PairingCompletedEvent) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{20}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PairingCompletedEvent) GetPeerDeviceId() string {
@@ -1269,7 +1321,7 @@ type RequestPairingRequest struct {
 func (x *RequestPairingRequest) Reset() {
 	*x = RequestPairingRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[21]
+		mi := &file_proto_hubfuse_proto_msgTypes[22]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1282,7 +1334,7 @@ func (x *RequestPairingRequest) String() string {
 func (*RequestPairingRequest) ProtoMessage() {}
 
 func (x *RequestPairingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[21]
+	mi := &file_proto_hubfuse_proto_msgTypes[22]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1295,7 +1347,7 @@ func (x *RequestPairingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestPairingRequest.ProtoReflect.Descriptor instead.
 func (*RequestPairingRequest) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{21}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *RequestPairingRequest) GetToDevice() string {
@@ -1323,7 +1375,7 @@ type RequestPairingResponse struct {
 func (x *RequestPairingResponse) Reset() {
 	*x = RequestPairingResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[22]
+		mi := &file_proto_hubfuse_proto_msgTypes[23]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1336,7 +1388,7 @@ func (x *RequestPairingResponse) String() string {
 func (*RequestPairingResponse) ProtoMessage() {}
 
 func (x *RequestPairingResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[22]
+	mi := &file_proto_hubfuse_proto_msgTypes[23]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1349,7 +1401,7 @@ func (x *RequestPairingResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestPairingResponse.ProtoReflect.Descriptor instead.
 func (*RequestPairingResponse) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{22}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *RequestPairingResponse) GetInviteCode() string {
@@ -1372,7 +1424,7 @@ type ConfirmPairingRequest struct {
 func (x *ConfirmPairingRequest) Reset() {
 	*x = ConfirmPairingRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[23]
+		mi := &file_proto_hubfuse_proto_msgTypes[24]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1385,7 +1437,7 @@ func (x *ConfirmPairingRequest) String() string {
 func (*ConfirmPairingRequest) ProtoMessage() {}
 
 func (x *ConfirmPairingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[23]
+	mi := &file_proto_hubfuse_proto_msgTypes[24]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1398,7 +1450,7 @@ func (x *ConfirmPairingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmPairingRequest.ProtoReflect.Descriptor instead.
 func (*ConfirmPairingRequest) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{23}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ConfirmPairingRequest) GetDeviceId() string {
@@ -1435,7 +1487,7 @@ type ConfirmPairingResponse struct {
 func (x *ConfirmPairingResponse) Reset() {
 	*x = ConfirmPairingResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_proto_hubfuse_proto_msgTypes[24]
+		mi := &file_proto_hubfuse_proto_msgTypes[25]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1448,7 +1500,7 @@ func (x *ConfirmPairingResponse) String() string {
 func (*ConfirmPairingResponse) ProtoMessage() {}
 
 func (x *ConfirmPairingResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_hubfuse_proto_msgTypes[24]
+	mi := &file_proto_hubfuse_proto_msgTypes[25]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1461,7 +1513,7 @@ func (x *ConfirmPairingResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmPairingResponse.ProtoReflect.Descriptor instead.
 func (*ConfirmPairingResponse) Descriptor() ([]byte, []int) {
-	return file_proto_hubfuse_proto_rawDescGZIP(), []int{24}
+	return file_proto_hubfuse_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ConfirmPairingResponse) GetSuccess() bool {
@@ -1562,7 +1614,7 @@ var file_proto_hubfuse_proto_rawDesc = []byte{
 	0x63, 0x63, 0x65, 0x73, 0x73, 0x22, 0x2f, 0x0a, 0x10, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69,
 	0x62, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x1b, 0x0a, 0x09, 0x64, 0x65, 0x76,
 	0x69, 0x63, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x64, 0x65,
-	0x76, 0x69, 0x63, 0x65, 0x49, 0x64, 0x22, 0xff, 0x02, 0x0a, 0x05, 0x45, 0x76, 0x65, 0x6e, 0x74,
+	0x76, 0x69, 0x63, 0x65, 0x49, 0x64, 0x22, 0xc8, 0x03, 0x0a, 0x05, 0x45, 0x76, 0x65, 0x6e, 0x74,
 	0x12, 0x41, 0x0a, 0x0d, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x5f, 0x6f, 0x6e, 0x6c, 0x69, 0x6e,
 	0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x68, 0x75, 0x62, 0x66, 0x75, 0x73,
 	0x65, 0x2e, 0x44, 0x65, 0x76, 0x69, 0x63, 0x65, 0x4f, 0x6e, 0x6c, 0x69, 0x6e, 0x65, 0x45, 0x76,
@@ -1585,8 +1637,14 @@ var file_proto_hubfuse_proto_rawDesc = []byte{
 	0x74, 0x65, 0x64, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x68, 0x75, 0x62, 0x66,
 	0x75, 0x73, 0x65, 0x2e, 0x50, 0x61, 0x69, 0x72, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6d, 0x70, 0x6c,
 	0x65, 0x74, 0x65, 0x64, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x48, 0x00, 0x52, 0x10, 0x70, 0x61, 0x69,
-	0x72, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0x64, 0x42, 0x09, 0x0a,
-	0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x22, 0x9f, 0x01, 0x0a, 0x11, 0x44, 0x65, 0x76,
+	0x72, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0x64, 0x12, 0x47, 0x0a,
+	0x0f, 0x73, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x5f, 0x72, 0x65, 0x61, 0x64, 0x79,
+	0x18, 0x06, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1c, 0x2e, 0x68, 0x75, 0x62, 0x66, 0x75, 0x73, 0x65,
+	0x2e, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x65, 0x61, 0x64, 0x79, 0x45,
+	0x76, 0x65, 0x6e, 0x74, 0x48, 0x00, 0x52, 0x0e, 0x73, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62,
+	0x65, 0x52, 0x65, 0x61, 0x64, 0x79, 0x42, 0x09, 0x0a, 0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61,
+	0x64, 0x22, 0x15, 0x0a, 0x13, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x65,
+	0x61, 0x64, 0x79, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x22, 0x9f, 0x01, 0x0a, 0x11, 0x44, 0x65, 0x76,
 	0x69, 0x63, 0x65, 0x4f, 0x6e, 0x6c, 0x69, 0x6e, 0x65, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x12, 0x1b,
 	0x0a, 0x09, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28,
 	0x09, 0x52, 0x08, 0x64, 0x65, 0x76, 0x69, 0x63, 0x65, 0x49, 0x64, 0x12, 0x1a, 0x0a, 0x08, 0x6e,
@@ -1700,7 +1758,7 @@ func file_proto_hubfuse_proto_rawDescGZIP() []byte {
 	return file_proto_hubfuse_proto_rawDescData
 }
 
-var file_proto_hubfuse_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
+var file_proto_hubfuse_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_proto_hubfuse_proto_goTypes = []interface{}{
 	(*Share)(nil),                  // 0: hubfuse.Share
 	(*DeviceInfo)(nil),             // 1: hubfuse.DeviceInfo
@@ -1718,51 +1776,53 @@ var file_proto_hubfuse_proto_goTypes = []interface{}{
 	(*DeregisterResponse)(nil),     // 13: hubfuse.DeregisterResponse
 	(*SubscribeRequest)(nil),       // 14: hubfuse.SubscribeRequest
 	(*Event)(nil),                  // 15: hubfuse.Event
-	(*DeviceOnlineEvent)(nil),      // 16: hubfuse.DeviceOnlineEvent
-	(*DeviceOfflineEvent)(nil),     // 17: hubfuse.DeviceOfflineEvent
-	(*SharesUpdatedEvent)(nil),     // 18: hubfuse.SharesUpdatedEvent
-	(*PairingRequestedEvent)(nil),  // 19: hubfuse.PairingRequestedEvent
-	(*PairingCompletedEvent)(nil),  // 20: hubfuse.PairingCompletedEvent
-	(*RequestPairingRequest)(nil),  // 21: hubfuse.RequestPairingRequest
-	(*RequestPairingResponse)(nil), // 22: hubfuse.RequestPairingResponse
-	(*ConfirmPairingRequest)(nil),  // 23: hubfuse.ConfirmPairingRequest
-	(*ConfirmPairingResponse)(nil), // 24: hubfuse.ConfirmPairingResponse
+	(*SubscribeReadyEvent)(nil),    // 16: hubfuse.SubscribeReadyEvent
+	(*DeviceOnlineEvent)(nil),      // 17: hubfuse.DeviceOnlineEvent
+	(*DeviceOfflineEvent)(nil),     // 18: hubfuse.DeviceOfflineEvent
+	(*SharesUpdatedEvent)(nil),     // 19: hubfuse.SharesUpdatedEvent
+	(*PairingRequestedEvent)(nil),  // 20: hubfuse.PairingRequestedEvent
+	(*PairingCompletedEvent)(nil),  // 21: hubfuse.PairingCompletedEvent
+	(*RequestPairingRequest)(nil),  // 22: hubfuse.RequestPairingRequest
+	(*RequestPairingResponse)(nil), // 23: hubfuse.RequestPairingResponse
+	(*ConfirmPairingRequest)(nil),  // 24: hubfuse.ConfirmPairingRequest
+	(*ConfirmPairingResponse)(nil), // 25: hubfuse.ConfirmPairingResponse
 }
 var file_proto_hubfuse_proto_depIdxs = []int32{
 	0,  // 0: hubfuse.DeviceInfo.shares:type_name -> hubfuse.Share
 	0,  // 1: hubfuse.RegisterRequest.shares:type_name -> hubfuse.Share
 	1,  // 2: hubfuse.RegisterResponse.devices_online:type_name -> hubfuse.DeviceInfo
 	0,  // 3: hubfuse.UpdateSharesRequest.shares:type_name -> hubfuse.Share
-	16, // 4: hubfuse.Event.device_online:type_name -> hubfuse.DeviceOnlineEvent
-	17, // 5: hubfuse.Event.device_offline:type_name -> hubfuse.DeviceOfflineEvent
-	18, // 6: hubfuse.Event.shares_updated:type_name -> hubfuse.SharesUpdatedEvent
-	19, // 7: hubfuse.Event.pairing_requested:type_name -> hubfuse.PairingRequestedEvent
-	20, // 8: hubfuse.Event.pairing_completed:type_name -> hubfuse.PairingCompletedEvent
-	0,  // 9: hubfuse.DeviceOnlineEvent.shares:type_name -> hubfuse.Share
-	0,  // 10: hubfuse.SharesUpdatedEvent.shares:type_name -> hubfuse.Share
-	2,  // 11: hubfuse.HubFuse.Join:input_type -> hubfuse.JoinRequest
-	4,  // 12: hubfuse.HubFuse.Register:input_type -> hubfuse.RegisterRequest
-	6,  // 13: hubfuse.HubFuse.Rename:input_type -> hubfuse.RenameRequest
-	8,  // 14: hubfuse.HubFuse.Heartbeat:input_type -> hubfuse.HeartbeatRequest
-	10, // 15: hubfuse.HubFuse.UpdateShares:input_type -> hubfuse.UpdateSharesRequest
-	12, // 16: hubfuse.HubFuse.Deregister:input_type -> hubfuse.DeregisterRequest
-	14, // 17: hubfuse.HubFuse.Subscribe:input_type -> hubfuse.SubscribeRequest
-	21, // 18: hubfuse.HubFuse.RequestPairing:input_type -> hubfuse.RequestPairingRequest
-	23, // 19: hubfuse.HubFuse.ConfirmPairing:input_type -> hubfuse.ConfirmPairingRequest
-	3,  // 20: hubfuse.HubFuse.Join:output_type -> hubfuse.JoinResponse
-	5,  // 21: hubfuse.HubFuse.Register:output_type -> hubfuse.RegisterResponse
-	7,  // 22: hubfuse.HubFuse.Rename:output_type -> hubfuse.RenameResponse
-	9,  // 23: hubfuse.HubFuse.Heartbeat:output_type -> hubfuse.HeartbeatResponse
-	11, // 24: hubfuse.HubFuse.UpdateShares:output_type -> hubfuse.UpdateSharesResponse
-	13, // 25: hubfuse.HubFuse.Deregister:output_type -> hubfuse.DeregisterResponse
-	15, // 26: hubfuse.HubFuse.Subscribe:output_type -> hubfuse.Event
-	22, // 27: hubfuse.HubFuse.RequestPairing:output_type -> hubfuse.RequestPairingResponse
-	24, // 28: hubfuse.HubFuse.ConfirmPairing:output_type -> hubfuse.ConfirmPairingResponse
-	20, // [20:29] is the sub-list for method output_type
-	11, // [11:20] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	17, // 4: hubfuse.Event.device_online:type_name -> hubfuse.DeviceOnlineEvent
+	18, // 5: hubfuse.Event.device_offline:type_name -> hubfuse.DeviceOfflineEvent
+	19, // 6: hubfuse.Event.shares_updated:type_name -> hubfuse.SharesUpdatedEvent
+	20, // 7: hubfuse.Event.pairing_requested:type_name -> hubfuse.PairingRequestedEvent
+	21, // 8: hubfuse.Event.pairing_completed:type_name -> hubfuse.PairingCompletedEvent
+	16, // 9: hubfuse.Event.subscribe_ready:type_name -> hubfuse.SubscribeReadyEvent
+	0,  // 10: hubfuse.DeviceOnlineEvent.shares:type_name -> hubfuse.Share
+	0,  // 11: hubfuse.SharesUpdatedEvent.shares:type_name -> hubfuse.Share
+	2,  // 12: hubfuse.HubFuse.Join:input_type -> hubfuse.JoinRequest
+	4,  // 13: hubfuse.HubFuse.Register:input_type -> hubfuse.RegisterRequest
+	6,  // 14: hubfuse.HubFuse.Rename:input_type -> hubfuse.RenameRequest
+	8,  // 15: hubfuse.HubFuse.Heartbeat:input_type -> hubfuse.HeartbeatRequest
+	10, // 16: hubfuse.HubFuse.UpdateShares:input_type -> hubfuse.UpdateSharesRequest
+	12, // 17: hubfuse.HubFuse.Deregister:input_type -> hubfuse.DeregisterRequest
+	14, // 18: hubfuse.HubFuse.Subscribe:input_type -> hubfuse.SubscribeRequest
+	22, // 19: hubfuse.HubFuse.RequestPairing:input_type -> hubfuse.RequestPairingRequest
+	24, // 20: hubfuse.HubFuse.ConfirmPairing:input_type -> hubfuse.ConfirmPairingRequest
+	3,  // 21: hubfuse.HubFuse.Join:output_type -> hubfuse.JoinResponse
+	5,  // 22: hubfuse.HubFuse.Register:output_type -> hubfuse.RegisterResponse
+	7,  // 23: hubfuse.HubFuse.Rename:output_type -> hubfuse.RenameResponse
+	9,  // 24: hubfuse.HubFuse.Heartbeat:output_type -> hubfuse.HeartbeatResponse
+	11, // 25: hubfuse.HubFuse.UpdateShares:output_type -> hubfuse.UpdateSharesResponse
+	13, // 26: hubfuse.HubFuse.Deregister:output_type -> hubfuse.DeregisterResponse
+	15, // 27: hubfuse.HubFuse.Subscribe:output_type -> hubfuse.Event
+	23, // 28: hubfuse.HubFuse.RequestPairing:output_type -> hubfuse.RequestPairingResponse
+	25, // 29: hubfuse.HubFuse.ConfirmPairing:output_type -> hubfuse.ConfirmPairingResponse
+	21, // [21:30] is the sub-list for method output_type
+	12, // [12:21] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_hubfuse_proto_init() }
@@ -1964,7 +2024,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*DeviceOnlineEvent); i {
+			switch v := v.(*SubscribeReadyEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1976,7 +2036,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*DeviceOfflineEvent); i {
+			switch v := v.(*DeviceOnlineEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1988,7 +2048,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*SharesUpdatedEvent); i {
+			switch v := v.(*DeviceOfflineEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2000,7 +2060,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PairingRequestedEvent); i {
+			switch v := v.(*SharesUpdatedEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2012,7 +2072,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[20].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*PairingCompletedEvent); i {
+			switch v := v.(*PairingRequestedEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2024,7 +2084,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[21].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RequestPairingRequest); i {
+			switch v := v.(*PairingCompletedEvent); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2036,7 +2096,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[22].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*RequestPairingResponse); i {
+			switch v := v.(*RequestPairingRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2048,7 +2108,7 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[23].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*ConfirmPairingRequest); i {
+			switch v := v.(*RequestPairingResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -2060,6 +2120,18 @@ func file_proto_hubfuse_proto_init() {
 			}
 		}
 		file_proto_hubfuse_proto_msgTypes[24].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*ConfirmPairingRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_proto_hubfuse_proto_msgTypes[25].Exporter = func(v interface{}, i int) interface{} {
 			switch v := v.(*ConfirmPairingResponse); i {
 			case 0:
 				return &v.state
@@ -2078,6 +2150,7 @@ func file_proto_hubfuse_proto_init() {
 		(*Event_SharesUpdated)(nil),
 		(*Event_PairingRequested)(nil),
 		(*Event_PairingCompleted)(nil),
+		(*Event_SubscribeReady)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2085,7 +2158,7 @@ func file_proto_hubfuse_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_proto_hubfuse_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   25,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

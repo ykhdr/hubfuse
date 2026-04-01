@@ -204,6 +204,12 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe RPC: %v", err)
 	}
+	// Consume SubscribeReady sentinel before expecting real events.
+	if ev, err := stream.Recv(); err != nil {
+		t.Fatalf("Subscribe ready: %v", err)
+	} else if ev.GetSubscribeReady() == nil {
+		t.Fatalf("expected SubscribeReady, got %T", ev.GetPayload())
+	}
 
 	// Join + register device2.
 	device2ID := "dev-" + uuid.New().String()

@@ -116,8 +116,11 @@ message Event {
     SharesUpdatedEvent shares_updated = 3;
     PairingRequestedEvent pairing_requested = 4;
     PairingCompletedEvent pairing_completed = 5;
+    SubscribeReadyEvent subscribe_ready = 6;
   }
 }
+
+message SubscribeReadyEvent {}
 
 message DeviceOnlineEvent {
   string device_id = 1;

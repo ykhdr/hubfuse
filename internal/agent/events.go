@@ -20,6 +20,8 @@ func (d *Daemon) handleEvent(event *pb.Event) {
 		d.handlePairingRequested(p.PairingRequested)
 	case *pb.Event_PairingCompleted:
 		d.handlePairingCompleted(p.PairingCompleted)
+	case *pb.Event_SubscribeReady:
+		// Handled by the connector; nothing to do here.
 	default:
 		d.logger.Warn("received unknown event type")
 	}
