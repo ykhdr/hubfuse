@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  exclusions:
+    paths:
+      - proto
+    rules:
+      - linters:
+          - errcheck
+        source: "\\.(Close|Stop)\\("

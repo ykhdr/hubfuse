@@ -736,7 +736,7 @@ func TestStoreErrors(t *testing.T) {
 			}
 			// Errors must not be nil but need not be wrapped — just ensure
 			// they satisfy the error interface.
-			var _ error = err
+			var _ = err
 		})
 	}
 }

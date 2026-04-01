@@ -75,6 +75,12 @@ func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Subscribe B: %v", err)
 	}
+	// Wait for SubscribeReady so the server has registered B's event channel.
+	if ev, err := streamB.Recv(); err != nil {
+		t.Fatalf("Subscribe B ready: %v", err)
+	} else if ev.GetSubscribeReady() == nil {
+		t.Fatalf("Subscribe B: expected SubscribeReady, got %T", ev.GetPayload())
+	}
 
 	// A joins and registers with an initial share.
 	joinRespA, err := unauthClient.Join(context.Background(), &pb.JoinRequest{

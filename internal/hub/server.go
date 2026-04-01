@@ -144,6 +144,13 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.HubFuse_Subscribe
 	ch, unsub := s.registry.Subscribe(deviceID)
 	defer unsub()
 
+	// Signal that the subscription is active so clients can synchronise.
+	if err := stream.Send(&pb.Event{
+		Payload: &pb.Event_SubscribeReady{SubscribeReady: &pb.SubscribeReadyEvent{}},
+	}); err != nil {
+		return err
+	}
+
 	for {
 		select {
 		case <-stream.Context().Done():
