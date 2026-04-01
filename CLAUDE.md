@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow
+
+Always commit and push after completing an action (feature, fix, refactor, etc.) without waiting for explicit request.
+
 ## Project
 
 HubFuse is a network file sharing system for local networks. Devices mount remote directories transparently via SSHFS, coordinated by a central gRPC hub server. Written in Go 1.25.
