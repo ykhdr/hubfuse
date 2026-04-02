@@ -301,7 +301,7 @@ func pairCmd() *cobra.Command {
 func devicesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "devices",
-		Short: "List online devices",
+		Short: "List all devices",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
 			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -312,20 +312,22 @@ func devicesCmd() *cobra.Command {
 			}
 			defer hubClient.Close()
 
-			resp, err := hubClient.Register(context.Background(), nil, 0)
+			resp, err := hubClient.ListDevices(context.Background())
 			if err != nil {
-				return fmt.Errorf("get device list: %w", err)
+				return fmt.Errorf("list devices: %w", err)
 			}
 
-			if len(resp.DevicesOnline) == 0 {
-				fmt.Println("no devices online")
+			if len(resp.Devices) == 0 {
+				fmt.Println("no devices registered")
 				return nil
 			}
 
-			fmt.Printf("%-40s  %-20s  %s\n", "DEVICE ID", "NICKNAME", "IP")
-			fmt.Printf("%-40s  %-20s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 20), strings.Repeat("-", 15))
-			for _, d := range resp.DevicesOnline {
-				fmt.Printf("%-40s  %-20s  %s\n", d.DeviceId, d.Nickname, d.Ip)
+			fmt.Printf("%-40s  %-20s  %-8s  %s\n", "DEVICE ID", "NICKNAME", "STATUS", "IP")
+			fmt.Printf("%-40s  %-20s  %-8s  %s\n",
+				strings.Repeat("-", 40), strings.Repeat("-", 20),
+				strings.Repeat("-", 8), strings.Repeat("-", 15))
+			for _, d := range resp.Devices {
+				fmt.Printf("%-40s  %-20s  %-8s  %s\n", d.DeviceId, d.Nickname, d.Status, d.Ip)
 			}
 			return nil
 		},

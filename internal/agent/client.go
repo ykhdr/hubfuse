@@ -147,6 +147,15 @@ func (c *HubClient) RequestPairing(ctx context.Context, toDevice, publicKey stri
 	return resp.InviteCode, nil
 }
 
+// ListDevices retrieves all devices known to the hub.
+func (c *HubClient) ListDevices(ctx context.Context) (*pb.ListDevicesResponse, error) {
+	resp, err := c.client.ListDevices(ctx, &pb.ListDevicesRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("ListDevices RPC: %w", err)
+	}
+	return resp, nil
+}
+
 // ConfirmPairing completes a pairing handshake and returns the peer's public key.
 func (c *HubClient) ConfirmPairing(ctx context.Context, deviceID, inviteCode, publicKey string) (string, error) {
 	resp, err := c.client.ConfirmPairing(ctx, &pb.ConfirmPairingRequest{
