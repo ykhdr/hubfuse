@@ -58,9 +58,10 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 
 	devA := "pair-a-" + uuid.New().String()
 	devB := "pair-b-" + uuid.New().String()
+	nickB := "pair-bob-" + uuid.New().String()
 
 	clientA := joinAndRegister(t, h, devA, "pair-alice-"+uuid.New().String())
-	clientB := joinAndRegister(t, h, devB, "pair-bob-"+uuid.New().String())
+	clientB := joinAndRegister(t, h, devB, nickB)
 
 	// B subscribes before A initiates pairing so the event can be received.
 	subCtxB, cancelB := context.WithCancel(context.Background())
@@ -93,9 +94,9 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	const pubKeyA = "ssh-rsa AAAA...A public key of alice"
 	const pubKeyB = "ssh-rsa BBBB...B public key of bob"
 
-	// A requests pairing with B.
+	// A requests pairing with B (by nickname).
 	pairResp, err := clientA.RequestPairing(context.Background(), &pb.RequestPairingRequest{
-		ToDevice:  devB,
+		ToDevice:  nickB,
 		PublicKey: pubKeyA,
 	})
 	if err != nil {
@@ -180,13 +181,14 @@ func TestIntegration_Pairing_WrongInviteCode(t *testing.T) {
 
 	devA := "wic-a-" + uuid.New().String()
 	devB := "wic-b-" + uuid.New().String()
+	nickB := "wic-bob-" + uuid.New().String()
 
 	clientA := joinAndRegister(t, h, devA, "wic-alice-"+uuid.New().String())
-	clientB := joinAndRegister(t, h, devB, "wic-bob-"+uuid.New().String())
+	clientB := joinAndRegister(t, h, devB, nickB)
 
 	// A requests pairing to get a valid code into the store.
 	_, err := clientA.RequestPairing(context.Background(), &pb.RequestPairingRequest{
-		ToDevice:  devB,
+		ToDevice:  nickB,
 		PublicKey: "pk-a",
 	})
 	if err != nil {
@@ -217,12 +219,13 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 
 	devA := "ma-a-" + uuid.New().String()
 	devB := "ma-b-" + uuid.New().String()
+	nickB := "ma-bob-" + uuid.New().String()
 
 	clientA := joinAndRegister(t, h, devA, "ma-alice-"+uuid.New().String())
-	clientB := joinAndRegister(t, h, devB, "ma-bob-"+uuid.New().String())
+	clientB := joinAndRegister(t, h, devB, nickB)
 
 	pairResp, err := clientA.RequestPairing(context.Background(), &pb.RequestPairingRequest{
-		ToDevice:  devB,
+		ToDevice:  nickB,
 		PublicKey: "pk-a",
 	})
 	if err != nil {
