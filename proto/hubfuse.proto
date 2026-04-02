@@ -19,6 +19,8 @@ service HubFuse {
 
   rpc RequestPairing(RequestPairingRequest) returns (RequestPairingResponse);
   rpc ConfirmPairing(ConfirmPairingRequest) returns (ConfirmPairingResponse);
+
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
 }
 
 // ─── Common types ────────────────────────────────────────────────────────────
@@ -35,6 +37,7 @@ message DeviceInfo {
   string ip = 3;
   int32 ssh_port = 4;
   repeated Share shares = 5;
+  string status = 6;
 }
 
 // ─── Join ────────────────────────────────────────────────────────────────────
@@ -173,4 +176,12 @@ message ConfirmPairingResponse {
   bool success = 1;
   string error = 2;
   string peer_public_key = 3;
+}
+
+// ─── ListDevices ────────────────────────────────────────────────────────────
+
+message ListDevicesRequest {}
+
+message ListDevicesResponse {
+  repeated DeviceInfo devices = 1;
 }
