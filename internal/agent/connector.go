@@ -80,8 +80,5 @@ func isTLSCertError(err error) bool {
 		return true
 	}
 	var certInvalid x509.CertificateInvalidError
-	if errors.As(err, &certInvalid) {
-		return true
-	}
-	return false
+	return errors.As(err, &certInvalid)
 }
