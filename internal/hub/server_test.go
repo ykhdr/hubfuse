@@ -40,7 +40,7 @@ func startTestHub(t *testing.T) (addr string, caCertPEM []byte) {
 	// Write CA and server certs to a temp dir so LoadTLSServerConfig can read them.
 	tlsDir := t.TempDir()
 
-	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, []string{"localhost", "127.0.0.1"})
+	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, common.LocalHosts())
 	if err != nil {
 		t.Fatalf("GenerateServerCert: %v", err)
 	}

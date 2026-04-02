@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -22,10 +23,11 @@ import (
 
 // HubConfig holds configuration for a Hub instance.
 type HubConfig struct {
-	ListenAddr string // e.g. ":9090"
-	DataDir    string // e.g. "~/.hubfuse-hub"
-	LogLevel   string // "debug", "info", "warn", "error"
-	LogOutput  string // "stderr" or file path
+	ListenAddr string   // e.g. ":9090"
+	DataDir    string   // e.g. "~/.hubfuse-hub"
+	LogLevel   string   // "debug", "info", "warn", "error"
+	LogOutput  string   // "stderr" or file path
+	ExtraSANs  []string // additional SANs for the server TLS certificate
 }
 
 // Hub wires together the store, registry, heartbeat monitor, and gRPC server.
@@ -59,7 +61,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
-	caCert, caKey, err := loadOrGenerateCerts(dataDir, logger)
+	caCert, caKey, err := loadOrGenerateCerts(dataDir, config.ExtraSANs, logger)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("load/generate certs: %w", err)
@@ -171,8 +173,9 @@ func (h *Hub) Stop() error {
 }
 
 // loadOrGenerateCerts loads existing CA and server TLS certificates from
-// dataDir/tls/, or generates and saves them if they do not exist.
-func loadOrGenerateCerts(dataDir string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, error) {
+// dataDir/tls/, or generates and saves them if they do not exist. When
+// generating, it auto-detects local IPs/hostnames and merges extraSANs.
+func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, error) {
 	tlsDir := filepath.Join(dataDir, "tls")
 
 	caCertPath := filepath.Join(tlsDir, "ca.crt")
@@ -207,8 +210,15 @@ func loadOrGenerateCerts(dataDir string, logger *slog.Logger) (*x509.Certificate
 		return nil, nil, fmt.Errorf("write CA key: %w", err)
 	}
 
+	// Build SAN list: auto-detected local hosts + extra SANs from config.
+	hosts := common.LocalHosts()
+	hosts = append(hosts, extraSANs...)
+	hosts = dedup(hosts)
+
+	logger.Info("generating server TLS certificate", slog.Any("sans", hosts))
+
 	// Generate and save server cert.
-	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, []string{"localhost", "127.0.0.1"})
+	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, hosts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate server cert: %w", err)
 	}
@@ -261,6 +271,20 @@ func expandHome(path string) string {
 		return path
 	}
 	return filepath.Join(home, path[1:])
+}
+
+// dedup returns a sorted, deduplicated copy of ss.
+func dedup(ss []string) []string {
+	seen := make(map[string]struct{}, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TLSConfig returns a tls.Config that trusts the hub's CA and presents the

@@ -42,7 +42,7 @@ func startTestHub(t *testing.T) hubHandle {
 
 	tlsDir := t.TempDir()
 
-	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, []string{"localhost", "127.0.0.1"})
+	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, common.LocalHosts())
 	if err != nil {
 		t.Fatalf("startTestHub: GenerateServerCert: %v", err)
 	}
