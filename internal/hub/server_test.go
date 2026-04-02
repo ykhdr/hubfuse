@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,9 @@ import (
 	"github.com/ykhdr/hubfuse/internal/hub/store"
 	pb "github.com/ykhdr/hubfuse/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 // startTestHub starts an in-process gRPC hub server on a random port. It
@@ -329,6 +332,146 @@ func TestIntegration_JoinNicknameConflict(t *testing.T) {
 	}
 	if resp2.Error == "" {
 		t.Error("expected non-empty error message for duplicate nickname")
+	}
+}
+
+func TestRequestPairing_DeviceNotFound(t *testing.T) {
+	addr, caCertPEM := startTestHub(t)
+	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+
+	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-pair-from",
+		Nickname: "pair-from",
+	})
+	if err != nil || !joinResp.Success {
+		t.Fatalf("Join: err=%v success=%v", err, joinResp.GetSuccess())
+	}
+
+	client := dialWithClientCert(t, addr, joinResp.ClientCert, joinResp.ClientKey, caCertPEM)
+	_, err = client.Register(context.Background(), &pb.RegisterRequest{
+		SshPort:         2222,
+		ProtocolVersion: int32(common.ProtocolVersion),
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Pair with non-existent device.
+	_, err = client.RequestPairing(context.Background(), &pb.RequestPairingRequest{
+		ToDevice:  "nonexistent",
+		PublicKey: "ssh-ed25519 AAAA...",
+	})
+	if err == nil {
+		t.Fatal("expected error for non-existent device")
+	}
+	st := status.Convert(err)
+	if st.Code() != codes.NotFound {
+		t.Errorf("expected NotFound, got %v", st.Code())
+	}
+	if !strings.Contains(st.Message(), "no device with nickname") {
+		t.Errorf("expected 'no device with nickname' in message, got %q", st.Message())
+	}
+}
+
+func TestRequestPairing_DeviceOffline(t *testing.T) {
+	addr, caCertPEM := startTestHub(t)
+	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+
+	// Join two devices but only register one.
+	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-pair-1",
+		Nickname: "pair-alice",
+	})
+	if err != nil || !joinResp1.Success {
+		t.Fatalf("Join dev1: err=%v", err)
+	}
+
+	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-pair-2",
+		Nickname: "pair-bob",
+	})
+	if err != nil || !joinResp2.Success {
+		t.Fatalf("Join dev2: err=%v", err)
+	}
+
+	// Register only device 1.
+	client1 := dialWithClientCert(t, addr, joinResp1.ClientCert, joinResp1.ClientKey, caCertPEM)
+	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
+		SshPort:         2222,
+		ProtocolVersion: int32(common.ProtocolVersion),
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Pair with offline device 2.
+	_, err = client1.RequestPairing(context.Background(), &pb.RequestPairingRequest{
+		ToDevice:  "pair-bob",
+		PublicKey: "ssh-ed25519 AAAA...",
+	})
+	if err == nil {
+		t.Fatal("expected error for offline device")
+	}
+	st := status.Convert(err)
+	if st.Code() != codes.Unavailable {
+		t.Errorf("expected Unavailable, got %v", st.Code())
+	}
+	if !strings.Contains(st.Message(), "not currently connected") {
+		t.Errorf("expected 'not currently connected' in message, got %q", st.Message())
+	}
+}
+
+func TestListDevices(t *testing.T) {
+	addr, caCertPEM := startTestHub(t)
+
+	// Join two devices.
+	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+
+	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-list-1",
+		Nickname: "list-alice",
+	})
+	if err != nil || !joinResp1.Success {
+		t.Fatalf("Join dev1: err=%v success=%v", err, joinResp1.GetSuccess())
+	}
+
+	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-list-2",
+		Nickname: "list-bob",
+	})
+	if err != nil || !joinResp2.Success {
+		t.Fatalf("Join dev2: err=%v success=%v", err, joinResp2.GetSuccess())
+	}
+
+	// Register only device 1 (device 2 stays offline).
+	client1 := dialWithClientCert(t, addr, joinResp1.ClientCert, joinResp1.ClientKey, caCertPEM)
+	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
+		SshPort:         2222,
+		ProtocolVersion: int32(common.ProtocolVersion),
+	})
+	if err != nil {
+		t.Fatalf("Register dev1: %v", err)
+	}
+
+	// Call ListDevices as device 1.
+	resp, err := client1.ListDevices(context.Background(), &pb.ListDevicesRequest{})
+	if err != nil {
+		t.Fatalf("ListDevices: %v", err)
+	}
+
+	if len(resp.Devices) != 2 {
+		t.Fatalf("expected 2 devices, got %d", len(resp.Devices))
+	}
+
+	statusMap := map[string]string{}
+	for _, d := range resp.Devices {
+		statusMap[d.Nickname] = d.Status
+	}
+	if statusMap["list-alice"] != "online" {
+		t.Errorf("alice status = %q, want %q", statusMap["list-alice"], "online")
+	}
+	if statusMap["list-bob"] != "offline" {
+		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "offline")
 	}
 }
 

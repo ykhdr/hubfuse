@@ -65,7 +65,7 @@ func TestRequestPairing_Success(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRequestPairing_SendsEventToTarget(t *testing.T) {
 	ch, unsub := r.Subscribe("dev-b")
 	defer unsub()
 
-	if _, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice"); err != nil {
+	if _, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice"); err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
 
@@ -118,7 +118,7 @@ func TestRequestPairing_UnknownToDevice(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	_, err := r.RequestPairing(ctx, "dev-a", "no-such-device", "pk")
+	_, err := r.RequestPairing(ctx, "dev-a", "no-such-nickname", "pk")
 	if err == nil {
 		t.Fatal("expected error for unknown to device, got nil")
 	}
@@ -133,7 +133,7 @@ func TestRequestPairing_AlreadyPaired(t *testing.T) {
 		t.Fatalf("CreatePairing: %v", err)
 	}
 
-	_, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err == nil {
 		t.Fatal("expected ErrPairingAlreadyExists, got nil")
 	}
@@ -152,7 +152,7 @@ func TestRequestPairing_OfflineDevice(t *testing.T) {
 	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
 	// dev-b remains offline.
 
-	_, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err == nil {
 		t.Fatal("expected error for offline target device, got nil")
 	}
@@ -165,7 +165,7 @@ func TestConfirmPairing_Success(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestConfirmPairing_SendsCompletedEventToInitiator(t *testing.T) {
 	ch, unsub := r.Subscribe("dev-a")
 	defer unsub()
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestConfirmPairing_WrongCode(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	if _, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice"); err != nil {
+	if _, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice"); err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
 
@@ -235,7 +235,7 @@ func TestConfirmPairing_MaxAttempts(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestConfirmPairing_WrongTargetDevice(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestConfirmPairing_InviteDeletedAfterSuccess(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestConfirmPairing_PairingRecordCreated(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	code, err := r.RequestPairing(ctx, "dev-a", "dev-b", "pk-alice")
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err != nil {
 		t.Fatalf("RequestPairing: %v", err)
 	}

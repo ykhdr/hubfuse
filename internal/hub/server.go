@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 
@@ -194,6 +195,40 @@ func (s *Server) ConfirmPairing(ctx context.Context, req *pb.ConfirmPairingReque
 		Success:       true,
 		PeerPublicKey: peerPublicKey,
 	}, nil
+}
+
+// ListDevices returns all devices known to the hub, regardless of status.
+func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*pb.ListDevicesResponse, error) {
+	if _, err := common.ExtractDeviceID(ctx); err != nil {
+		return nil, err
+	}
+
+	all, err := s.registry.store.ListAllDevices(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list all devices: %w", err)
+	}
+
+	devices := make([]*pb.DeviceInfo, 0, len(all))
+	for _, d := range all {
+		shares, err := s.registry.store.GetShares(ctx, d.DeviceID)
+		if err != nil {
+			s.logger.Warn("ListDevices: get shares",
+				slog.String("device_id", d.DeviceID),
+				slog.Any("error", err))
+			continue
+		}
+
+		devices = append(devices, &pb.DeviceInfo{
+			DeviceId: d.DeviceID,
+			Nickname: d.Nickname,
+			Ip:       d.LastIP,
+			SshPort:  int32(d.SSHPort),
+			Shares:   sharesToProto(shares),
+			Status:   d.Status,
+		})
+	}
+
+	return &pb.ListDevicesResponse{Devices: devices}, nil
 }
 
 // peerIP extracts the IP address from the gRPC peer information in ctx. If

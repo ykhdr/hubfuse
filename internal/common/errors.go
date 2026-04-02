@@ -8,6 +8,7 @@ import (
 var (
 	ErrNicknameTaken        = status.Error(codes.AlreadyExists, "nickname already taken")
 	ErrDeviceNotFound       = status.Error(codes.NotFound, "device not found")
+	ErrDeviceOffline        = status.Error(codes.Unavailable, "device offline")
 	ErrUnsupportedProtocol  = status.Error(codes.FailedPrecondition, "unsupported protocol version")
 	ErrInvalidInviteCode    = status.Error(codes.PermissionDenied, "invalid invite code")
 	ErrMaxAttemptsExceeded  = status.Error(codes.ResourceExhausted, "max pairing attempts exceeded")

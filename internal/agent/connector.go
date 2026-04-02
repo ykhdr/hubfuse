@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -44,6 +46,10 @@ func (c *Connector) Connect(ctx context.Context) (*HubClient, error) {
 			return client, nil
 		}
 
+		if isTLSCertError(err) {
+			return nil, fmt.Errorf("hub certificate not trusted — the hub CA may have changed, please re-join with: hubfuse join %s", c.hubAddr)
+		}
+
 		c.logger.Warn("failed to connect to hub, retrying",
 			"addr", c.hubAddr,
 			"err", err,
@@ -61,4 +67,18 @@ func (c *Connector) Connect(ctx context.Context) (*HubClient, error) {
 			delay = backoffMax
 		}
 	}
+}
+
+// isTLSCertError reports whether err is a TLS certificate validation error
+// that will not resolve on retry (e.g. the hub CA has changed).
+func isTLSCertError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuth) {
+		return true
+	}
+	var certInvalid x509.CertificateInvalidError
+	return errors.As(err, &certInvalid)
 }

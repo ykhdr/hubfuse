@@ -28,6 +28,7 @@ const (
 	HubFuse_Subscribe_FullMethodName      = "/hubfuse.HubFuse/Subscribe"
 	HubFuse_RequestPairing_FullMethodName = "/hubfuse.HubFuse/RequestPairing"
 	HubFuse_ConfirmPairing_FullMethodName = "/hubfuse.HubFuse/ConfirmPairing"
+	HubFuse_ListDevices_FullMethodName    = "/hubfuse.HubFuse/ListDevices"
 )
 
 // HubFuseClient is the client API for HubFuse service.
@@ -45,6 +46,7 @@ type HubFuseClient interface {
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (HubFuse_SubscribeClient, error)
 	RequestPairing(ctx context.Context, in *RequestPairingRequest, opts ...grpc.CallOption) (*RequestPairingResponse, error)
 	ConfirmPairing(ctx context.Context, in *ConfirmPairingRequest, opts ...grpc.CallOption) (*ConfirmPairingResponse, error)
+	ListDevices(ctx context.Context, in *ListDevicesRequest, opts ...grpc.CallOption) (*ListDevicesResponse, error)
 }
 
 type hubFuseClient struct {
@@ -159,6 +161,15 @@ func (c *hubFuseClient) ConfirmPairing(ctx context.Context, in *ConfirmPairingRe
 	return out, nil
 }
 
+func (c *hubFuseClient) ListDevices(ctx context.Context, in *ListDevicesRequest, opts ...grpc.CallOption) (*ListDevicesResponse, error) {
+	out := new(ListDevicesResponse)
+	err := c.cc.Invoke(ctx, HubFuse_ListDevices_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // HubFuseServer is the server API for HubFuse service.
 // All implementations must embed UnimplementedHubFuseServer
 // for forward compatibility
@@ -174,6 +185,7 @@ type HubFuseServer interface {
 	Subscribe(*SubscribeRequest, HubFuse_SubscribeServer) error
 	RequestPairing(context.Context, *RequestPairingRequest) (*RequestPairingResponse, error)
 	ConfirmPairing(context.Context, *ConfirmPairingRequest) (*ConfirmPairingResponse, error)
+	ListDevices(context.Context, *ListDevicesRequest) (*ListDevicesResponse, error)
 	mustEmbedUnimplementedHubFuseServer()
 }
 
@@ -207,6 +219,9 @@ func (UnimplementedHubFuseServer) RequestPairing(context.Context, *RequestPairin
 }
 func (UnimplementedHubFuseServer) ConfirmPairing(context.Context, *ConfirmPairingRequest) (*ConfirmPairingResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ConfirmPairing not implemented")
+}
+func (UnimplementedHubFuseServer) ListDevices(context.Context, *ListDevicesRequest) (*ListDevicesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListDevices not implemented")
 }
 func (UnimplementedHubFuseServer) mustEmbedUnimplementedHubFuseServer() {}
 
@@ -386,6 +401,24 @@ func _HubFuse_ConfirmPairing_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HubFuse_ListDevices_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDevicesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HubFuseServer).ListDevices(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HubFuse_ListDevices_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HubFuseServer).ListDevices(ctx, req.(*ListDevicesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // HubFuse_ServiceDesc is the grpc.ServiceDesc for HubFuse service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -424,6 +457,10 @@ var HubFuse_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ConfirmPairing",
 			Handler:    _HubFuse_ConfirmPairing_Handler,
+		},
+		{
+			MethodName: "ListDevices",
+			Handler:    _HubFuse_ListDevices_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
