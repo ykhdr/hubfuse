@@ -421,5 +421,59 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	}
 }
 
+func TestListDevices(t *testing.T) {
+	addr, caCertPEM := startTestHub(t)
+
+	// Join two devices.
+	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+
+	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-list-1",
+		Nickname: "list-alice",
+	})
+	if err != nil || !joinResp1.Success {
+		t.Fatalf("Join dev1: err=%v success=%v", err, joinResp1.GetSuccess())
+	}
+
+	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-list-2",
+		Nickname: "list-bob",
+	})
+	if err != nil || !joinResp2.Success {
+		t.Fatalf("Join dev2: err=%v success=%v", err, joinResp2.GetSuccess())
+	}
+
+	// Register only device 1 (device 2 stays offline).
+	client1 := dialWithClientCert(t, addr, joinResp1.ClientCert, joinResp1.ClientKey, caCertPEM)
+	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
+		SshPort:         2222,
+		ProtocolVersion: int32(common.ProtocolVersion),
+	})
+	if err != nil {
+		t.Fatalf("Register dev1: %v", err)
+	}
+
+	// Call ListDevices as device 1.
+	resp, err := client1.ListDevices(context.Background(), &pb.ListDevicesRequest{})
+	if err != nil {
+		t.Fatalf("ListDevices: %v", err)
+	}
+
+	if len(resp.Devices) != 2 {
+		t.Fatalf("expected 2 devices, got %d", len(resp.Devices))
+	}
+
+	statusMap := map[string]string{}
+	for _, d := range resp.Devices {
+		statusMap[d.Nickname] = d.Status
+	}
+	if statusMap["list-alice"] != "online" {
+		t.Errorf("alice status = %q, want %q", statusMap["list-alice"], "online")
+	}
+	if statusMap["list-bob"] != "offline" {
+		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "offline")
+	}
+}
+
 // Ensure fmt is used (it's used in parseCACertPool if we add it, but let's keep it in case).
 var _ = fmt.Sprintf
