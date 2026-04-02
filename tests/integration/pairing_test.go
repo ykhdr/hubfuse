@@ -8,6 +8,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/ykhdr/hubfuse/internal/common"
 	pb "github.com/ykhdr/hubfuse/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // joinAndRegister is a helper that joins and registers a device, returning the
@@ -280,5 +282,54 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	}
 	if resp2.Success {
 		t.Error("second ConfirmPairing should fail after invite is deleted, got success=true")
+	}
+}
+
+// TestPairing_OfflineDevice verifies that RequestPairing returns a gRPC
+// Unavailable error when the target device is not currently online.
+func TestPairing_OfflineDevice(t *testing.T) {
+	h := startTestHub(t)
+
+	unauthClient := dialNoClientCert(t, h)
+
+	// Join two devices.
+	join1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-po-1",
+		Nickname: "po-alice",
+	})
+	if err != nil || !join1.Success {
+		t.Fatalf("Join dev1: err=%v", err)
+	}
+
+	join2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
+		DeviceId: "dev-po-2",
+		Nickname: "po-bob",
+	})
+	if err != nil || !join2.Success {
+		t.Fatalf("Join dev2: err=%v", err)
+	}
+
+	// Register only device 1.
+	client1 := dialWithClientCert(t, h, join1.ClientCert, join1.ClientKey)
+	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
+		SshPort:         2222,
+		ProtocolVersion: int32(common.ProtocolVersion),
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Pair with offline device — should get Unavailable error.
+	_, err = client1.RequestPairing(context.Background(), &pb.RequestPairingRequest{
+		ToDevice:  "po-bob",
+		PublicKey: "ssh-ed25519 AAAA...",
+	})
+	if err == nil {
+		t.Fatal("expected error pairing with offline device")
+	}
+
+	st := status.Convert(err)
+	if st.Code() != codes.Unavailable {
+		t.Errorf("expected Unavailable, got %v", st.Code())
 	}
 }
