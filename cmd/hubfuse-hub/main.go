@@ -35,6 +35,7 @@ func startCmd() *cobra.Command {
 		dataDir   string
 		logLevel  string
 		logOutput string
+		extraSANs []string
 	)
 
 	cmd := &cobra.Command{
@@ -46,6 +47,7 @@ func startCmd() *cobra.Command {
 				DataDir:    dataDir,
 				LogLevel:   logLevel,
 				LogOutput:  logOutput,
+				ExtraSANs:  extraSANs,
 			}
 
 			h, err := hub.NewHub(cfg)
@@ -78,6 +80,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dataDir, "data-dir", "~/.hubfuse-hub", "data directory")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 
 	return cmd
 }
