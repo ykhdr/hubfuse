@@ -7,7 +7,7 @@ Network file sharing for local networks. Mount remote directories transparently 
 HubFuse uses a hub-and-spoke architecture:
 
 - **Hub** (`hubfuse-hub`) — a central gRPC server that tracks devices, manages pairing, and broadcasts events.
-- **Agent** (`hubfuse-agent`) — a daemon on each device that connects to the hub, exports local directories via an embedded SSH server, and mounts remote shares via SSHFS.
+- **Agent** (`hubfuse`) — a daemon on each device that connects to the hub, exports local directories via an embedded SSH server, and mounts remote shares via SSHFS.
 
 All communication is secured with mTLS. Devices pair using short-lived invite codes to exchange SSH public keys.
 
@@ -30,8 +30,8 @@ make install
 hubfuse-hub start
 
 # On each device — join the hub and start the agent
-hubfuse-agent join --hub <hub-address>:9090
-hubfuse-agent start
+hubfuse join --hub <hub-address>:9090
+hubfuse start
 ```
 
 ## Configuration
@@ -70,7 +70,7 @@ make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
 ```
 cmd/
   hubfuse-hub/          # hub CLI entry point
-  hubfuse-agent/        # agent CLI entry point
+  hubfuse/        # agent CLI entry point
 proto/
   hubfuse.proto         # gRPC service definition
 internal/

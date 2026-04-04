@@ -19,7 +19,7 @@ make test-unit          # go test ./internal/...
 make test-integration   # go test ./tests/integration/... -timeout 120s
 make vet                # go vet ./...
 make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
-make install            # install hubfuse-hub and hubfuse-agent to $GOPATH/bin
+make install            # install hubfuse-hub and hubfuse to $GOPATH/bin
 ```
 
 Run a single test: `go test ./internal/hub/store/... -run TestName`
@@ -29,7 +29,7 @@ Run a single test: `go test ./internal/hub/store/... -run TestName`
 Hub-and-spoke model with two binaries:
 
 - **hubfuse-hub** — Central gRPC server. Manages device registry, pairing, heartbeat monitoring, and event broadcasting. Stores state in SQLite (pure Go, no CGO via `modernc.org/sqlite`).
-- **hubfuse-agent** — Daemon running on each device. Connects to hub, exports local directories via an embedded SSH server, and mounts remote shares via SSHFS.
+- **hubfuse** — Daemon running on each device. Connects to hub, exports local directories via an embedded SSH server, and mounts remote shares via SSHFS.
 
 ### Communication
 
