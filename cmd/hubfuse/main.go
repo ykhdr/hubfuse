@@ -94,7 +94,7 @@ func joinCmd() *cobra.Command {
 			deviceID := uuid.New().String()
 
 			// Dial hub insecurely (no client cert yet).
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, err := agent.DialInsecure(hubAddr, logger)
 			if err != nil {
 				return fmt.Errorf("dial hub: %w", err)
@@ -154,14 +154,27 @@ func joinCmd() *cobra.Command {
 
 // startCmd implements: hubfuse start
 func startCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		logFile  string
+		logLevel string
+		verbose  bool
+	)
+
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the agent daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
 			cfgPath := filepath.Join(dataDir, configFile)
 
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger, err := common.SetupLogger(common.LoggerOptions{
+				LogFile:   logFile,
+				FileLevel: common.ParseLogLevel(logLevel),
+				Verbose:   verbose,
+			})
+			if err != nil {
+				return fmt.Errorf("setup logger: %w", err)
+			}
 
 			daemon, err := agent.NewDaemon(cfgPath, logger)
 			if err != nil {
@@ -196,6 +209,12 @@ func startCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
+
+	return cmd
 }
 
 // stopCmd implements: hubfuse stop
@@ -278,7 +297,7 @@ func pairCmd() *cobra.Command {
 				publicKey = pk
 			}
 
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, _, err := dialHub(dataDir, logger)
 			if err != nil {
 				return fmt.Errorf("connect to hub: %w", err)
@@ -304,7 +323,7 @@ func devicesCmd() *cobra.Command {
 		Short: "List all devices",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, _, err := dialHub(dataDir, logger)
 			if err != nil {
@@ -344,7 +363,7 @@ func renameCmd() *cobra.Command {
 			newNickname := args[0]
 
 			dataDir := expandHome(defaultDataDir)
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, identity, err := dialHub(dataDir, logger)
 			if err != nil {

@@ -33,8 +33,9 @@ func startCmd() *cobra.Command {
 	var (
 		listen    string
 		dataDir   string
+		logFile   string
 		logLevel  string
-		logOutput string
+		verbose   bool
 		extraSANs []string
 	)
 
@@ -45,8 +46,9 @@ func startCmd() *cobra.Command {
 			cfg := hub.HubConfig{
 				ListenAddr: listen,
 				DataDir:    dataDir,
+				LogFile:    logFile,
 				LogLevel:   logLevel,
-				LogOutput:  logOutput,
+				Verbose:    verbose,
 				ExtraSANs:  extraSANs,
 			}
 
@@ -78,8 +80,9 @@ func startCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&listen, "listen", ":9090", "address to listen on")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "~/.hubfuse-hub", "data directory")
-	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
-	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
 	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 
 	return cmd
