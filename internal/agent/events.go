@@ -137,7 +137,7 @@ func (d *Daemon) handleSharesUpdated(e *pb.SharesUpdatedEvent) {
 // the CLI. The daemon does not handle interactive user input directly.
 func (d *Daemon) handlePairingRequested(e *pb.PairingRequestedEvent) {
 	d.logger.Info(
-		fmt.Sprintf("Pairing requested from %q. Run 'hubfuse-agent pair-confirm' to accept.", e.FromNickname),
+		fmt.Sprintf("Pairing requested from %q. Run 'hubfuse pair-confirm' to accept.", e.FromNickname),
 		"from_device_id", e.FromDeviceId,
 		"from_nickname", e.FromNickname,
 	)

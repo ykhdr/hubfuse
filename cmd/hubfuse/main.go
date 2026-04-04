@@ -22,7 +22,7 @@ import (
 const (
 	defaultDataDir = "~/.hubfuse"
 	configFile     = "config.kdl"
-	pidFile        = "hubfuse-agent.pid"
+	pidFile        = "hubfuse.pid"
 	identityFile   = "device.json"
 	tlsDir         = "tls"
 	keysDir        = "keys"
@@ -39,7 +39,7 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse-agent",
+		Use:   "hubfuse",
 		Short: "HubFuse agent daemon",
 	}
 
@@ -69,7 +69,7 @@ func rootCmd() *cobra.Command {
 	return cmd
 }
 
-// joinCmd implements: hubfuse-agent join <hub-address>
+// joinCmd implements: hubfuse join <hub-address>
 func joinCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "join <hub-address>",
@@ -152,7 +152,7 @@ func joinCmd() *cobra.Command {
 	}
 }
 
-// startCmd implements: hubfuse-agent start
+// startCmd implements: hubfuse start
 func startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
@@ -198,7 +198,7 @@ func startCmd() *cobra.Command {
 	}
 }
 
-// stopCmd implements: hubfuse-agent stop
+// stopCmd implements: hubfuse stop
 func stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
@@ -222,7 +222,7 @@ func stopCmd() *cobra.Command {
 	}
 }
 
-// statusCmd implements: hubfuse-agent status
+// statusCmd implements: hubfuse status
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -249,7 +249,7 @@ func statusCmd() *cobra.Command {
 	}
 }
 
-// pairCmd implements: hubfuse-agent pair <device>
+// pairCmd implements: hubfuse pair <device>
 func pairCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pair <device>",
@@ -297,7 +297,7 @@ func pairCmd() *cobra.Command {
 	}
 }
 
-// devicesCmd implements: hubfuse-agent devices
+// devicesCmd implements: hubfuse devices
 func devicesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "devices",
@@ -334,7 +334,7 @@ func devicesCmd() *cobra.Command {
 	}
 }
 
-// renameCmd implements: hubfuse-agent rename <new-nickname>
+// renameCmd implements: hubfuse rename <new-nickname>
 func renameCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rename <new-nickname>",
@@ -380,7 +380,7 @@ func renameCmd() *cobra.Command {
 	}
 }
 
-// shareAddCmd implements: hubfuse-agent share add <path> --alias <name> --permissions <ro|rw> --allow <devices>
+// shareAddCmd implements: hubfuse share add <path> --alias <name> --permissions <ro|rw> --allow <devices>
 func shareAddCmd() *cobra.Command {
 	var (
 		alias       string
@@ -439,7 +439,7 @@ func shareAddCmd() *cobra.Command {
 	return cmd
 }
 
-// shareRemoveCmd implements: hubfuse-agent share remove <alias>
+// shareRemoveCmd implements: hubfuse share remove <alias>
 func shareRemoveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <alias>",
@@ -480,7 +480,7 @@ func shareRemoveCmd() *cobra.Command {
 	}
 }
 
-// shareListCmd implements: hubfuse-agent share list
+// shareListCmd implements: hubfuse share list
 func shareListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -513,7 +513,7 @@ func shareListCmd() *cobra.Command {
 	}
 }
 
-// mountAddCmd implements: hubfuse-agent mount add <device>:<share> --to <local-path>
+// mountAddCmd implements: hubfuse mount add <device>:<share> --to <local-path>
 func mountAddCmd() *cobra.Command {
 	var to string
 
@@ -565,7 +565,7 @@ func mountAddCmd() *cobra.Command {
 	return cmd
 }
 
-// mountRemoveCmd implements: hubfuse-agent mount remove <device>:<share>
+// mountRemoveCmd implements: hubfuse mount remove <device>:<share>
 func mountRemoveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <device>:<share>",
@@ -611,7 +611,7 @@ func mountRemoveCmd() *cobra.Command {
 	}
 }
 
-// mountListCmd implements: hubfuse-agent mount list
+// mountListCmd implements: hubfuse mount list
 func mountListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
