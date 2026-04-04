@@ -4,37 +4,71 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 )
 
-// SetupLogger creates a structured JSON logger with the given level and output
-// target. level must be one of "debug", "info", "warn", or "error". output
-// must be "stderr" or a writable file path.
-func SetupLogger(level string, output string) (*slog.Logger, error) {
-	var lvl slog.Level
+// LoggerOptions configures the logger created by SetupLogger.
+type LoggerOptions struct {
+	// ConsoleLevel is the minimum level for console output (default: Info).
+	ConsoleLevel slog.Level
+
+	// LogFile is the path to a JSON log file. Empty means no file logging.
+	LogFile string
+
+	// FileLevel is the minimum level for file output (default: Debug).
+	FileLevel slog.Level
+
+	// Verbose overrides ConsoleLevel to Debug.
+	Verbose bool
+}
+
+// SetupLogger creates a logger with a human-readable console handler on stderr.
+// If LogFile is set, it also writes structured JSON to that file via a
+// MultiHandler.
+func SetupLogger(opts LoggerOptions) (*slog.Logger, error) {
+	consoleLevel := opts.ConsoleLevel
+	if opts.Verbose {
+		consoleLevel = slog.LevelDebug
+	}
+
+	consoleHandler := NewConsoleHandler(os.Stderr, &slog.HandlerOptions{
+		Level: consoleLevel,
+	})
+
+	if opts.LogFile == "" {
+		return slog.New(consoleHandler), nil
+	}
+
+	// Create parent directories for the log file.
+	if err := os.MkdirAll(filepath.Dir(opts.LogFile), 0755); err != nil {
+		return nil, fmt.Errorf("create log directory: %w", err)
+	}
+
+	f, err := os.OpenFile(opts.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %q: %w", opts.LogFile, err)
+	}
+
+	fileHandler := slog.NewJSONHandler(f, &slog.HandlerOptions{
+		Level: opts.FileLevel,
+	})
+
+	return slog.New(NewMultiHandler(consoleHandler, fileHandler)), nil
+}
+
+// ParseLogLevel converts a level name to slog.Level.
+// Returns slog.LevelDebug for unrecognised values.
+func ParseLogLevel(level string) slog.Level {
 	switch level {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "info":
-		lvl = slog.LevelInfo
+		return slog.LevelInfo
 	case "warn":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
+		return slog.LevelError
 	default:
-		return nil, fmt.Errorf("unsupported log level %q: must be debug, info, warn, or error", level)
+		return slog.LevelDebug
 	}
-
-	var w *os.File
-	if output == "stderr" {
-		w = os.Stderr
-	} else {
-		f, err := os.OpenFile(output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("open log file %q: %w", output, err)
-		}
-		w = f
-	}
-
-	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: lvl})
-	return slog.New(handler), nil
 }
