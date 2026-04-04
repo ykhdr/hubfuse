@@ -25,8 +25,9 @@ import (
 type HubConfig struct {
 	ListenAddr string   // e.g. ":9090"
 	DataDir    string   // e.g. "~/.hubfuse-hub"
-	LogLevel   string   // "debug", "info", "warn", "error"
-	LogOutput  string   // "stderr" or file path
+	LogFile    string   // path to JSON log file ("" = no file logging)
+	LogLevel   string   // file log level: "debug", "info", "warn", "error" (default: "debug")
+	Verbose    bool     // show debug logs in console
 	ExtraSANs  []string // additional SANs for the server TLS certificate
 }
 
@@ -44,7 +45,12 @@ type Hub struct {
 // (or creates) the SQLite database, and loads (or generates) the CA and
 // server TLS certificates.
 func NewHub(config HubConfig) (*Hub, error) {
-	logger, err := common.SetupLogger(config.LogLevel, config.LogOutput)
+	fileLevel := common.ParseLogLevel(config.LogLevel)
+	logger, err := common.SetupLogger(common.LoggerOptions{
+		LogFile:   config.LogFile,
+		FileLevel: fileLevel,
+		Verbose:   config.Verbose,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("setup logger: %w", err)
 	}
