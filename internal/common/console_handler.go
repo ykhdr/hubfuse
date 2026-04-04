@@ -2,11 +2,9 @@ package common
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
@@ -45,9 +43,6 @@ func NewConsoleHandler(w io.Writer, opts *slog.HandlerOptions) *ConsoleHandler {
 	if f, ok := w.(*os.File); ok {
 		fd := f.Fd()
 		useColor = isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
-		if runtime.GOOS == "windows" {
-			useColor = useColor || isatty.IsTerminal(fd)
-		}
 	}
 
 	return &ConsoleHandler{
@@ -69,9 +64,11 @@ func (h *ConsoleHandler) Enabled(_ context.Context, level slog.Level) bool {
 func (h *ConsoleHandler) Handle(_ context.Context, r slog.Record) error {
 	var buf []byte
 
-	// Timestamp.
-	buf = append(buf, r.Time.Format(time.TimeOnly)...)
-	buf = append(buf, ' ')
+	// Timestamp — omitted for zero time.
+	if !r.Time.IsZero() {
+		buf = append(buf, r.Time.Format(time.TimeOnly)...)
+		buf = append(buf, ' ')
+	}
 
 	// Level.
 	levelStr, color := h.levelString(r.Level)
@@ -165,6 +162,29 @@ func (h *ConsoleHandler) appendAttr(buf []byte, a slog.Attr, addGroup bool) []by
 		return buf
 	}
 
+	if a.Value.Kind() == slog.KindGroup {
+		attrs := a.Value.Group()
+		if len(attrs) == 0 {
+			return buf
+		}
+		prefix := a.Key
+		if addGroup && h.groupName != "" {
+			if prefix != "" {
+				prefix = h.groupName + "." + prefix
+			} else {
+				prefix = h.groupName
+			}
+		}
+		for _, ga := range attrs {
+			grouped := slog.Attr{Key: ga.Key, Value: ga.Value}
+			if prefix != "" {
+				grouped.Key = prefix + "." + ga.Key
+			}
+			buf = h.appendFlatAttr(buf, grouped)
+		}
+		return buf
+	}
+
 	buf = append(buf, ' ')
 	if addGroup && h.groupName != "" {
 		buf = append(buf, h.groupName...)
@@ -172,6 +192,35 @@ func (h *ConsoleHandler) appendAttr(buf []byte, a slog.Attr, addGroup bool) []by
 	}
 	buf = append(buf, a.Key...)
 	buf = append(buf, '=')
-	buf = append(buf, fmt.Sprintf("%v", a.Value.Any())...)
+	buf = append(buf, a.Value.String()...)
+	return buf
+}
+
+// appendFlatAttr appends a pre-prefixed key=value pair (no additional group prefix).
+func (h *ConsoleHandler) appendFlatAttr(buf []byte, a slog.Attr) []byte {
+	a.Value = a.Value.Resolve()
+	if a.Equal(slog.Attr{}) {
+		return buf
+	}
+	if a.Value.Kind() == slog.KindGroup {
+		attrs := a.Value.Group()
+		if len(attrs) == 0 {
+			return buf
+		}
+		for _, ga := range attrs {
+			var nested slog.Attr
+			if a.Key != "" {
+				nested = slog.Attr{Key: a.Key + "." + ga.Key, Value: ga.Value}
+			} else {
+				nested = slog.Attr{Key: ga.Key, Value: ga.Value}
+			}
+			buf = h.appendFlatAttr(buf, nested)
+		}
+		return buf
+	}
+	buf = append(buf, ' ')
+	buf = append(buf, a.Key...)
+	buf = append(buf, '=')
+	buf = append(buf, a.Value.String()...)
 	return buf
 }
