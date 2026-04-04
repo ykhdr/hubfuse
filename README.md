@@ -70,7 +70,7 @@ make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
 ```
 cmd/
   hubfuse-hub/          # hub CLI entry point
-  hubfuse/        # agent CLI entry point
+  hubfuse/              # agent CLI entry point
 proto/
   hubfuse.proto         # gRPC service definition
 internal/
