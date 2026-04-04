@@ -29,7 +29,7 @@ jobs:
       - name: Build binaries
         run: |
           go build -o hubfuse-hub ./cmd/hubfuse-hub/
-          go build -o hubfuse-agent ./cmd/hubfuse-agent/
+          go build -o hubfuse ./cmd/hubfuse/
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -37,7 +37,7 @@ jobs:
           name: binaries
           path: |
             hubfuse-hub
-            hubfuse-agent
+            hubfuse
           retention-days: 7
 
   vet:
