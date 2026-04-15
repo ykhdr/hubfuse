@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
 )
 
@@ -35,23 +36,59 @@ func startCmd() *cobra.Command {
 		dataDir   string
 		logLevel  string
 		logOutput string
+		daemon    bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the hub server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			expandedData := expandHome(dataDir)
+			pidPath := filepath.Join(expandedData, "hubfuse-hub.pid")
+			defaultLog := filepath.Join(expandedData, "hub.log")
+
+			// Reject second concurrent start regardless of daemon flag.
+			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
+				return fmt.Errorf("check existing hub: %w", err)
+			} else if alive {
+				return fmt.Errorf("hub already running (pid %d)", pid)
+			}
+
+			// If we're the parent and --daemon was requested, re-exec.
+			if daemon && !daemonize.IsChild() {
+				if err := os.MkdirAll(expandedData, 0o700); err != nil {
+					return fmt.Errorf("create data dir: %w", err)
+				}
+				return daemonize.Spawn(daemonize.SpawnOpts{
+					LogPath:     daemonize.ResolveLogOutput(logOutput, true, defaultLog),
+					PIDFilePath: pidPath,
+				})
+			}
+
+			// Foreground path OR detached child past this point.
+			effectiveLog := daemonize.ResolveLogOutput(logOutput, daemon || daemonize.IsChild(), defaultLog)
+
 			cfg := hub.HubConfig{
 				ListenAddr: listen,
 				DataDir:    dataDir,
 				LogLevel:   logLevel,
-				LogOutput:  logOutput,
+				LogOutput:  effectiveLog,
 			}
 
 			h, err := hub.NewHub(cfg)
 			if err != nil {
 				return fmt.Errorf("create hub: %w", err)
 			}
+			h.OnReady = func() {
+				if err := daemonize.WritePIDFile(pidPath); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
+				}
+			}
+			defer func() {
+				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "warning: remove pid file: %v\n", err)
+				}
+			}()
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -78,6 +115,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dataDir, "data-dir", "~/.hubfuse-hub", "data directory")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 
 	return cmd
 }
