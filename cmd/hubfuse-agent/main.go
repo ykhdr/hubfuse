@@ -17,6 +17,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 )
 
 const (
@@ -154,28 +155,56 @@ func joinCmd() *cobra.Command {
 
 // startCmd implements: hubfuse-agent start
 func startCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		logLevel  string
+		logOutput string
+		daemon    bool
+	)
+
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the agent daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
 			cfgPath := filepath.Join(dataDir, configFile)
+			pidPath := filepath.Join(dataDir, pidFile)
+			defaultLog := filepath.Join(dataDir, "agent.log")
 
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
+				return fmt.Errorf("check existing agent: %w", err)
+			} else if alive {
+				return fmt.Errorf("agent already running (pid %d)", pid)
+			}
 
-			daemon, err := agent.NewDaemon(cfgPath, logger)
+			if daemon && !daemonize.IsChild() {
+				if err := os.MkdirAll(dataDir, 0o700); err != nil {
+					return fmt.Errorf("create data dir: %w", err)
+				}
+				return daemonize.Spawn(daemonize.SpawnOpts{
+					LogPath:     daemonize.ResolveLogOutput(logOutput, true, defaultLog),
+					PIDFilePath: pidPath,
+				})
+			}
+
+			effectiveLog := daemonize.ResolveLogOutput(logOutput, daemon || daemonize.IsChild(), defaultLog)
+
+			logger, err := common.SetupLogger(logLevel, effectiveLog)
+			if err != nil {
+				return fmt.Errorf("setup logger: %w", err)
+			}
+
+			d, err := agent.NewDaemon(cfgPath, logger)
 			if err != nil {
 				return fmt.Errorf("create daemon: %w", err)
 			}
-
-			// Write PID file.
-			pidPath := filepath.Join(dataDir, pidFile)
-			if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-				logger.Warn("failed to write PID file", "path", pidPath, "error", err)
+			d.OnReady = func() {
+				if err := daemonize.WritePIDFile(pidPath); err != nil {
+					logger.Warn("write pid file", "path", pidPath, "error", err)
+				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
-					logger.Warn("failed to remove PID file", "path", pidPath, "error", err)
+					logger.Warn("remove pid file", "path", pidPath, "error", err)
 				}
 			}()
 
@@ -190,12 +219,18 @@ func startCmd() *cobra.Command {
 				cancel()
 			}()
 
-			if err := daemon.Run(ctx); err != nil {
+			if err := d.Run(ctx); err != nil {
 				return fmt.Errorf("daemon run: %w", err)
 			}
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
+
+	return cmd
 }
 
 // stopCmd implements: hubfuse-agent stop
