@@ -23,7 +23,7 @@ import (
 const (
 	defaultDataDir = "~/.hubfuse"
 	configFile     = "config.kdl"
-	pidFile        = "hubfuse-agent.pid"
+	pidFile        = "hubfuse.pid"
 	identityFile   = "device.json"
 	tlsDir         = "tls"
 	keysDir        = "keys"
@@ -40,7 +40,7 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse-agent",
+		Use:   "hubfuse",
 		Short: "HubFuse agent daemon",
 	}
 
@@ -70,7 +70,7 @@ func rootCmd() *cobra.Command {
 	return cmd
 }
 
-// joinCmd implements: hubfuse-agent join <hub-address>
+// joinCmd implements: hubfuse join <hub-address>
 func joinCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "join <hub-address>",
@@ -95,7 +95,7 @@ func joinCmd() *cobra.Command {
 			deviceID := uuid.New().String()
 
 			// Dial hub insecurely (no client cert yet).
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, err := agent.DialInsecure(hubAddr, logger)
 			if err != nil {
 				return fmt.Errorf("dial hub: %w", err)
@@ -153,12 +153,13 @@ func joinCmd() *cobra.Command {
 	}
 }
 
-// startCmd implements: hubfuse-agent start
+// startCmd implements: hubfuse start
 func startCmd() *cobra.Command {
 	var (
-		logLevel  string
-		logOutput string
-		daemon    bool
+		logFile  string
+		logLevel string
+		verbose  bool
+		daemon   bool
 	)
 
 	cmd := &cobra.Command{
@@ -170,25 +171,31 @@ func startCmd() *cobra.Command {
 			pidPath := filepath.Join(dataDir, pidFile)
 			defaultLog := filepath.Join(dataDir, "agent.log")
 
+			// Reject second concurrent start regardless of daemon flag.
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
 				return fmt.Errorf("check existing agent: %w", err)
 			} else if alive {
 				return fmt.Errorf("agent already running (pid %d)", pid)
 			}
 
+			// If we're the parent and --daemon was requested, re-exec.
+			// The detached child's stdout/stderr (which is where the
+			// console-handler logs land) gets redirected into defaultLog.
 			if daemon && !daemonize.IsChild() {
 				if err := os.MkdirAll(dataDir, 0o700); err != nil {
 					return fmt.Errorf("create data dir: %w", err)
 				}
 				return daemonize.Spawn(daemonize.SpawnOpts{
-					LogPath:     daemonize.ResolveLogOutput(logOutput, true, defaultLog),
+					LogPath:     defaultLog,
 					PIDFilePath: pidPath,
 				})
 			}
 
-			effectiveLog := daemonize.ResolveLogOutput(logOutput, daemon || daemonize.IsChild(), defaultLog)
-
-			logger, err := common.SetupLogger(logLevel, effectiveLog)
+			logger, err := common.SetupLogger(common.LoggerOptions{
+				LogFile:   logFile,
+				FileLevel: common.ParseLogLevel(logLevel),
+				Verbose:   verbose,
+			})
 			if err != nil {
 				return fmt.Errorf("setup logger: %w", err)
 			}
@@ -226,14 +233,15 @@ func startCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
-	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
 	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 
 	return cmd
 }
 
-// stopCmd implements: hubfuse-agent stop
+// stopCmd implements: hubfuse stop
 func stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
@@ -257,7 +265,7 @@ func stopCmd() *cobra.Command {
 	}
 }
 
-// statusCmd implements: hubfuse-agent status
+// statusCmd implements: hubfuse status
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
@@ -284,7 +292,7 @@ func statusCmd() *cobra.Command {
 	}
 }
 
-// pairCmd implements: hubfuse-agent pair <device>
+// pairCmd implements: hubfuse pair <device>
 func pairCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pair <device>",
@@ -313,7 +321,7 @@ func pairCmd() *cobra.Command {
 				publicKey = pk
 			}
 
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, _, err := dialHub(dataDir, logger)
 			if err != nil {
 				return fmt.Errorf("connect to hub: %w", err)
@@ -332,14 +340,14 @@ func pairCmd() *cobra.Command {
 	}
 }
 
-// devicesCmd implements: hubfuse-agent devices
+// devicesCmd implements: hubfuse devices
 func devicesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "devices",
-		Short: "List online devices",
+		Short: "List all devices",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, _, err := dialHub(dataDir, logger)
 			if err != nil {
@@ -347,27 +355,29 @@ func devicesCmd() *cobra.Command {
 			}
 			defer hubClient.Close()
 
-			resp, err := hubClient.Register(context.Background(), nil, 0)
+			resp, err := hubClient.ListDevices(context.Background())
 			if err != nil {
-				return fmt.Errorf("get device list: %w", err)
+				return fmt.Errorf("list devices: %w", err)
 			}
 
-			if len(resp.DevicesOnline) == 0 {
-				fmt.Println("no devices online")
+			if len(resp.Devices) == 0 {
+				fmt.Println("no devices registered")
 				return nil
 			}
 
-			fmt.Printf("%-40s  %-20s  %s\n", "DEVICE ID", "NICKNAME", "IP")
-			fmt.Printf("%-40s  %-20s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 20), strings.Repeat("-", 15))
-			for _, d := range resp.DevicesOnline {
-				fmt.Printf("%-40s  %-20s  %s\n", d.DeviceId, d.Nickname, d.Ip)
+			fmt.Printf("%-40s  %-20s  %-8s  %s\n", "DEVICE ID", "NICKNAME", "STATUS", "IP")
+			fmt.Printf("%-40s  %-20s  %-8s  %s\n",
+				strings.Repeat("-", 40), strings.Repeat("-", 20),
+				strings.Repeat("-", 8), strings.Repeat("-", 15))
+			for _, d := range resp.Devices {
+				fmt.Printf("%-40s  %-20s  %-8s  %s\n", d.DeviceId, d.Nickname, d.Status, d.Ip)
 			}
 			return nil
 		},
 	}
 }
 
-// renameCmd implements: hubfuse-agent rename <new-nickname>
+// renameCmd implements: hubfuse rename <new-nickname>
 func renameCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rename <new-nickname>",
@@ -377,7 +387,7 @@ func renameCmd() *cobra.Command {
 			newNickname := args[0]
 
 			dataDir := expandHome(defaultDataDir)
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, identity, err := dialHub(dataDir, logger)
 			if err != nil {
@@ -413,7 +423,7 @@ func renameCmd() *cobra.Command {
 	}
 }
 
-// shareAddCmd implements: hubfuse-agent share add <path> --alias <name> --permissions <ro|rw> --allow <devices>
+// shareAddCmd implements: hubfuse share add <path> --alias <name> --permissions <ro|rw> --allow <devices>
 func shareAddCmd() *cobra.Command {
 	var (
 		alias       string
@@ -472,7 +482,7 @@ func shareAddCmd() *cobra.Command {
 	return cmd
 }
 
-// shareRemoveCmd implements: hubfuse-agent share remove <alias>
+// shareRemoveCmd implements: hubfuse share remove <alias>
 func shareRemoveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <alias>",
@@ -513,7 +523,7 @@ func shareRemoveCmd() *cobra.Command {
 	}
 }
 
-// shareListCmd implements: hubfuse-agent share list
+// shareListCmd implements: hubfuse share list
 func shareListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -546,7 +556,7 @@ func shareListCmd() *cobra.Command {
 	}
 }
 
-// mountAddCmd implements: hubfuse-agent mount add <device>:<share> --to <local-path>
+// mountAddCmd implements: hubfuse mount add <device>:<share> --to <local-path>
 func mountAddCmd() *cobra.Command {
 	var to string
 
@@ -598,7 +608,7 @@ func mountAddCmd() *cobra.Command {
 	return cmd
 }
 
-// mountRemoveCmd implements: hubfuse-agent mount remove <device>:<share>
+// mountRemoveCmd implements: hubfuse mount remove <device>:<share>
 func mountRemoveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <device>:<share>",
@@ -644,7 +654,7 @@ func mountRemoveCmd() *cobra.Command {
 	}
 }
 
-// mountListCmd implements: hubfuse-agent mount list
+// mountListCmd implements: hubfuse mount list
 func mountListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",

@@ -173,9 +173,10 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 	// Create a second device and establish a pairing — we want to verify the
 	// pairing survives the restart.
 	devB := "reconnect-b-" + uuid.New().String()
+	nickB := "reconnect-bob-" + uuid.New().String()
 	joinRespB, err := unauthClient1.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: devB,
-		Nickname: "reconnect-bob-" + uuid.New().String(),
+		Nickname: nickB,
 	})
 	if err != nil || !joinRespB.Success {
 		t.Fatalf("Join B before restart: err=%v success=%v", err, joinRespB.GetSuccess())
@@ -189,9 +190,9 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 		t.Fatalf("Register B before restart: err=%v", err)
 	}
 
-	// A requests pairing with B.
+	// A requests pairing with B (by nickname).
 	pairResp, err := authedClient1.RequestPairing(context.Background(), &pb.RequestPairingRequest{
-		ToDevice:  devB,
+		ToDevice:  nickB,
 		PublicKey: "pk-alice",
 	})
 	if err != nil {
@@ -254,7 +255,7 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 
 	// Attempting RequestPairing again must fail because they are already paired.
 	_, pairErr := authedClient2.RequestPairing(context.Background(), &pb.RequestPairingRequest{
-		ToDevice:  devB,
+		ToDevice:  nickB,
 		PublicKey: "pk-alice",
 	})
 	if pairErr == nil {

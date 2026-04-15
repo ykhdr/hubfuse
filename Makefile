@@ -18,7 +18,7 @@ vet:
 	go vet ./...
 
 clean:
-	rm -f hubfuse-hub hubfuse-agent
+	rm -f hubfuse-hub hubfuse
 
 install:
-	go install ./cmd/hubfuse-hub/ ./cmd/hubfuse-agent/
+	go install ./cmd/hubfuse-hub/ ./cmd/hubfuse/

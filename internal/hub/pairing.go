@@ -10,6 +10,8 @@ import (
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
 	pb "github.com/ykhdr/hubfuse/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -21,25 +23,29 @@ const (
 )
 
 // RequestPairing initiates a pairing request from fromDevice to toDevice.
-// Both devices must exist and be online. Returns common.ErrPairingAlreadyExists
-// if they are already paired. On success it sends a PairingRequested event to
-// the target device and returns the generated invite code.
+// toDevice is a human-readable nickname. Both devices must exist and be online.
+// Returns common.ErrPairingAlreadyExists if they are already paired. On success
+// it sends a PairingRequested event to the target device and returns the
+// generated invite code.
 func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, publicKey string) (string, error) {
 	from, err := r.store.GetDevice(ctx, fromDevice)
 	if err != nil {
 		return "", common.ErrDeviceNotFound
 	}
 
-	to, err := r.store.GetDevice(ctx, toDevice)
+	to, err := r.store.GetDeviceByNickname(ctx, toDevice)
 	if err != nil {
-		return "", common.ErrDeviceNotFound
+		return "", status.Errorf(codes.NotFound, "no device with nickname %q", toDevice)
 	}
 
-	if from.Status != "online" || to.Status != "online" {
+	if from.Status != "online" {
 		return "", common.ErrDeviceNotFound
 	}
+	if to.Status != "online" {
+		return "", status.Errorf(codes.Unavailable, "%s is not currently connected", toDevice)
+	}
 
-	paired, err := r.store.IsPaired(ctx, fromDevice, toDevice)
+	paired, err := r.store.IsPaired(ctx, fromDevice, to.DeviceID)
 	if err != nil {
 		return "", err
 	}
@@ -52,7 +58,7 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 	inv := &store.PendingInvite{
 		InviteCode:    code,
 		FromDevice:    fromDevice,
-		ToDevice:      toDevice,
+		ToDevice:      to.DeviceID,
 		FromPublicKey: publicKey,
 		ExpiresAt:     time.Now().Add(inviteCodeTTL),
 		Attempts:      0,
@@ -70,7 +76,7 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 			},
 		},
 	}
-	r.sendToDevice(toDevice, event)
+	r.sendToDevice(to.DeviceID, event)
 
 	return code, nil
 }

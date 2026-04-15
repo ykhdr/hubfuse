@@ -35,8 +35,10 @@ func startCmd() *cobra.Command {
 	var (
 		listen    string
 		dataDir   string
+		logFile   string
 		logLevel  string
-		logOutput string
+		verbose   bool
+		extraSANs []string
 		daemon    bool
 	)
 
@@ -56,24 +58,25 @@ func startCmd() *cobra.Command {
 			}
 
 			// If we're the parent and --daemon was requested, re-exec.
+			// The detached child's stdout/stderr (which is where the
+			// console-handler logs land) gets redirected into defaultLog.
 			if daemon && !daemonize.IsChild() {
 				if err := os.MkdirAll(expandedData, 0o700); err != nil {
 					return fmt.Errorf("create data dir: %w", err)
 				}
 				return daemonize.Spawn(daemonize.SpawnOpts{
-					LogPath:     daemonize.ResolveLogOutput(logOutput, true, defaultLog),
+					LogPath:     defaultLog,
 					PIDFilePath: pidPath,
 				})
 			}
 
-			// Foreground path OR detached child past this point.
-			effectiveLog := daemonize.ResolveLogOutput(logOutput, daemon || daemonize.IsChild(), defaultLog)
-
 			cfg := hub.HubConfig{
 				ListenAddr: listen,
 				DataDir:    dataDir,
+				LogFile:    logFile,
 				LogLevel:   logLevel,
-				LogOutput:  effectiveLog,
+				Verbose:    verbose,
+				ExtraSANs:  extraSANs,
 			}
 
 			h, err := hub.NewHub(cfg)
@@ -114,8 +117,10 @@ func startCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&listen, "listen", ":9090", "address to listen on")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "~/.hubfuse-hub", "data directory")
-	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
-	cmd.Flags().StringVar(&logOutput, "log-output", "stderr", "log output (stderr or file path)")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
+	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 
 	return cmd

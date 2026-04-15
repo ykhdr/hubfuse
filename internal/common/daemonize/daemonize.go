@@ -114,19 +114,3 @@ func CheckRunning(path string) (int, bool, error) {
 	}
 	return pid, true, nil
 }
-
-// ResolveLogOutput picks the effective log destination.
-//
-// If userFlag is an explicit file path, it wins unconditionally. If
-// userFlag is empty or the literal "stderr", the result is "stderr" in
-// foreground mode and defaultPath in daemon mode — because a detached
-// process has no controlling terminal to write to.
-func ResolveLogOutput(userFlag string, daemon bool, defaultPath string) string {
-	if userFlag != "" && userFlag != "stderr" {
-		return userFlag
-	}
-	if daemon {
-		return defaultPath
-	}
-	return "stderr"
-}

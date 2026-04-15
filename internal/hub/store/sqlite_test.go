@@ -741,6 +741,43 @@ func TestStoreErrors(t *testing.T) {
 	}
 }
 
+func TestListAllDevices(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	d1 := makeDevice("dev-1", "alice")
+	d2 := makeDevice("dev-2", "bob")
+	if err := s.CreateDevice(ctx, d1); err != nil {
+		t.Fatalf("CreateDevice d1: %v", err)
+	}
+	if err := s.CreateDevice(ctx, d2); err != nil {
+		t.Fatalf("CreateDevice d2: %v", err)
+	}
+	// Mark d1 online.
+	if err := s.UpdateDeviceStatus(ctx, "dev-1", "online", "10.0.0.1", 2222); err != nil {
+		t.Fatalf("UpdateDeviceStatus: %v", err)
+	}
+
+	devices, err := s.ListAllDevices(ctx)
+	if err != nil {
+		t.Fatalf("ListAllDevices: %v", err)
+	}
+	if len(devices) != 2 {
+		t.Fatalf("expected 2 devices, got %d", len(devices))
+	}
+
+	statusMap := map[string]string{}
+	for _, d := range devices {
+		statusMap[d.DeviceID] = d.Status
+	}
+	if statusMap["dev-1"] != "online" {
+		t.Errorf("dev-1 status = %q, want %q", statusMap["dev-1"], "online")
+	}
+	if statusMap["dev-2"] != "offline" {
+		t.Errorf("dev-2 status = %q, want %q", statusMap["dev-2"], "offline")
+	}
+}
+
 // TestUpdateHeartbeat_Idempotent verifies that calling UpdateHeartbeat multiple
 // times on the same device succeeds without error.
 func TestUpdateHeartbeat_Idempotent(t *testing.T) {

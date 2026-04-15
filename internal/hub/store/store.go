@@ -24,6 +24,9 @@ type Store interface {
 	// ListOnlineDevices returns all devices whose status is "online".
 	ListOnlineDevices(ctx context.Context) ([]*Device, error)
 
+	// ListAllDevices returns all devices regardless of status.
+	ListAllDevices(ctx context.Context) ([]*Device, error)
+
 	// UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
 	UpdateDeviceStatus(ctx context.Context, deviceID string, status string, ip string, sshPort int) error
 

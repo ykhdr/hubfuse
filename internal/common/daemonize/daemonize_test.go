@@ -149,29 +149,3 @@ func newDeadPIDCmd(t *testing.T) *exec.Cmd {
 	}
 	return cmd
 }
-
-func TestResolveLogOutput(t *testing.T) {
-	cases := []struct {
-		name        string
-		userFlag    string
-		daemon      bool
-		defaultPath string
-		want        string
-	}{
-		{"foreground default stderr", "stderr", false, "/tmp/x.log", "stderr"},
-		{"daemon default upgrades to path", "stderr", true, "/tmp/x.log", "/tmp/x.log"},
-		{"user override wins foreground", "/custom/a.log", false, "/tmp/x.log", "/custom/a.log"},
-		{"user override wins daemon", "/custom/a.log", true, "/tmp/x.log", "/custom/a.log"},
-		{"empty userFlag treated as stderr foreground", "", false, "/tmp/x.log", "stderr"},
-		{"empty userFlag treated as stderr daemon", "", true, "/tmp/x.log", "/tmp/x.log"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := ResolveLogOutput(tc.userFlag, tc.daemon, tc.defaultPath)
-			if got != tc.want {
-				t.Fatalf("ResolveLogOutput(%q, %v, %q) = %q; want %q",
-					tc.userFlag, tc.daemon, tc.defaultPath, got, tc.want)
-			}
-		})
-	}
-}

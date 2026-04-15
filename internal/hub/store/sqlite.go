@@ -136,6 +136,19 @@ func (s *sqliteStore) ListOnlineDevices(ctx context.Context) ([]*Device, error) 
 	return scanDevices(rows)
 }
 
+// ListAllDevices returns all devices regardless of status.
+func (s *sqliteStore) ListAllDevices(ctx context.Context) ([]*Device, error) {
+	const q = `
+		SELECT device_id, nickname, last_ip, ssh_port, status, last_heartbeat
+		FROM devices`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list all devices: %w", err)
+	}
+	defer rows.Close()
+	return scanDevices(rows)
+}
+
 // UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
 func (s *sqliteStore) UpdateDeviceStatus(ctx context.Context, deviceID string, status string, ip string, sshPort int) error {
 	const q = `UPDATE devices SET status = ?, last_ip = ?, ssh_port = ? WHERE device_id = ?`
