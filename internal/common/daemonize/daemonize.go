@@ -61,6 +61,21 @@ func WritePIDFile(path string) error {
 	return nil
 }
 
+// ReadPID reads an integer PID from a PID file. Trailing whitespace
+// is trimmed. Returns a wrapped error that includes the path on any
+// failure.
+func ReadPID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read pidfile %q: %w", path, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse pidfile %q: %w", path, err)
+	}
+	return pid, nil
+}
+
 // CheckRunning inspects path and reports whether it contains a live PID.
 //
 //   - If path does not exist → returns (0, false, nil).
