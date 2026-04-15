@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
@@ -36,6 +35,11 @@ type Hub struct {
 	heartbeat  *HeartbeatMonitor
 	grpcServer *grpc.Server
 	logger     *slog.Logger
+
+	// OnReady, if non-nil, is invoked exactly once from Start right
+	// after net.Listen returns. The hub is serving at that point. The
+	// cmd layer uses this hook to write the PID file.
+	OnReady func()
 }
 
 // NewHub creates a Hub from the given config. It sets up the logger, opens
@@ -78,7 +82,8 @@ func NewHub(config HubConfig) (*Hub, error) {
 }
 
 // Start begins serving gRPC requests and starts the heartbeat monitor. It
-// writes a PID file and blocks until the gRPC server stops.
+// invokes OnReady (if set) once the listener is up, and blocks until the
+// gRPC server stops.
 func (h *Hub) Start(ctx context.Context) error {
 	dataDir := expandHome(h.config.DataDir)
 	tlsDir := filepath.Join(dataDir, "tls")
@@ -108,9 +113,8 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("listen on %q: %w", h.config.ListenAddr, err)
 	}
 
-	pidFile := filepath.Join(dataDir, "hubfuse-hub.pid")
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-		h.logger.Warn("failed to write PID file", slog.String("path", pidFile), slog.Any("error", err))
+	if h.OnReady != nil {
+		h.OnReady()
 	}
 
 	// Start heartbeat monitor in the background.
@@ -126,7 +130,7 @@ func (h *Hub) Start(ctx context.Context) error {
 }
 
 // Stop performs a graceful shutdown: broadcasts DeviceOffline for all online
-// devices, stops the gRPC server, closes the store, and removes the PID file.
+// devices, stops the gRPC server, and closes the store.
 func (h *Hub) Stop() error {
 	ctx := context.Background()
 
@@ -159,12 +163,6 @@ func (h *Hub) Stop() error {
 
 	if err := h.store.Close(); err != nil {
 		h.logger.Warn("stop: close store", slog.Any("error", err))
-	}
-
-	dataDir := expandHome(h.config.DataDir)
-	pidFile := filepath.Join(dataDir, "hubfuse-hub.pid")
-	if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-		h.logger.Warn("stop: remove PID file", slog.Any("error", err))
 	}
 
 	return nil
