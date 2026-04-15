@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/spf13/cobra"
 )
 
 // LoggerOptions configures the logger created by SetupLogger.
@@ -70,5 +72,29 @@ func ParseLogLevel(level string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelDebug
+	}
+}
+
+// RegisterLogFlags wires --log-file, --log-level, and --verbose
+// onto the given command and returns a function that builds the
+// final LoggerOptions from the parsed flags. Callers must call the
+// returned thunk after cobra parses args (typically at the top of
+// RunE).
+func RegisterLogFlags(cmd *cobra.Command) func() LoggerOptions {
+	var (
+		logFile  string
+		logLevel string
+		verbose  bool
+	)
+	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
+
+	return func() LoggerOptions {
+		return LoggerOptions{
+			LogFile:   logFile,
+			FileLevel: ParseLogLevel(logLevel),
+			Verbose:   verbose,
+		}
 	}
 }

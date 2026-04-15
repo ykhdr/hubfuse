@@ -284,3 +284,16 @@ func randomSerial() (*big.Int, error) {
 	}
 	return serial, nil
 }
+
+// EncodeCACertPEM returns the PEM-encoded certificate suitable for
+// writing to disk or embedding in a TLS config. The input cert must
+// be either freshly generated (with Raw populated) or parsed from an
+// existing PEM.
+func EncodeCACertPEM(cert *x509.Certificate) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: cert.Raw})
+}
+
+// EncodeCAKeyPEM returns the PEM-encoded PKCS#1 private key.
+func EncodeCAKeyPEM(key *rsa.PrivateKey) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: pemTypeKey, Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
