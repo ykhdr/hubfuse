@@ -15,3 +15,11 @@ linters:
       - linters:
           - errcheck
         source: "\\.(Close|Stop)\\("
+      # SA9003 ("empty branch") flags the pattern
+      #   if err := x(); err != nil { /* comment */ }
+      # which we use intentionally to document "we don't care about
+      # this error" with a local note. The explicit if-form is clearer
+      # than `_ = x()` when the reason deserves a comment.
+      - linters:
+          - staticcheck
+        text: "SA9003:"
