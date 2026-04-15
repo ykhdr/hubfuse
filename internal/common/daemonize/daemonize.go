@@ -5,6 +5,7 @@
 package daemonize
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,8 +65,13 @@ func WritePIDFile(path string) error {
 //
 //   - If path does not exist → returns (0, false, nil).
 //   - If path exists and the PID is alive → (pid, true, nil).
-//   - If path exists but the PID is gone (stale) → the file is removed
-//     and (0, false, nil) is returned.
+//   - If path exists but the PID is gone (stale, ESRCH) → the file is
+//     removed and (0, false, nil) is returned.
+//   - If the PID exists but we lack permission to signal it (EPERM, e.g.
+//     the process runs as a different user) → treat it as alive and
+//     return (pid, true, nil) without removing the file. Reporting
+//     "stale" here would let a second instance start while the original
+//     is still running.
 //   - I/O problems (permission errors, malformed contents) surface as
 //     non-nil err with (0, false, err).
 //
@@ -96,9 +102,13 @@ func CheckRunning(path string) (int, bool, error) {
 		return 0, false, nil
 	}
 	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		// Process is gone (ESRCH) or we can't signal it (EPERM). In
-		// either case treat the PID file as stale and remove it so the
-		// next start can proceed.
+		// EPERM means the process exists but we can't signal it — it's
+		// alive and the pidfile is NOT stale.
+		if errors.Is(err, syscall.EPERM) {
+			return pid, true, nil
+		}
+		// Anything else (typically ESRCH) means the process is gone;
+		// clean up the stale pidfile so the next start can proceed.
 		_ = os.Remove(path)
 		return 0, false, nil
 	}

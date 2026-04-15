@@ -37,8 +37,10 @@ type Hub struct {
 	logger     *slog.Logger
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
-	// after net.Listen returns. The hub is serving at that point. The
-	// cmd layer uses this hook to write the PID file.
+	// after net.Listen returns — the TCP listener is bound and the
+	// kernel is already queueing SYNs, and grpcServer.Serve runs
+	// immediately after the callback. The cmd layer uses this hook to
+	// write the PID file.
 	OnReady func()
 }
 

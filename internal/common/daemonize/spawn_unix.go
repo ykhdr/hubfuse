@@ -5,6 +5,7 @@ package daemonize
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,13 +149,49 @@ func stripDaemonFlag(argv []string) []string {
 	return out
 }
 
+// tailMaxBytes caps how much of a log file tailFile reads from disk.
+// Startup-failure logs are usually tiny, but a daemon sharing a long-
+// lived log file across restarts can accumulate megabytes — we only
+// need the last few lines, so bound the read.
+const tailMaxBytes = 64 * 1024
+
 // tailFile returns the last n lines of path, or a short diagnostic
-// string if the file cannot be read.
+// string if the file cannot be read. It reads at most tailMaxBytes
+// from the end of the file to keep memory bounded regardless of log
+// size.
 func tailFile(path string, n int) string {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Sprintf("(log unavailable: %v)", err)
 	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Sprintf("(log unavailable: %v)", err)
+	}
+
+	readFrom := int64(0)
+	if stat.Size() > tailMaxBytes {
+		readFrom = stat.Size() - tailMaxBytes
+	}
+	if _, err := f.Seek(readFrom, 0); err != nil {
+		return fmt.Sprintf("(log unavailable: %v)", err)
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Sprintf("(log unavailable: %v)", err)
+	}
+
+	// If we truncated from the middle of a line, drop that partial
+	// first line so we don't emit garbage.
+	if readFrom > 0 {
+		if i := strings.IndexByte(string(data), '\n'); i >= 0 {
+			data = data[i+1:]
+		}
+	}
+
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
