@@ -4,7 +4,6 @@ package daemonize
 
 import (
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -198,7 +197,3 @@ func waitForDeath(t *testing.T, pid int, timeout time.Duration) {
 	}
 	t.Fatalf("process %d still alive after %s", pid, timeout)
 }
-
-// keep the linter happy for imports we reference below once Spawn is
-// implemented; these helpers are used there.
-var _ = exec.Command
