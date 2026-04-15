@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -187,7 +188,7 @@ func readPID(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	pid, err := strconv.Atoi(string(data))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		return 0, fmt.Errorf("parse PID: %w", err)
 	}
