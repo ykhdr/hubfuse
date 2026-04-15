@@ -2,6 +2,7 @@ package daemonize
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -69,4 +70,82 @@ func TestWritePIDFile_AtomicOverwrite(t *testing.T) {
 	if strings.Contains(string(data), "leftover-junk") {
 		t.Fatalf("pidfile still has old contents: %q", data)
 	}
+}
+
+func TestCheckRunning_NoFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nope.pid")
+
+	pid, alive, err := CheckRunning(path)
+	if err != nil {
+		t.Fatalf("CheckRunning: %v", err)
+	}
+	if alive {
+		t.Fatal("alive=true with no pidfile; want false")
+	}
+	if pid != 0 {
+		t.Fatalf("pid=%d; want 0", pid)
+	}
+}
+
+func TestCheckRunning_LivePID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.pid")
+	if err := WritePIDFile(path); err != nil {
+		t.Fatalf("seed pidfile: %v", err)
+	}
+
+	pid, alive, err := CheckRunning(path)
+	if err != nil {
+		t.Fatalf("CheckRunning: %v", err)
+	}
+	if !alive {
+		t.Fatal("alive=false for own pid; want true")
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("pid=%d; want %d", pid, os.Getpid())
+	}
+}
+
+func TestCheckRunning_StalePID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stale.pid")
+
+	// Find a PID that's definitely dead: spawn a short-lived child, wait
+	// for it to exit, then write its PID.
+	cmd := newDeadPIDCmd(t)
+	stalePID := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		// exit error is expected; we just need the process to be gone.
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(stalePID)+"\n"), 0o644); err != nil {
+		t.Fatalf("seed stale pidfile: %v", err)
+	}
+
+	pid, alive, err := CheckRunning(path)
+	if err != nil {
+		t.Fatalf("CheckRunning: %v", err)
+	}
+	if alive {
+		t.Fatalf("alive=true for dead pid %d; want false", stalePID)
+	}
+	if pid != 0 {
+		t.Fatalf("pid=%d; want 0 (stale)", pid)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale pidfile still exists: %v", err)
+	}
+}
+
+// newDeadPIDCmd starts /bin/sh that exits immediately. Caller must Wait()
+// to reap it; the returned cmd's Process.Pid is then safe to use as a
+// pid that no longer refers to a live process (in practice the kernel
+// reuses PIDs only after a long cycle).
+func newDeadPIDCmd(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	return cmd
 }

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 )
 
 // EnvDaemonized is the environment variable the parent sets on the
@@ -56,4 +58,49 @@ func WritePIDFile(path string) error {
 		return fmt.Errorf("rename tmp pidfile to %q: %w", path, err)
 	}
 	return nil
+}
+
+// CheckRunning inspects path and reports whether it contains a live PID.
+//
+//   - If path does not exist → returns (0, false, nil).
+//   - If path exists and the PID is alive → (pid, true, nil).
+//   - If path exists but the PID is gone (stale) → the file is removed
+//     and (0, false, nil) is returned.
+//   - I/O problems (permission errors, malformed contents) surface as
+//     non-nil err with (0, false, err).
+//
+// Liveness is probed with os.FindProcess followed by proc.Signal(0),
+// which is the POSIX idiom for "does this process exist and can I send
+// it signals?". On Unix, FindProcess never fails, so the Signal call is
+// authoritative.
+func CheckRunning(path string) (int, bool, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read pidfile %q: %w", path, err)
+	}
+
+	trimmed := strings.TrimSpace(string(data))
+	pid, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse pidfile %q (contents %q): %w", path, trimmed, err)
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		// Not reachable on Unix (FindProcess always succeeds) but we
+		// handle it defensively.
+		_ = os.Remove(path)
+		return 0, false, nil
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		// Process is gone (ESRCH) or we can't signal it (EPERM). In
+		// either case treat the PID file as stale and remove it so the
+		// next start can proceed.
+		_ = os.Remove(path)
+		return 0, false, nil
+	}
+	return pid, true, nil
 }
