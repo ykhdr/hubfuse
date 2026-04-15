@@ -17,6 +17,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 )
 
 const (
@@ -158,6 +159,7 @@ func startCmd() *cobra.Command {
 		logFile  string
 		logLevel string
 		verbose  bool
+		daemon   bool
 	)
 
 	cmd := &cobra.Command{
@@ -166,6 +168,28 @@ func startCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dataDir := expandHome(defaultDataDir)
 			cfgPath := filepath.Join(dataDir, configFile)
+			pidPath := filepath.Join(dataDir, pidFile)
+			defaultLog := filepath.Join(dataDir, "agent.log")
+
+			// Reject second concurrent start regardless of daemon flag.
+			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
+				return fmt.Errorf("check existing agent: %w", err)
+			} else if alive {
+				return fmt.Errorf("agent already running (pid %d)", pid)
+			}
+
+			// If we're the parent and --daemon was requested, re-exec.
+			// The detached child's stdout/stderr (which is where the
+			// console-handler logs land) gets redirected into defaultLog.
+			if daemon && !daemonize.IsChild() {
+				if err := os.MkdirAll(dataDir, 0o700); err != nil {
+					return fmt.Errorf("create data dir: %w", err)
+				}
+				return daemonize.Spawn(daemonize.SpawnOpts{
+					LogPath:     defaultLog,
+					PIDFilePath: pidPath,
+				})
+			}
 
 			logger, err := common.SetupLogger(common.LoggerOptions{
 				LogFile:   logFile,
@@ -176,19 +200,18 @@ func startCmd() *cobra.Command {
 				return fmt.Errorf("setup logger: %w", err)
 			}
 
-			daemon, err := agent.NewDaemon(cfgPath, logger)
+			d, err := agent.NewDaemon(cfgPath, logger)
 			if err != nil {
 				return fmt.Errorf("create daemon: %w", err)
 			}
-
-			// Write PID file.
-			pidPath := filepath.Join(dataDir, pidFile)
-			if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-				logger.Warn("failed to write PID file", "path", pidPath, "error", err)
+			d.OnReady = func() {
+				if err := daemonize.WritePIDFile(pidPath); err != nil {
+					logger.Warn("write pid file", "path", pidPath, "error", err)
+				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
-					logger.Warn("failed to remove PID file", "path", pidPath, "error", err)
+					logger.Warn("remove pid file", "path", pidPath, "error", err)
 				}
 			}()
 
@@ -203,7 +226,7 @@ func startCmd() *cobra.Command {
 				cancel()
 			}()
 
-			if err := daemon.Run(ctx); err != nil {
+			if err := d.Run(ctx); err != nil {
 				return fmt.Errorf("daemon run: %w", err)
 			}
 			return nil
@@ -213,6 +236,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
+	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 
 	return cmd
 }

@@ -7,9 +7,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
 )
 
@@ -37,12 +39,37 @@ func startCmd() *cobra.Command {
 		logLevel  string
 		verbose   bool
 		extraSANs []string
+		daemon    bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the hub server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			expandedData := expandHome(dataDir)
+			pidPath := filepath.Join(expandedData, "hubfuse-hub.pid")
+			defaultLog := filepath.Join(expandedData, "hub.log")
+
+			// Reject second concurrent start regardless of daemon flag.
+			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
+				return fmt.Errorf("check existing hub: %w", err)
+			} else if alive {
+				return fmt.Errorf("hub already running (pid %d)", pid)
+			}
+
+			// If we're the parent and --daemon was requested, re-exec.
+			// The detached child's stdout/stderr (which is where the
+			// console-handler logs land) gets redirected into defaultLog.
+			if daemon && !daemonize.IsChild() {
+				if err := os.MkdirAll(expandedData, 0o700); err != nil {
+					return fmt.Errorf("create data dir: %w", err)
+				}
+				return daemonize.Spawn(daemonize.SpawnOpts{
+					LogPath:     defaultLog,
+					PIDFilePath: pidPath,
+				})
+			}
+
 			cfg := hub.HubConfig{
 				ListenAddr: listen,
 				DataDir:    dataDir,
@@ -56,6 +83,16 @@ func startCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("create hub: %w", err)
 			}
+			h.OnReady = func() {
+				if err := daemonize.WritePIDFile(pidPath); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
+				}
+			}
+			defer func() {
+				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "warning: remove pid file: %v\n", err)
+				}
+			}()
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -84,6 +121,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
 	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
+	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 
 	return cmd
 }
@@ -155,7 +193,7 @@ func readPID(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	pid, err := strconv.Atoi(string(data))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		return 0, fmt.Errorf("parse PID: %w", err)
 	}

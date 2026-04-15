@@ -38,6 +38,12 @@ type Daemon struct {
 
 	// dataDir is the base data directory (~/.hubfuse by default).
 	dataDir string
+
+	// OnReady, if non-nil, is invoked exactly once by Run, immediately
+	// after successful Register with the hub. At that point the agent
+	// can serve hub-driven RPCs. The cmd layer uses this hook to write
+	// the PID file.
+	OnReady func()
 }
 
 // NewDaemon loads the config and identity, creates the connector, mounter, and
@@ -137,6 +143,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.logger.Info("registered with hub",
 		"online_devices", len(regResp.DevicesOnline),
 	)
+
+	// 4a. Signal readiness to whoever launched us.
+	if d.OnReady != nil {
+		d.OnReady()
+	}
 
 	// 5. Process initial online devices.
 	d.processInitialDevices(regResp.DevicesOnline)
