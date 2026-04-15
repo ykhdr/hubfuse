@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 		// Write the PID file at the path passed in HUBFUSE_TEST_PIDFILE,
 		// then block on SIGTERM/SIGINT.
 		if err := WritePIDFile(os.Getenv("HUBFUSE_TEST_PIDFILE")); err != nil {
-			os.Stderr.WriteString("child: WritePIDFile failed: " + err.Error() + "\n")
+			_, _ = os.Stderr.WriteString("child: WritePIDFile failed: " + err.Error() + "\n")
 			os.Exit(3)
 		}
 		sigCh := make(chan os.Signal, 1)
@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 		<-sigCh
 		os.Exit(0)
 	case "die":
-		os.Stderr.WriteString("boom\n")
+		_, _ = os.Stderr.WriteString("boom\n")
 		os.Exit(2)
 	case "slow":
 		// Never write PID file; just sleep. Parent must time out.

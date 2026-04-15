@@ -112,7 +112,7 @@ func Spawn(opts SpawnOpts) error {
 			return fmt.Errorf("check pidfile: %w", err)
 		}
 		if alive && pid == cmd.Process.Pid {
-			fmt.Fprintf(os.Stdout, "started (pid %d, logs: %s)\n", pid, absLogPath)
+			_, _ = fmt.Fprintf(os.Stdout, "started (pid %d, logs: %s)\n", pid, absLogPath)
 			return nil
 		}
 

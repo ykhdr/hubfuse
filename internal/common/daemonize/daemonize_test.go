@@ -115,9 +115,8 @@ func TestCheckRunning_StalePID(t *testing.T) {
 	// for it to exit, then write its PID.
 	cmd := newDeadPIDCmd(t)
 	stalePID := cmd.Process.Pid
-	if err := cmd.Wait(); err != nil {
-		// exit error is expected; we just need the process to be gone.
-	}
+	// exit error is expected; we just need the process to be gone.
+	_ = cmd.Wait()
 	if err := os.WriteFile(path, []byte(strconv.Itoa(stalePID)+"\n"), 0o644); err != nil {
 		t.Fatalf("seed stale pidfile: %v", err)
 	}
