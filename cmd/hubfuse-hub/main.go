@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/cmd/internal/clierrors"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
@@ -16,7 +17,7 @@ import (
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, clierrors.Format(err, nil))
 		os.Exit(1)
 	}
 }

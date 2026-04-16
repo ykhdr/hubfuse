@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,15 +13,17 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/cmd/internal/clierrors"
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
+	pb "github.com/ykhdr/hubfuse/proto"
 )
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, clierrors.Format(err, nil))
 		os.Exit(1)
 	}
 }
@@ -68,18 +71,6 @@ func joinCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			hubAddr := args[0]
 
-			// Prompt for nickname.
-			fmt.Print("Enter nickname for this device: ")
-			reader := bufio.NewReader(os.Stdin)
-			nickname, err := reader.ReadString('\n')
-			if err != nil {
-				return fmt.Errorf("read nickname: %w", err)
-			}
-			nickname = strings.TrimSpace(nickname)
-			if nickname == "" {
-				return fmt.Errorf("nickname cannot be empty")
-			}
-
 			deviceID := agent.GenerateDeviceID()
 
 			// Dial hub insecurely (no client cert yet).
@@ -90,13 +81,42 @@ func joinCmd() *cobra.Command {
 			}
 			defer hubClient.Close()
 
-			// Call Join.
-			resp, err := hubClient.Join(context.Background(), deviceID, nickname)
-			if err != nil {
-				return fmt.Errorf("join hub: %w", err)
-			}
-			if !resp.Success {
-				return fmt.Errorf("join failed: %s", resp.Error)
+			reader := bufio.NewReader(os.Stdin)
+			var (
+				nickname string
+				resp     *pb.JoinResponse
+			)
+
+			for {
+				n, err := promptNickname(reader)
+				if err != nil {
+					return err
+				}
+				nickname = n
+				if nickname == "" {
+					fmt.Fprintln(os.Stderr, "error: nickname cannot be empty")
+					continue
+				}
+
+				// Call Join.
+				resp, err = hubClient.Join(context.Background(), deviceID, nickname)
+				if err != nil {
+					if clierrors.IsNicknameTaken(err) {
+						fmt.Fprintf(os.Stderr, "error: nickname %q is already in use; choose a different one\n", nickname)
+						continue
+					}
+					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), &clierrors.Context{Nickname: nickname})
+				}
+				if !resp.Success {
+					respErr := errors.New(resp.Error)
+					if clierrors.IsNicknameTaken(respErr) {
+						fmt.Fprintf(os.Stderr, "error: nickname %q is already in use; choose a different one\n", nickname)
+						continue
+					}
+					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), nil)
+				}
+
+				break
 			}
 
 			// Save certs to ~/.hubfuse/tls/.
@@ -291,7 +311,7 @@ func pairCmd() *cobra.Command {
 
 			inviteCode, err := hubClient.RequestPairing(context.Background(), toDevice, publicKey)
 			if err != nil {
-				return fmt.Errorf("request pairing: %w", err)
+				return clierrors.Wrap(fmt.Errorf("request pairing: %w", err), &clierrors.Context{Nickname: toDevice})
 			}
 
 			fmt.Printf("pairing invite code: %s\n", inviteCode)
@@ -356,8 +376,12 @@ func renameCmd() *cobra.Command {
 			}
 			defer hubClient.Close()
 
-			if _, err := hubClient.Rename(context.Background(), newNickname); err != nil {
-				return fmt.Errorf("rename: %w", err)
+			resp, err := hubClient.Rename(context.Background(), newNickname)
+			if err != nil {
+				return clierrors.Wrap(fmt.Errorf("rename: %w", err), &clierrors.Context{Nickname: newNickname})
+			}
+			if !resp.Success {
+				return clierrors.Wrap(errors.New(resp.Error), &clierrors.Context{Nickname: newNickname})
 			}
 
 			// Update local identity.
@@ -644,6 +668,15 @@ func mountListCmd() *cobra.Command {
 	}
 }
 
+func promptNickname(reader *bufio.Reader) (string, error) {
+	fmt.Print("Enter nickname for this device: ")
+	nickname, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read nickname: %w", err)
+	}
+	return strings.TrimSpace(nickname), nil
+}
+
 // dialHub loads the device identity and connects to the hub with mTLS.
 func dialHub(dataDir string, logger *slog.Logger) (*agent.HubClient, *agent.DeviceIdentity, error) {
 	identityPath := filepath.Join(dataDir, common.IdentityFile)
@@ -684,5 +717,3 @@ func loadConfig(path string) (*config.Config, error) {
 	}
 	return cfg, nil
 }
-
-
