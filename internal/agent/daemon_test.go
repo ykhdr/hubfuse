@@ -309,13 +309,64 @@ func TestHandleDeviceOffline_UnmountsShares(t *testing.T) {
 	}
 }
 
+// ─── handleDeviceRemoved ──────────────────────────────────────────────────────
+
+func TestHandleDeviceRemoved_RemovesFromKnownDevices(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123",
+		Nickname: "laptop",
+		IP:       "10.0.0.5",
+		SSHPort:  2222,
+	}
+	d.mu.Unlock()
+
+	evt := &pb.DeviceRemovedEvent{DeviceId: "device-123", Nickname: "laptop"}
+	d.handleDeviceRemoved(evt)
+
+	d.mu.RLock()
+	_, ok := d.onlineDevices["device-123"]
+	d.mu.RUnlock()
+
+	if ok {
+		t.Error("knownDevices still contains device-123 after handleDeviceRemoved")
+	}
+}
+
+func TestHandleDeviceRemoved_UnmountsShares(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")}
+	if err := d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222); err != nil {
+		t.Fatalf("pre-mount: %v", err)
+	}
+
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123",
+		Nickname: "laptop",
+		IP:       "10.0.0.5",
+		SSHPort:  2222,
+	}
+	d.mu.Unlock()
+
+	evt := &pb.DeviceRemovedEvent{DeviceId: "device-123", Nickname: "laptop"}
+	d.handleDeviceRemoved(evt)
+
+	if d.mounter.IsActive("laptop", "docs") {
+		t.Error("share should be unmounted after handleDeviceRemoved")
+	}
+}
+
 // ─── handlePairingCompleted ────────────────────────────────────────────────────
 
 func TestHandlePairingCompleted_SavesPeerKey(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
 	evt := &pb.PairingCompletedEvent{
-		PeerDeviceId: "peer-device-999",
+		PeerDeviceId:  "peer-device-999",
 		PeerPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpeer test@host",
 	}
 

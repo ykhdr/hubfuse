@@ -196,12 +196,67 @@ func (s *sqliteStore) GetStaleDevices(ctx context.Context, threshold time.Time) 
 
 // DeleteDevice removes a device record by device_id.
 func (s *sqliteStore) DeleteDevice(ctx context.Context, deviceID string) error {
-	const q = `DELETE FROM devices WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, deviceID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("begin transaction for DeleteDevice: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if err := s.deleteDeviceCascade(ctx, tx, deviceID); err != nil {
 		return fmt.Errorf("delete device %q: %w", deviceID, err)
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit DeleteDevice: %w", err)
+	}
 	return nil
+}
+
+// DeletePrunedDevices removes offline devices whose last_heartbeat is older
+// than threshold and not present in activeDeviceIDs. It returns the pruned
+// devices so callers can log or broadcast removals.
+func (s *sqliteStore) DeletePrunedDevices(ctx context.Context, threshold time.Time, activeDeviceIDs []string) ([]*Device, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction for DeletePrunedDevices: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	q := `
+		SELECT device_id, nickname, last_ip, ssh_port, status, last_heartbeat
+		FROM devices
+		WHERE status = 'offline' AND last_heartbeat < ?`
+	args := []any{threshold.UTC()}
+	if len(activeDeviceIDs) > 0 {
+		placeholders := make([]string, len(activeDeviceIDs))
+		for i, id := range activeDeviceIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		q += " AND device_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select prunable devices: %w", err)
+	}
+	defer rows.Close()
+
+	devices, err := scanDevices(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan prunable devices: %w", err)
+	}
+
+	for _, d := range devices {
+		if err := s.deleteDeviceCascade(ctx, tx, d.DeviceID); err != nil {
+			return nil, fmt.Errorf("delete pruned device %q: %w", d.DeviceID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit DeletePrunedDevices: %w", err)
+	}
+	return devices, nil
 }
 
 // --- Shares ---
@@ -414,6 +469,24 @@ func (s *sqliteStore) DeleteExpiredInvites(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, q, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("delete expired invites: %w", err)
+	}
+	return nil
+}
+
+// deleteDeviceCascade removes a device and any dependent records within the
+// provided transaction.
+func (s *sqliteStore) deleteDeviceCascade(ctx context.Context, tx *sql.Tx, deviceID string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM shares WHERE device_id = ?`, deviceID); err != nil {
+		return fmt.Errorf("delete shares for device %q: %w", deviceID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pairings WHERE device_a = ? OR device_b = ?`, deviceID, deviceID); err != nil {
+		return fmt.Errorf("delete pairings for device %q: %w", deviceID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_invites WHERE from_device = ? OR to_device = ?`, deviceID, deviceID); err != nil {
+		return fmt.Errorf("delete invites for device %q: %w", deviceID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM devices WHERE device_id = ?`, deviceID); err != nil {
+		return fmt.Errorf("delete device row %q: %w", deviceID, err)
 	}
 	return nil
 }

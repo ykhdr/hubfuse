@@ -203,6 +203,19 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 	return ch, unsub
 }
 
+// ActiveSubscribers returns the device IDs that currently have an active
+// subscription stream.
+func (r *Registry) ActiveSubscribers() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ids := make([]string, 0, len(r.subscribers))
+	for id := range r.subscribers {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // Broadcast sends event to all subscribers except excludeDevice. If a
 // subscriber's channel is full the send is skipped and a warning is logged.
 func (r *Registry) Broadcast(event *pb.Event, excludeDevice string) {
@@ -290,6 +303,30 @@ func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error 
 	r.Broadcast(event, device.DeviceID)
 
 	return nil
+}
+
+// BroadcastDeviceRemoved sends a DeviceRemoved event to all subscribers except
+// the removed device.
+func (r *Registry) BroadcastDeviceRemoved(device *store.Device) {
+	event := &pb.Event{
+		Payload: &pb.Event_DeviceRemoved{
+			DeviceRemoved: &pb.DeviceRemovedEvent{
+				DeviceId: device.DeviceID,
+				Nickname: device.Nickname,
+			},
+		},
+	}
+	r.Broadcast(event, device.DeviceID)
+}
+
+// removeSubscriber removes and closes a subscriber channel if present.
+func (r *Registry) removeSubscriber(deviceID string) {
+	r.mu.Lock()
+	if ch, ok := r.subscribers[deviceID]; ok {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	r.mu.Unlock()
 }
 
 // sharesToProto converts store.Share records to pb.Share messages.

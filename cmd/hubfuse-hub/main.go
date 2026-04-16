@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -41,6 +42,7 @@ func startCmd() *cobra.Command {
 		verbose   bool
 		extraSANs []string
 		daemon    bool
+		deviceRet string
 	)
 
 	cmd := &cobra.Command{
@@ -50,6 +52,17 @@ func startCmd() *cobra.Command {
 			expandedData := common.ExpandHome(dataDir)
 			pidPath := filepath.Join(expandedData, common.HubPIDFile)
 			defaultLog := filepath.Join(expandedData, common.HubLogFile)
+			configPath := filepath.Join(expandedData, common.ConfigFile)
+
+			if !cmd.Flags().Changed("device-retention") {
+				fileCfg, err := hub.LoadHubConfigFile(configPath)
+				if err != nil {
+					return fmt.Errorf("load hub config: %w", err)
+				}
+				if fileCfg.DeviceRetention != 0 {
+					deviceRet = fileCfg.DeviceRetention.String()
+				}
+			}
 
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
 				return fmt.Errorf("check existing hub: %w", err)
@@ -67,13 +80,22 @@ func startCmd() *cobra.Command {
 				})
 			}
 
+			retention, err := time.ParseDuration(deviceRet)
+			if err != nil {
+				return fmt.Errorf("parse device-retention: %w", err)
+			}
+			if retention < 0 {
+				return fmt.Errorf("device-retention cannot be negative")
+			}
+
 			cfg := hub.Config{
-				ListenAddr: listen,
-				DataDir:    dataDir,
-				LogFile:    logFile,
-				LogLevel:   common.ParseLogLevel(logLevel),
-				Verbose:    verbose,
-				ExtraSANs:  extraSANs,
+				ListenAddr:      listen,
+				DataDir:         dataDir,
+				LogFile:         logFile,
+				LogLevel:        common.ParseLogLevel(logLevel),
+				Verbose:         verbose,
+				ExtraSANs:       extraSANs,
+				DeviceRetention: retention,
 				OnReady: func() {
 					if err := daemonize.WritePIDFile(pidPath); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
@@ -119,6 +141,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
 	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
+	cmd.Flags().StringVar(&deviceRet, "device-retention", hub.DefaultDeviceRetention.String(), "prune offline devices older than this duration (0 = never prune)")
 
 	return cmd
 }

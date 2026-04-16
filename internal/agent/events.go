@@ -23,6 +23,8 @@ func (d *Daemon) handleEvent(event *pb.Event) {
 		d.handlePairingCompleted(p.PairingCompleted)
 	case *pb.Event_SubscribeReady:
 		// Handled by the connector; nothing to do here.
+	case *pb.Event_DeviceRemoved:
+		d.handleDeviceRemoved(p.DeviceRemoved)
 	default:
 		d.logger.Warn("received unknown event type")
 	}
@@ -84,6 +86,26 @@ func (d *Daemon) handleDeviceOffline(e *pb.DeviceOfflineEvent) {
 
 	if err := d.mounter.UnmountDevice(e.Nickname); err != nil {
 		d.logger.Warn("unmount device shares on offline",
+			"nickname", e.Nickname,
+			"error", err,
+		)
+	}
+}
+
+// handleDeviceRemoved removes the device from onlineDevices and unmounts any
+// active mounts. Used when the hub prunes long-inactive devices.
+func (d *Daemon) handleDeviceRemoved(e *pb.DeviceRemovedEvent) {
+	d.logger.Info("device pruned from hub",
+		"device_id", e.DeviceId,
+		"nickname", e.Nickname,
+	)
+
+	d.mu.Lock()
+	delete(d.onlineDevices, e.DeviceId)
+	d.mu.Unlock()
+
+	if err := d.mounter.UnmountDevice(e.Nickname); err != nil {
+		d.logger.Warn("unmount device shares on removal",
 			"nickname", e.Nickname,
 			"error", err,
 		)
