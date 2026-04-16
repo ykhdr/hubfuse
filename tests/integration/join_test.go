@@ -8,13 +8,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
 // TestIntegration_Join_Success verifies a basic Join flow:
 // the response carries success=true and non-empty cert/key/ca_cert.
 func TestIntegration_Join_Success(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 	client := dialNoClientCert(t, h)
 
 	resp, err := client.Join(context.Background(), &pb.JoinRequest{
@@ -41,7 +42,7 @@ func TestIntegration_Join_Success(t *testing.T) {
 // TestIntegration_Join_CertHasDeviceIDInCN verifies that the signed client
 // certificate returned by Join has the device_id as the Common Name.
 func TestIntegration_Join_CertHasDeviceIDInCN(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 	client := dialNoClientCert(t, h)
 
 	deviceID := "cn-dev-" + uuid.New().String()
@@ -74,7 +75,7 @@ func TestIntegration_Join_CertHasDeviceIDInCN(t *testing.T) {
 // can reconnect using the returned client certificate and call an authenticated
 // RPC (Register).
 func TestIntegration_Join_ReconnectWithMTLS(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 	unauthClient := dialNoClientCert(t, h)
 
 	deviceID := "mtls-dev-" + uuid.New().String()
@@ -120,7 +121,7 @@ func TestIntegration_Join_ReconnectWithMTLS(t *testing.T) {
 // TestIntegration_Join_DuplicateNickname verifies that a second Join with the
 // same nickname returns success=false and a non-empty error message.
 func TestIntegration_Join_DuplicateNickname(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 	client := dialNoClientCert(t, h)
 
 	ctx := context.Background()

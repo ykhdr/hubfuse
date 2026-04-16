@@ -1,97 +1,22 @@
-package hub
+package hub_test
 
 import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
-	"fmt"
-	"log/slog"
-	"net"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ykhdr/hubfuse/internal/common"
-	"github.com/ykhdr/hubfuse/internal/hub/store"
+	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
-
-// startTestHub starts an in-process gRPC hub server on a random port. It
-// returns the server's listen address and the CA certificate in PEM form. The
-// gRPC server is stopped automatically via t.Cleanup.
-func startTestHub(t *testing.T) (addr string, caCertPEM []byte) {
-	t.Helper()
-
-	s, err := store.NewSQLiteStore(":memory:")
-	if err != nil {
-		t.Fatalf("NewSQLiteStore: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-
-	caCert, caKey, err := common.GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA: %v", err)
-	}
-
-	// Write CA and server certs to a temp dir so LoadTLSServerConfig can read them.
-	tlsDir := t.TempDir()
-
-	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, common.LocalHosts())
-	if err != nil {
-		t.Fatalf("GenerateServerCert: %v", err)
-	}
-
-	caCertPEMBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
-
-	caCertPath := tlsDir + "/ca.crt"
-	serverCertPath := tlsDir + "/server.crt"
-	serverKeyPath := tlsDir + "/server.key"
-
-	if err := os.WriteFile(caCertPath, caCertPEMBytes, 0644); err != nil {
-		t.Fatalf("write CA cert: %v", err)
-	}
-	if err := common.SaveCertAndKey(serverCertPath, serverKeyPath, serverCertPEM, serverKeyPEM); err != nil {
-		t.Fatalf("SaveCertAndKey: %v", err)
-	}
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	registry := NewRegistry(s, caCert, caKey, logger)
-
-	tlsCfg, err := common.LoadTLSServerConfig(caCertPath, serverCertPath, serverKeyPath)
-	if err != nil {
-		t.Fatalf("LoadTLSServerConfig: %v", err)
-	}
-
-	grpcServer := grpc.NewServer(
-		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.UnaryInterceptor(AuthUnaryInterceptor),
-		grpc.StreamInterceptor(AuthStreamInterceptor),
-	)
-
-	srv := NewServer(registry, logger)
-	pb.RegisterHubFuseServer(grpcServer, srv)
-
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	go func() {
-		_ = grpcServer.Serve(lis)
-	}()
-
-	t.Cleanup(func() { grpcServer.GracefulStop() })
-
-	return lis.Addr().String(), caCertPEMBytes
-}
 
 // dialNoClientCert connects to the hub without presenting a client certificate.
 // The client still verifies the server certificate using the given CA PEM.
@@ -121,9 +46,20 @@ func dialNoClientCert(t *testing.T, addr string, caCertPEM []byte) pb.HubFuseCli
 func dialWithClientCert(t *testing.T, addr string, certPEM, keyPEM, caCertPEM []byte) pb.HubFuseClient {
 	t.Helper()
 
-	tlsCfg, err := tlsConfigFromPEM(certPEM, keyPEM, caCertPEM)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		t.Fatalf("tlsConfigFromPEM: %v", err)
+		t.Fatalf("dialWithClientCert: X509KeyPair: %v", err)
+	}
+
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		t.Fatal("dialWithClientCert: failed to parse CA cert PEM")
+	}
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caPool,
+		MinVersion:   tls.VersionTLS13,
 	}
 
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))) //nolint:staticcheck
@@ -144,10 +80,10 @@ func dialWithClientCert(t *testing.T, addr string, certPEM, keyPEM, caCertPEM []
 //  5. Heartbeat — verify success
 //  6. Deregister — verify DeviceOffline event on the stream
 func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	// ── 1. Join without a client certificate ────────────────────────────────
-	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	deviceID := "dev-" + uuid.New().String()
 
@@ -172,7 +108,7 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 	}
 
 	// ── 2. Reconnect with mTLS using the received certificate ───────────────
-	authedClient := dialWithClientCert(t, addr, joinResp.ClientCert, joinResp.ClientKey, joinResp.CaCert)
+	authedClient := dialWithClientCert(t, h.Addr, joinResp.ClientCert, joinResp.ClientKey, joinResp.CaCert)
 
 	// ── 3. Register ──────────────────────────────────────────────────────────
 	regResp, err := authedClient.Register(context.Background(), &pb.RegisterRequest{
@@ -224,7 +160,7 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 		t.Fatalf("Join2: err=%v resp=%+v", err, joinResp2)
 	}
 
-	authedClient2 := dialWithClientCert(t, addr, joinResp2.ClientCert, joinResp2.ClientKey, joinResp2.CaCert)
+	authedClient2 := dialWithClientCert(t, h.Addr, joinResp2.ClientCert, joinResp2.ClientKey, joinResp2.CaCert)
 
 	regResp2, err := authedClient2.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         22,
@@ -297,9 +233,9 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 // TestIntegration_AuthenticatedRPCBlockedWithoutCert verifies that
 // authenticated RPCs are rejected when no client certificate is presented.
 func TestIntegration_AuthenticatedRPCBlockedWithoutCert(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
-	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	_, err := unauthClient.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         22,
@@ -313,8 +249,8 @@ func TestIntegration_AuthenticatedRPCBlockedWithoutCert(t *testing.T) {
 // TestIntegration_JoinNicknameConflict verifies that a duplicate nickname
 // results in success=false without a transport error.
 func TestIntegration_JoinNicknameConflict(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
-	client := dialNoClientCert(t, addr, caCertPEM)
+	h := hubtest.StartTestHub(t)
+	client := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	ctx := context.Background()
 
@@ -336,8 +272,8 @@ func TestIntegration_JoinNicknameConflict(t *testing.T) {
 }
 
 func TestRequestPairing_DeviceNotFound(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
-	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+	h := hubtest.StartTestHub(t)
+	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: "dev-pair-from",
@@ -347,7 +283,7 @@ func TestRequestPairing_DeviceNotFound(t *testing.T) {
 		t.Fatalf("Join: err=%v success=%v", err, joinResp.GetSuccess())
 	}
 
-	client := dialWithClientCert(t, addr, joinResp.ClientCert, joinResp.ClientKey, caCertPEM)
+	client := dialWithClientCert(t, h.Addr, joinResp.ClientCert, joinResp.ClientKey, h.CAPEM)
 	_, err = client.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
@@ -374,8 +310,8 @@ func TestRequestPairing_DeviceNotFound(t *testing.T) {
 }
 
 func TestRequestPairing_DeviceOffline(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
-	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+	h := hubtest.StartTestHub(t)
+	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	// Join two devices but only register one.
 	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
@@ -395,7 +331,7 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	}
 
 	// Register only device 1.
-	client1 := dialWithClientCert(t, addr, joinResp1.ClientCert, joinResp1.ClientKey, caCertPEM)
+	client1 := dialWithClientCert(t, h.Addr, joinResp1.ClientCert, joinResp1.ClientKey, h.CAPEM)
 	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
@@ -422,10 +358,10 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 }
 
 func TestListDevices(t *testing.T) {
-	addr, caCertPEM := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	// Join two devices.
-	unauthClient := dialNoClientCert(t, addr, caCertPEM)
+	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: "dev-list-1",
@@ -444,7 +380,7 @@ func TestListDevices(t *testing.T) {
 	}
 
 	// Register only device 1 (device 2 stays offline).
-	client1 := dialWithClientCert(t, addr, joinResp1.ClientCert, joinResp1.ClientKey, caCertPEM)
+	client1 := dialWithClientCert(t, h.Addr, joinResp1.ClientCert, joinResp1.ClientKey, h.CAPEM)
 	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
@@ -474,6 +410,3 @@ func TestListDevices(t *testing.T) {
 		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "offline")
 	}
 }
-
-// Ensure fmt is used (it's used in parseCACertPool if we add it, but let's keep it in case).
-var _ = fmt.Sprintf

@@ -5,11 +5,12 @@ import (
 	"testing"
 
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
 func TestListDevices_AllStatuses(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	unauthClient := dialNoClientCert(t, h)
 

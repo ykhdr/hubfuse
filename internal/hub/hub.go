@@ -3,7 +3,6 @@ package hub
 import (
 	"context"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -293,23 +292,3 @@ func dedup(ss []string) []string {
 	return out
 }
 
-// TLSConfig returns a tls.Config that trusts the hub's CA and presents the
-// client certificate identified by the given PEM bytes. This is a convenience
-// helper used in tests.
-func tlsConfigFromPEM(certPEM, keyPEM, caCertPEM []byte) (*tls.Config, error) {
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("parse client cert/key: %w", err)
-	}
-
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("parse CA cert PEM")
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS13,
-	}, nil
-}
