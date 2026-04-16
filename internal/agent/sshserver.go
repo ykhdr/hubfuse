@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -166,7 +167,10 @@ func (s *SSHServer) Start(ctx context.Context) error {
 	}
 }
 
-// Stop closes the listener, causing Start to return.
+// Stop closes the listener, causing Start to return. It is safe to call
+// Stop after Start's ctx-cancel path has already closed the listener:
+// net.ErrClosed is treated as success so double-close during shutdown
+// (signal cancels ctx → Daemon.Shutdown calls Stop) does not surface.
 func (s *SSHServer) Stop() error {
 	s.mu.Lock()
 	ln := s.listener
@@ -175,7 +179,10 @@ func (s *SSHServer) Stop() error {
 	if ln == nil {
 		return nil
 	}
-	return ln.Close()
+	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 // handleConn performs the SSH handshake and dispatches channels.
