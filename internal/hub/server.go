@@ -63,7 +63,7 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 	for _, d := range online {
 		ids = append(ids, d.DeviceID)
 	}
-	sharesByDevice, err := s.registry.store.GetSharesForDevices(ctx, ids)
+	sharesByDevice, err := s.registry.GetSharesForDevices(ctx, ids)
 	if err != nil {
 		s.logger.Warn("register: get shares", slog.Any("error", err))
 		sharesByDevice = map[string][]*store.Share{}
@@ -219,19 +219,9 @@ func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*
 		return nil, err
 	}
 
-	all, err := s.registry.store.ListAllDevices(ctx)
+	all, sharesByDevice, err := s.registry.ListDevicesWithShares(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list all devices: %w", err)
-	}
-
-	ids := make([]string, 0, len(all))
-	for _, d := range all {
-		ids = append(ids, d.DeviceID)
-	}
-	sharesByDevice, err := s.registry.store.GetSharesForDevices(ctx, ids)
-	if err != nil {
-		s.logger.Warn("ListDevices: get shares", slog.Any("error", err))
-		sharesByDevice = map[string][]*store.Share{}
+		return nil, fmt.Errorf("list devices: %w", err)
 	}
 
 	devices := make([]*pb.DeviceInfo, 0, len(all))
@@ -242,7 +232,7 @@ func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*
 			Ip:       d.LastIP,
 			SshPort:  int32(d.SSHPort),
 			Shares:   sharesToProto(sharesByDevice[d.DeviceID]),
-			Status:   d.Status,
+			Status:   string(d.Status),
 		})
 	}
 

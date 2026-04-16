@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	pb "github.com/ykhdr/hubfuse/proto"
 )
@@ -27,7 +28,7 @@ func (d *Daemon) handleEvent(event *pb.Event) {
 	}
 }
 
-// handleDeviceOnline adds the device to knownDevices and, if it is paired and
+// handleDeviceOnline adds the device to onlineDevices and, if it is paired and
 // has a mount configured, auto-mounts.
 func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	d.logger.Info("device came online",
@@ -41,7 +42,7 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 		shares = append(shares, s.Alias)
 	}
 
-	info := &DeviceInfo{
+	info := &OnlineDevice{
 		DeviceID: e.DeviceId,
 		Nickname: e.Nickname,
 		IP:       e.Ip,
@@ -50,7 +51,7 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	}
 
 	d.mu.Lock()
-	d.knownDevices[e.DeviceId] = info
+	d.onlineDevices[e.DeviceId] = info
 	d.mu.Unlock()
 
 	mc, shouldMount := d.shouldMount(e.Nickname)
@@ -69,7 +70,7 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	}
 }
 
-// handleDeviceOffline removes the device from knownDevices and unmounts any
+// handleDeviceOffline removes the device from onlineDevices and unmounts any
 // shares that were mounted from it.
 func (d *Daemon) handleDeviceOffline(e *pb.DeviceOfflineEvent) {
 	d.logger.Info("device went offline",
@@ -78,10 +79,9 @@ func (d *Daemon) handleDeviceOffline(e *pb.DeviceOfflineEvent) {
 	)
 
 	d.mu.Lock()
-	delete(d.knownDevices, e.DeviceId)
+	delete(d.onlineDevices, e.DeviceId)
 	d.mu.Unlock()
 
-	// Unmount all shares from this device (matched by nickname).
 	if err := d.mounter.UnmountDevice(e.Nickname); err != nil {
 		d.logger.Warn("unmount device shares on offline",
 			"nickname", e.Nickname,
@@ -96,7 +96,7 @@ func (d *Daemon) handleSharesUpdated(e *pb.SharesUpdatedEvent) {
 	d.logger.Info("device shares updated", "device_id", e.DeviceId)
 
 	d.mu.Lock()
-	info, ok := d.knownDevices[e.DeviceId]
+	info, ok := d.onlineDevices[e.DeviceId]
 	if ok {
 		newShares := make([]string, 0, len(e.Shares))
 		for _, s := range e.Shares {
@@ -110,13 +110,11 @@ func (d *Daemon) handleSharesUpdated(e *pb.SharesUpdatedEvent) {
 		return
 	}
 
-	// Build a set of new share aliases.
 	newShareSet := make(map[string]struct{}, len(e.Shares))
 	for _, s := range e.Shares {
 		newShareSet[s.Alias] = struct{}{}
 	}
 
-	// Unmount any active mounts whose share alias is no longer available.
 	for _, mnt := range d.mounter.ActiveMounts() {
 		if mnt.Device != info.Nickname {
 			continue
@@ -143,14 +141,14 @@ func (d *Daemon) handlePairingRequested(e *pb.PairingRequestedEvent) {
 	)
 }
 
-// handlePairingCompleted saves the peer's public key to known_devices and, if
-// the peer is currently online and has a mount configured, auto-mounts.
+// handlePairingCompleted saves the peer's public key to known_devices (keyed
+// by device_id) and, if the peer is currently online and has a mount
+// configured, auto-mounts.
 func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 	d.logger.Info("pairing completed", "peer_device_id", e.PeerDeviceId)
 
-	knownDevicesDir := knownDevicesDirPath(d.dataDir)
+	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
 
-	// Save by device ID (canonical form used by isPaired).
 	if err := SavePeerPublicKey(knownDevicesDir, e.PeerDeviceId, e.PeerPublicKey); err != nil {
 		d.logger.Error("failed to save peer public key",
 			"peer_device_id", e.PeerDeviceId,
@@ -159,23 +157,12 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 		return
 	}
 
-	// If the peer is currently online, attempt auto-mount.
 	d.mu.RLock()
-	info, online := d.knownDevices[e.PeerDeviceId]
+	info, online := d.onlineDevices[e.PeerDeviceId]
 	d.mu.RUnlock()
 
 	if !online {
 		return
-	}
-
-	// The mounter verifies pairing by looking up <mc.Device>.pub where
-	// mc.Device is the nickname. Save the key by nickname too so the mounter
-	// can find it.
-	if err := SavePeerPublicKey(knownDevicesDir, info.Nickname, e.PeerPublicKey); err != nil {
-		d.logger.Warn("failed to save peer public key by nickname",
-			"nickname", info.Nickname,
-			"error", err,
-		)
 	}
 
 	mc, shouldMount := d.shouldMount(info.Nickname)
@@ -190,10 +177,4 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 			"error", err,
 		)
 	}
-}
-
-// knownDevicesDirPath returns the known_devices directory path given the base
-// data directory.
-func knownDevicesDirPath(base string) string {
-	return base + "/known_devices"
 }

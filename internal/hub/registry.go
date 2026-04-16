@@ -38,7 +38,6 @@ func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey,
 // certificate, private key, and the CA certificate in PEM form. It returns
 // common.ErrNicknameTaken if the nickname is already in use.
 func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM, keyPEM, caCertPEM []byte, err error) {
-	// Check nickname uniqueness before inserting.
 	existing, _ := r.store.GetDeviceByNickname(ctx, nickname)
 	if existing != nil {
 		return nil, nil, nil, common.ErrNicknameTaken
@@ -47,7 +46,7 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM
 	d := &store.Device{
 		DeviceID: deviceID,
 		Nickname: nickname,
-		Status:   "offline",
+		Status:   store.StatusOffline,
 	}
 	if err := r.store.CreateDevice(ctx, d); err != nil {
 		return nil, nil, nil, err
@@ -58,7 +57,6 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM
 		return nil, nil, nil, err
 	}
 
-	// Encode the CA certificate DER bytes as PEM.
 	caCertPEM = pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: r.caCert.Raw,
@@ -75,7 +73,7 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, "online", ip, sshPort); err != nil {
+	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
 		return nil, err
 	}
 
@@ -89,7 +87,6 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, err
 	}
 
-	// Build the DeviceOnline event.
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {
 		return nil, err
@@ -156,7 +153,7 @@ func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 		return err
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, "offline", device.LastIP, device.SSHPort); err != nil {
+	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOffline, device.LastIP, device.SSHPort); err != nil {
 		return err
 	}
 
@@ -180,12 +177,17 @@ func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 	return nil
 }
 
-// Subscribe creates a buffered event channel for the device. The returned
-// function unsubscribes and closes the channel.
+// Subscribe creates a buffered event channel for the device. If the device
+// already has a registered channel (e.g. due to reconnect), the old channel
+// is closed and replaced. The returned function unsubscribes and closes the
+// channel.
 func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 	ch := make(chan *pb.Event, 64)
 
 	r.mu.Lock()
+	if old, ok := r.subscribers[deviceID]; ok {
+		close(old)
+	}
 	r.subscribers[deviceID] = ch
 	r.mu.Unlock()
 
@@ -195,7 +197,6 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 			delete(r.subscribers, deviceID)
 		}
 		r.mu.Unlock()
-		// Drain and close the channel.
 		close(ch)
 	}
 
@@ -221,11 +222,60 @@ func (r *Registry) Broadcast(event *pb.Event, excludeDevice string) {
 	}
 }
 
+// BroadcastAll sends event to every subscriber. Use this when there is no
+// sender to exclude (e.g. hub-initiated broadcasts during shutdown).
+func (r *Registry) BroadcastAll(event *pb.Event) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for deviceID, ch := range r.subscribers {
+		select {
+		case ch <- event:
+		default:
+			r.logger.Warn("event channel full, dropping event",
+				slog.String("device_id", deviceID))
+		}
+	}
+}
+
+// GetShares returns all shares registered for the given device.
+func (r *Registry) GetShares(ctx context.Context, deviceID string) ([]*store.Share, error) {
+	return r.store.GetShares(ctx, deviceID)
+}
+
+// GetSharesForDevices returns shares for each of the given device IDs in a
+// single query, keyed by device_id. Devices with no shares are absent from
+// the returned map.
+func (r *Registry) GetSharesForDevices(ctx context.Context, deviceIDs []string) (map[string][]*store.Share, error) {
+	return r.store.GetSharesForDevices(ctx, deviceIDs)
+}
+
+// ListDevicesWithShares returns all devices regardless of status together with
+// a map of their shares, keyed by device_id.
+func (r *Registry) ListDevicesWithShares(ctx context.Context) ([]*store.Device, map[string][]*store.Share, error) {
+	devices, err := r.store.ListAllDevices(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ids := make([]string, 0, len(devices))
+	for _, d := range devices {
+		ids = append(ids, d.DeviceID)
+	}
+
+	shares, err := r.store.GetSharesForDevices(ctx, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return devices, shares, nil
+}
+
 // MarkOffline marks the given device offline and broadcasts DeviceOffline.
 // Used by the heartbeat monitor for stale devices. The caller passes the
 // *Device already in hand, avoiding a redundant store lookup.
 func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error {
-	if err := r.store.UpdateDeviceStatus(ctx, device.DeviceID, "offline", device.LastIP, device.SSHPort); err != nil {
+	if err := r.store.UpdateDeviceStatus(ctx, device.DeviceID, store.StatusOffline, device.LastIP, device.SSHPort); err != nil {
 		return err
 	}
 
@@ -248,7 +298,7 @@ func sharesToProto(shares []*store.Share) []*pb.Share {
 	for _, s := range shares {
 		result = append(result, &pb.Share{
 			Alias:          s.Alias,
-			Permissions:    s.Permissions,
+			Permissions:    string(s.Permissions),
 			AllowedDevices: s.AllowedDevices,
 		})
 	}
@@ -263,7 +313,7 @@ func sharesFromProto(deviceID string, shares []*pb.Share) []*store.Share {
 		result = append(result, &store.Share{
 			DeviceID:       deviceID,
 			Alias:          s.Alias,
-			Permissions:    s.Permissions,
+			Permissions:    store.Permission(s.Permissions),
 			AllowedDevices: s.AllowedDevices,
 		})
 	}

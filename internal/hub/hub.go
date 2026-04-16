@@ -19,25 +19,14 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// HubConfig holds configuration for a Hub instance.
-type HubConfig struct {
-	ListenAddr string   // e.g. ":9090"
-	DataDir    string   // e.g. "~/.hubfuse-hub"
-	LogFile    string   // path to JSON log file ("" = no file logging)
-	LogLevel   string   // file log level: "debug", "info", "warn", "error" (default: "debug")
-	Verbose    bool     // show debug logs in console
-	ExtraSANs  []string // additional SANs for the server TLS certificate
-}
-
-// Hub wires together the store, registry, heartbeat monitor, and gRPC server.
-type Hub struct {
-	config     HubConfig
-	store      store.Store
-	registry   *Registry
-	heartbeat  *HeartbeatMonitor
-	grpcServer *grpc.Server
-	tlsCfg     *tls.Config
-	logger     *slog.Logger
+// Config holds configuration for a Hub instance.
+type Config struct {
+	ListenAddr string     // e.g. ":9090"
+	DataDir    string     // e.g. "~/.hubfuse-hub"
+	LogFile    string     // path to JSON log file ("" = no file logging)
+	LogLevel   slog.Level // file log level (default: Debug)
+	Verbose    bool       // show debug logs in console
+	ExtraSANs  []string   // additional SANs for the server TLS certificate
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
 	// after net.Listen returns — the TCP listener is bound and the
@@ -47,14 +36,24 @@ type Hub struct {
 	OnReady func()
 }
 
+// Hub wires together the store, registry, heartbeat monitor, and gRPC server.
+type Hub struct {
+	config     Config
+	store      store.Store
+	registry   *Registry
+	heartbeat  *HeartbeatMonitor
+	grpcServer *grpc.Server
+	tlsCfg     *tls.Config
+	logger     *slog.Logger
+}
+
 // NewHub creates a Hub from the given config. It sets up the logger, opens
 // (or creates) the SQLite database, and loads (or generates) the CA and
 // server TLS certificates.
-func NewHub(config HubConfig) (*Hub, error) {
-	fileLevel := common.ParseLogLevel(config.LogLevel)
+func NewHub(config Config) (*Hub, error) {
 	logger, err := common.SetupLogger(common.LoggerOptions{
 		LogFile:   config.LogFile,
-		FileLevel: fileLevel,
+		FileLevel: config.LogLevel,
 		Verbose:   config.Verbose,
 	})
 	if err != nil {
@@ -112,11 +111,10 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("listen on %q: %w", h.config.ListenAddr, err)
 	}
 
-	if h.OnReady != nil {
-		h.OnReady()
+	if h.config.OnReady != nil {
+		h.config.OnReady()
 	}
 
-	// Start heartbeat monitor in the background.
 	go h.heartbeat.Start(ctx)
 
 	h.logger.Info("hub gRPC server starting", slog.String("addr", h.config.ListenAddr))
@@ -133,7 +131,6 @@ func (h *Hub) Start(ctx context.Context) error {
 func (h *Hub) Stop() error {
 	ctx := context.Background()
 
-	// Mark all online devices offline.
 	online, err := h.store.ListOnlineDevices(ctx)
 	if err != nil {
 		h.logger.Warn("stop: list online devices", slog.Any("error", err))
@@ -147,8 +144,8 @@ func (h *Hub) Stop() error {
 					},
 				},
 			}
-			h.registry.Broadcast(event, "")
-			if err := h.store.UpdateDeviceStatus(ctx, d.DeviceID, "offline", d.LastIP, d.SSHPort); err != nil {
+			h.registry.BroadcastAll(event)
+			if err := h.store.UpdateDeviceStatus(ctx, d.DeviceID, store.StatusOffline, d.LastIP, d.SSHPort); err != nil {
 				h.logger.Warn("stop: mark device offline",
 					slog.String("device_id", d.DeviceID),
 					slog.Any("error", err))

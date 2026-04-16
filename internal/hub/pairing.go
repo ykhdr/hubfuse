@@ -38,10 +38,10 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 		return "", status.Errorf(codes.NotFound, "no device with nickname %q", toDevice)
 	}
 
-	if from.Status != "online" {
+	if from.Status != store.StatusOnline {
 		return "", common.ErrDeviceNotFound
 	}
-	if to.Status != "online" {
+	if to.Status != store.StatusOnline {
 		return "", status.Errorf(codes.Unavailable, "%s is not currently connected", toDevice)
 	}
 
@@ -67,7 +67,6 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 		return "", err
 	}
 
-	// Send PairingRequested event only to the target device.
 	event := &pb.Event{
 		Payload: &pb.Event_PairingRequested{
 			PairingRequested: &pb.PairingRequestedEvent{
@@ -113,7 +112,6 @@ func (r *Registry) ConfirmPairing(ctx context.Context, deviceID, inviteCode, pub
 		return "", err
 	}
 
-	// Notify the initiating device that pairing completed.
 	event := &pb.Event{
 		Payload: &pb.Event_PairingCompleted{
 			PairingCompleted: &pb.PairingCompletedEvent{
@@ -155,16 +153,26 @@ func GenerateInviteCode() string {
 	return fmt.Sprintf("HUB-%s-%s", seg1, seg2)
 }
 
-// randomSegment generates a random string of n characters from inviteAlphabet.
+// randomSegment generates a random string of n characters from inviteAlphabet
+// using rejection sampling to avoid modulo bias. Bytes >= 252 (the largest
+// multiple of 36 that fits in a byte is 252 = 36×7) are rejected and redrawn.
 func randomSegment(n int) string {
-	alphabetLen := byte(len(inviteAlphabet))
+	const alphabetLen = byte(len(inviteAlphabet))
+	// 252 is the largest multiple of 36 that is <= 255, so bytes in [0,251]
+	// map uniformly across the 36-character alphabet without bias.
+	const maxUnbiased = 252
 	buf := make([]byte, n)
-	raw := make([]byte, n)
-	if _, err := rand.Read(raw); err != nil {
-		panic(fmt.Sprintf("crypto/rand read: %v", err))
-	}
-	for i, b := range raw {
-		buf[i] = inviteAlphabet[b%alphabetLen]
+	filled := 0
+	for filled < n {
+		var b [1]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(fmt.Sprintf("crypto/rand read: %v", err))
+		}
+		if b[0] >= maxUnbiased {
+			continue
+		}
+		buf[filled] = inviteAlphabet[b[0]%alphabetLen]
+		filled++
 	}
 	return string(buf)
 }

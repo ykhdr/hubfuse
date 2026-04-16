@@ -11,7 +11,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/agent/config"
@@ -79,8 +78,7 @@ func joinCmd() *cobra.Command {
 				return fmt.Errorf("nickname cannot be empty")
 			}
 
-			// Generate device ID.
-			deviceID := uuid.New().String()
+			deviceID := agent.GenerateDeviceID()
 
 			// Dial hub insecurely (no client cert yet).
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -130,7 +128,7 @@ func joinCmd() *cobra.Command {
 			cfg := config.DefaultConfig()
 			cfg.Device.Nickname = nickname
 			cfg.Hub.Address = hubAddr
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -187,14 +185,15 @@ func startCmd() *cobra.Command {
 				return fmt.Errorf("setup logger: %w", err)
 			}
 
-			d, err := agent.NewDaemon(cfgPath, logger)
+			d, err := agent.NewDaemon(cfgPath, logger, agent.DaemonOptions{
+				OnReady: func() {
+					if err := daemonize.WritePIDFile(pidPath); err != nil {
+						logger.Warn("write pid file", "path", pidPath, "error", err)
+					}
+				},
+			})
 			if err != nil {
 				return fmt.Errorf("create daemon: %w", err)
-			}
-			d.OnReady = func() {
-				if err := daemonize.WritePIDFile(pidPath); err != nil {
-					logger.Warn("write pid file", "path", pidPath, "error", err)
-				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
@@ -373,7 +372,7 @@ func renameCmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 			cfg.Device.Nickname = newNickname
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -425,7 +424,7 @@ func shareAddCmd() *cobra.Command {
 				AllowedDevices: allow,
 			})
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -473,7 +472,7 @@ func shareRemoveCmd() *cobra.Command {
 			}
 			cfg.Shares = newShares
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -553,7 +552,7 @@ func mountAddCmd() *cobra.Command {
 				To:     to,
 			})
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -604,7 +603,7 @@ func mountRemoveCmd() *cobra.Command {
 			}
 			cfg.Mounts = newMounts
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -684,62 +683,4 @@ func loadConfig(path string) (*config.Config, error) {
 	return cfg, nil
 }
 
-// writeConfig serialises cfg to a KDL file at path, creating parent
-// directories as needed. The format matches what config.Load expects.
-func writeConfig(path string, cfg *config.Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
-
-	var sb strings.Builder
-
-	// device block.
-	fmt.Fprintf(&sb, "device {\n")
-	fmt.Fprintf(&sb, "    nickname %q\n", cfg.Device.Nickname)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// hub block.
-	fmt.Fprintf(&sb, "hub {\n")
-	fmt.Fprintf(&sb, "    address %q\n", cfg.Hub.Address)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// agent block.
-	fmt.Fprintf(&sb, "agent {\n")
-	fmt.Fprintf(&sb, "    ssh-port %d\n", cfg.Agent.SSHPort)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// shares block.
-	if len(cfg.Shares) > 0 {
-		fmt.Fprintf(&sb, "shares {\n")
-		for _, s := range cfg.Shares {
-			fmt.Fprintf(&sb, "    share %q alias=%q permissions=%q", s.Path, s.Alias, s.Permissions)
-			if len(s.AllowedDevices) > 0 {
-				fmt.Fprintf(&sb, " {\n")
-				fmt.Fprintf(&sb, "        allowed-devices")
-				for _, d := range s.AllowedDevices {
-					fmt.Fprintf(&sb, " %q", d)
-				}
-				fmt.Fprintf(&sb, "\n")
-				fmt.Fprintf(&sb, "    }\n")
-			} else {
-				fmt.Fprintf(&sb, "\n")
-			}
-		}
-		fmt.Fprintf(&sb, "}\n\n")
-	}
-
-	// mounts block.
-	if len(cfg.Mounts) > 0 {
-		fmt.Fprintf(&sb, "mounts {\n")
-		for _, m := range cfg.Mounts {
-			fmt.Fprintf(&sb, "    mount device=%q share=%q to=%q\n", m.Device, m.Share, m.To)
-		}
-		fmt.Fprintf(&sb, "}\n")
-	}
-
-	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
-		return fmt.Errorf("write config %q: %w", path, err)
-	}
-	return nil
-}
 

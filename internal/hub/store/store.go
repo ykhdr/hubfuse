@@ -28,7 +28,7 @@ type Store interface {
 	ListAllDevices(ctx context.Context) ([]*Device, error)
 
 	// UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
-	UpdateDeviceStatus(ctx context.Context, deviceID string, status string, ip string, sshPort int) error
+	UpdateDeviceStatus(ctx context.Context, deviceID string, status DeviceStatus, ip string, sshPort int) error
 
 	// UpdateDeviceNickname changes the nickname of a device.
 	UpdateDeviceNickname(ctx context.Context, deviceID string, nickname string) error

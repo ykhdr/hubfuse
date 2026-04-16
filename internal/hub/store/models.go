@@ -2,13 +2,29 @@ package store
 
 import "time"
 
+// DeviceStatus represents whether a device is online or offline.
+type DeviceStatus string
+
+const (
+	StatusOnline  DeviceStatus = "online"
+	StatusOffline DeviceStatus = "offline"
+)
+
+// Permission represents the access level for a share.
+type Permission string
+
+const (
+	PermRO Permission = "ro"
+	PermRW Permission = "rw"
+)
+
 // Device represents a registered device in the hub.
 type Device struct {
 	DeviceID      string
 	Nickname      string
 	LastIP        string
 	SSHPort       int
-	Status        string // "online" | "offline"
+	Status        DeviceStatus
 	LastHeartbeat time.Time
 }
 
@@ -16,7 +32,7 @@ type Device struct {
 type Share struct {
 	DeviceID       string
 	Alias          string
-	Permissions    string   // "ro" | "rw"
+	Permissions    Permission
 	AllowedDevices []string // stored as JSON array in DB
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/ykhdr/hubfuse/internal/hub/store"
 )
 
 func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
@@ -13,7 +15,7 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 	joinDevice(t, r, "dev-stale2", "stale-device2")
 
 	// Set the device online. Its last_heartbeat stays at zero (always stale).
-	if err := r.store.UpdateDeviceStatus(bg, "dev-stale2", "online", "10.0.0.1", 22); err != nil {
+	if err := r.store.UpdateDeviceStatus(bg, "dev-stale2", store.StatusOnline, "10.0.0.1", 22); err != nil {
 		t.Fatalf("UpdateDeviceStatus: %v", err)
 	}
 
@@ -31,7 +33,7 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetDevice: %v", err)
 		}
-		if d.Status == "offline" {
+		if d.Status == store.StatusOffline {
 			return // success
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -63,7 +65,7 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDevice: %v", err)
 	}
-	if d.Status != "online" {
+	if d.Status != store.StatusOnline {
 		t.Errorf("Status = %q, want online", d.Status)
 	}
 }
@@ -77,7 +79,7 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	joinDevice(t, r, "dev-watcher", "watcher")
 
 	// Put dev-stale online with stale heartbeat.
-	if err := r.store.UpdateDeviceStatus(ctx, "dev-stale", "online", "10.0.0.1", 22); err != nil {
+	if err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22); err != nil {
 		t.Fatalf("UpdateDeviceStatus: %v", err)
 	}
 

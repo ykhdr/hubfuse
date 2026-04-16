@@ -12,6 +12,9 @@ import (
 // heartbeat before being marked offline.
 const DefaultHeartbeatTimeout = 30 * time.Second
 
+// heartbeatInterval is how often the heartbeat monitor checks for stale devices.
+const heartbeatInterval = 10 * time.Second
+
 // HeartbeatMonitor periodically checks for stale devices and marks them offline.
 // Every invitePruneEvery ticks it also prunes expired invite codes from the store.
 type HeartbeatMonitor struct {
@@ -27,15 +30,17 @@ type HeartbeatMonitor struct {
 const invitePruneEvery = 6
 
 // NewHeartbeatMonitor creates a HeartbeatMonitor. The timeout is how long a
-// device may go without a heartbeat before being marked offline; the check
-// interval defaults to timeout/3 (minimum 1 second).
+// device may go without a heartbeat before being marked offline. When timeout
+// is zero, DefaultHeartbeatTimeout and heartbeatInterval are used.
 func NewHeartbeatMonitor(registry *Registry, s store.Store, timeout time.Duration, logger *slog.Logger) *HeartbeatMonitor {
+	check := heartbeatInterval
 	if timeout == 0 {
 		timeout = DefaultHeartbeatTimeout
-	}
-	check := timeout / 3
-	if check < time.Second {
-		check = time.Second
+	} else {
+		check = timeout / 3
+		if check < time.Second {
+			check = time.Second
+		}
 	}
 	return &HeartbeatMonitor{
 		registry: registry,

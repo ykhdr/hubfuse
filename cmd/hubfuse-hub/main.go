@@ -65,23 +65,23 @@ func startCmd() *cobra.Command {
 				})
 			}
 
-			cfg := hub.HubConfig{
+			cfg := hub.Config{
 				ListenAddr: listen,
 				DataDir:    dataDir,
 				LogFile:    logFile,
-				LogLevel:   logLevel,
+				LogLevel:   common.ParseLogLevel(logLevel),
 				Verbose:    verbose,
 				ExtraSANs:  extraSANs,
+				OnReady: func() {
+					if err := daemonize.WritePIDFile(pidPath); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
+					}
+				},
 			}
 
 			h, err := hub.NewHub(cfg)
 			if err != nil {
 				return fmt.Errorf("create hub: %w", err)
-			}
-			h.OnReady = func() {
-				if err := daemonize.WritePIDFile(pidPath); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
-				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {

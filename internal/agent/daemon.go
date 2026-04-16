@@ -12,8 +12,8 @@ import (
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
-// DeviceInfo holds the known state of an online remote device.
-type DeviceInfo struct {
+// OnlineDevice holds the known state of a currently-online remote device.
+type OnlineDevice struct {
 	DeviceID string
 	Nickname string
 	IP       string
@@ -21,34 +21,38 @@ type DeviceInfo struct {
 	Shares   []string // share aliases
 }
 
+// DaemonOptions configures a Daemon at construction time.
+type DaemonOptions struct {
+	// OnReady, if non-nil, is invoked exactly once by Run, immediately
+	// after successful Register with the hub. The cmd layer uses this
+	// hook to write the PID file.
+	OnReady func()
+}
+
 // Daemon is the main orchestrator that ties together hub client, mounter,
 // SSH server, config watcher, heartbeat, and event handling.
 type Daemon struct {
-	config       *agentconfig.Config
-	configPath   string
-	identity     *DeviceIdentity
-	hubClient    *HubClient
-	connector    *Connector
-	mounter      *Mounter
-	sshServer    *SSHServer
-	watcher      *agentconfig.Watcher
-	logger       *slog.Logger
-	knownDevices map[string]*DeviceInfo // online devices from hub (device_id -> info)
-	mu           sync.RWMutex
+	config        *agentconfig.Config
+	configPath    string
+	identity      *DeviceIdentity
+	hubClient     *HubClient
+	connector     *Connector
+	mounter       *Mounter
+	sshServer     *SSHServer
+	watcher       *agentconfig.Watcher
+	logger        *slog.Logger
+	onlineDevices map[string]*OnlineDevice // online devices from hub (device_id -> info)
+	mu            sync.RWMutex
 
 	// dataDir is the base data directory (~/.hubfuse by default).
 	dataDir string
 
-	// OnReady, if non-nil, is invoked exactly once by Run, immediately
-	// after successful Register with the hub. At that point the agent
-	// can serve hub-driven RPCs. The cmd layer uses this hook to write
-	// the PID file.
-	OnReady func()
+	onReady func()
 }
 
 // NewDaemon loads the config and identity, creates the connector, mounter, and
 // SSH server, and returns a ready-to-run Daemon.
-func NewDaemon(cfgPath string, logger *slog.Logger) (*Daemon, error) {
+func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon, error) {
 	cfg, err := agentconfig.Load(cfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config %q: %w", cfgPath, err)
@@ -72,15 +76,10 @@ func NewDaemon(cfgPath string, logger *slog.Logger) (*Daemon, error) {
 	keysDir := filepath.Join(dir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 
-	knownDevicesDir := filepath.Join(dir, "known_devices")
-
-	mounter := NewMounter(keyPath, knownDevicesDir, logger)
+	mounter := NewMounter(keyPath, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
-	// Generate SSH keys if they don't exist yet. We need the key file before
-	// creating the SSH server, but the server creation itself will also fail
-	// gracefully if the key is missing (it is created in Run if needed).
 	if _, statErr := os.Stat(keyPath); os.IsNotExist(statErr) {
 		if _, genErr := GenerateSSHKeyPair(keysDir); genErr != nil {
 			logger.Warn("could not pre-generate SSH keys", "error", genErr)
@@ -93,22 +92,39 @@ func NewDaemon(cfgPath string, logger *slog.Logger) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		config:       cfg,
-		configPath:   cfgPath,
-		identity:     identity,
-		connector:    connector,
-		mounter:      mounter,
-		sshServer:    sshServer,
-		logger:       logger,
-		knownDevices: make(map[string]*DeviceInfo),
-		dataDir:      dir,
+		config:        cfg,
+		configPath:    cfgPath,
+		identity:      identity,
+		connector:     connector,
+		mounter:       mounter,
+		sshServer:     sshServer,
+		logger:        logger,
+		onlineDevices: make(map[string]*OnlineDevice),
+		dataDir:       dir,
+		onReady:       opts.OnReady,
 	}, nil
 }
 
 // Run is the main daemon loop. It connects to the hub, starts all subsystems,
 // and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
-	// 1. Connect to hub with backoff.
+	if err := d.connect(ctx); err != nil {
+		return err
+	}
+
+	if err := d.startSSH(ctx); err != nil {
+		return err
+	}
+
+	if err := d.registerAndSubscribe(ctx); err != nil {
+		return err
+	}
+
+	return d.runServices(ctx)
+}
+
+// connect establishes the hub connection with backoff retry.
+func (d *Daemon) connect(ctx context.Context) error {
 	d.logger.Info("connecting to hub", "addr", d.config.Hub.Address)
 	hubClient, err := d.connector.Connect(ctx)
 	if err != nil {
@@ -116,8 +132,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	d.hubClient = hubClient
 	d.logger.Info("connected to hub")
+	return nil
+}
 
-	// 2. Generate SSH keys if not present.
+// startSSH generates SSH keys if absent and starts the embedded SSH server.
+func (d *Daemon) startSSH(ctx context.Context) error {
 	keysDir := filepath.Join(d.dataDir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 	if _, statErr := os.Stat(keyPath); os.IsNotExist(statErr) {
@@ -127,14 +146,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	// 3. Start SSH server in a goroutine.
 	go func() {
 		if err := d.sshServer.Start(ctx); err != nil {
 			d.logger.Error("SSH server stopped", "error", err)
 		}
 	}()
 
-	// 4. Register with hub and get online devices.
+	return nil
+}
+
+// registerAndSubscribe registers with the hub, signals readiness, processes
+// the initial device list, and starts the event stream goroutine.
+func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
 	shares := configSharesToProto(d.config.Shares)
 	regResp, err := d.hubClient.Register(ctx, shares, d.config.Agent.SSHPort)
 	if err != nil {
@@ -144,15 +167,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
-	// 4a. Signal readiness to whoever launched us.
-	if d.OnReady != nil {
-		d.OnReady()
+	if d.onReady != nil {
+		d.onReady()
 	}
 
-	// 5. Process initial online devices.
 	d.processInitialDevices(regResp.DevicesOnline)
 
-	// 6. Start Subscribe stream and event processing in a goroutine.
 	stream, err := d.hubClient.Subscribe(ctx)
 	if err != nil {
 		return fmt.Errorf("subscribe to hub events: %w", err)
@@ -174,10 +194,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}()
 
-	// 7. Start heartbeat ticker.
+	return nil
+}
+
+// runServices starts the heartbeat ticker and config watcher, then blocks
+// until ctx is cancelled before shutting down.
+func (d *Daemon) runServices(ctx context.Context) error {
 	go d.runHeartbeat(ctx)
 
-	// 8. Start config watcher.
 	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
 	if err != nil {
 		d.logger.Warn("could not start config watcher", "error", err)
@@ -190,11 +214,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}()
 	}
 
-	// 9. Wait for context cancellation.
 	<-ctx.Done()
 	d.logger.Info("daemon shutting down")
 
-	// 10. Shutdown.
 	return d.Shutdown()
 }
 
@@ -239,10 +261,10 @@ func (d *Daemon) Shutdown() error {
 // For each device that is paired and has a mount configured, it auto-mounts.
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	for _, dev := range devices {
-		info := protoToDeviceInfo(dev)
+		info := protoToOnlineDevice(dev)
 
 		d.mu.Lock()
-		d.knownDevices[dev.DeviceId] = info
+		d.onlineDevices[dev.DeviceId] = info
 		d.mu.Unlock()
 
 		mc, shouldMount := d.shouldMount(dev.Nickname)
@@ -278,38 +300,20 @@ func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bo
 }
 
 // isPaired reports whether a device is paired by checking for a public key
-// file in the known_devices directory. It checks both by device ID and by
-// device nickname (as the mounter uses mc.Device, which is the nickname, for
-// its own pairing check).
+// file keyed on device_id in the known_devices directory.
 func (d *Daemon) isPaired(deviceID string) bool {
 	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
-
-	// Primary check: by device ID (set by handlePairingCompleted / SavePeerPublicKey).
-	if _, err := os.Stat(filepath.Join(knownDevicesDir, deviceID+".pub")); err == nil {
-		return true
-	}
-
-	// Secondary check: by device nickname, matching the filename that the
-	// Mounter expects when verifying mc.Device.
-	d.mu.RLock()
-	info, ok := d.knownDevices[deviceID]
-	d.mu.RUnlock()
-	if ok {
-		if _, err := os.Stat(filepath.Join(knownDevicesDir, info.Nickname+".pub")); err == nil {
-			return true
-		}
-	}
-
-	return false
+	_, err := os.Stat(filepath.Join(knownDevicesDir, deviceID+".pub"))
+	return err == nil
 }
 
-// protoToDeviceInfo converts a proto DeviceInfo to our local DeviceInfo type.
-func protoToDeviceInfo(dev *pb.DeviceInfo) *DeviceInfo {
+// protoToOnlineDevice converts a proto DeviceInfo to our local OnlineDevice type.
+func protoToOnlineDevice(dev *pb.DeviceInfo) *OnlineDevice {
 	shares := make([]string, 0, len(dev.Shares))
 	for _, s := range dev.Shares {
 		shares = append(shares, s.Alias)
 	}
-	return &DeviceInfo{
+	return &OnlineDevice{
 		DeviceID: dev.DeviceId,
 		Nickname: dev.Nickname,
 		IP:       dev.Ip,
