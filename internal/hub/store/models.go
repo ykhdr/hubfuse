@@ -2,12 +2,13 @@ package store
 
 import "time"
 
-// DeviceStatus represents whether a device is online or offline.
+// DeviceStatus represents a device's connection state.
 type DeviceStatus string
 
 const (
-	StatusOnline  DeviceStatus = "online"
-	StatusOffline DeviceStatus = "offline"
+	StatusOnline     DeviceStatus = "online"
+	StatusOffline    DeviceStatus = "offline"
+	StatusRegistered DeviceStatus = "registered" // joined but not yet registered/connected
 )
 
 // Permission represents the access level for a share.

@@ -135,6 +135,7 @@ func joinCmd() *cobra.Command {
 			}
 
 			fmt.Printf("joined hub %s as %q (device_id: %s)\n", hubAddr, nickname, deviceID)
+			fmt.Println("run `hubfuse start` to connect this device and appear online")
 			return nil
 		},
 	}
@@ -684,5 +685,3 @@ func loadConfig(path string) (*config.Config, error) {
 	}
 	return cfg, nil
 }
-
-

@@ -406,7 +406,7 @@ func TestListDevices(t *testing.T) {
 	if statusMap["list-alice"] != "online" {
 		t.Errorf("alice status = %q, want %q", statusMap["list-alice"], "online")
 	}
-	if statusMap["list-bob"] != "offline" {
-		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "offline")
+	if statusMap["list-bob"] != "registered" {
+		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "registered")
 	}
 }

@@ -31,7 +31,7 @@ func NewServer(registry *Registry, logger *slog.Logger) *Server {
 // authentication — the client will receive a signed cert it can use for
 // subsequent calls.
 func (s *Server) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
-	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname)
+	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname, peerIP(ctx))
 	if err != nil {
 		return &pb.JoinResponse{Success: false, Error: err.Error()}, nil
 	}
@@ -226,13 +226,17 @@ func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*
 
 	devices := make([]*pb.DeviceInfo, 0, len(all))
 	for _, d := range all {
+		status := string(d.Status)
+		if d.Status == store.StatusOffline && d.LastHeartbeat.IsZero() {
+			status = string(store.StatusRegistered)
+		}
 		devices = append(devices, &pb.DeviceInfo{
 			DeviceId: d.DeviceID,
 			Nickname: d.Nickname,
 			Ip:       d.LastIP,
 			SshPort:  int32(d.SSHPort),
 			Shares:   sharesToProto(sharesByDevice[d.DeviceID]),
-			Status:   string(d.Status),
+			Status:   status,
 		})
 	}
 
