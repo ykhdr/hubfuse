@@ -72,7 +72,7 @@ func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) 
 	// B subscribes.
 	subCtxB, cancelB := context.WithCancel(context.Background())
 	t.Cleanup(cancelB)
-	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{DeviceId: devB})
+	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{})
 	if err != nil {
 		t.Fatalf("Subscribe B: %v", err)
 	}

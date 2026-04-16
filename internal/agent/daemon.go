@@ -153,7 +153,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.processInitialDevices(regResp.DevicesOnline)
 
 	// 6. Start Subscribe stream and event processing in a goroutine.
-	stream, err := d.hubClient.Subscribe(ctx, d.identity.DeviceID)
+	stream, err := d.hubClient.Subscribe(ctx)
 	if err != nil {
 		return fmt.Errorf("subscribe to hub events: %w", err)
 	}

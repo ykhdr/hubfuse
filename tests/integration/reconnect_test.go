@@ -70,7 +70,6 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 		t.Fatalf("RequestPairing before restart: %v", err)
 	}
 	confirmResp, err := clientB1.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-		DeviceId:   devB,
 		InviteCode: pairResp.InviteCode,
 		PublicKey:  "pk-bob",
 	})

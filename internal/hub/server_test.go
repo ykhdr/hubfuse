@@ -139,7 +139,7 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 	subscribeCtx, cancelSubscribe := context.WithCancel(context.Background())
 	t.Cleanup(cancelSubscribe)
 
-	stream, err := authedClient.Subscribe(subscribeCtx, &pb.SubscribeRequest{DeviceId: deviceID})
+	stream, err := authedClient.Subscribe(subscribeCtx, &pb.SubscribeRequest{})
 	if err != nil {
 		t.Fatalf("Subscribe RPC: %v", err)
 	}
