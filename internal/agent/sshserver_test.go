@@ -517,6 +517,61 @@ func TestSSHServer_Stop_NilListenerIsNoOp(t *testing.T) {
 	}
 }
 
+// TestSSHServer_Stop_AfterContextCancel ensures Stop() is idempotent when
+// Start's ctx-cancel goroutine has already closed the listener. This mirrors
+// the real shutdown path: signal cancels ctx → listener closes → Daemon.Shutdown
+// calls Stop again, and the second close must not surface as an error.
+func TestSSHServer_Stop_AfterContextCancel(t *testing.T) {
+	hostDir := t.TempDir()
+	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
+		t.Fatalf("GenerateSSHKeyPair(): %v", err)
+	}
+
+	// Find a free port.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	srv, err := NewSSHServer(port, filepath.Join(hostDir, "id_ed25519"), discardLogger())
+	if err != nil {
+		t.Fatalf("NewSSHServer(): %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Start(ctx) }()
+
+	// Wait for the listener to be bound.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.RLock()
+		ln := srv.listener
+		srv.mu.RUnlock()
+		if ln != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start() returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start() did not return after ctx cancel")
+	}
+
+	// Second close (from Daemon.Shutdown) must not report net.ErrClosed.
+	if err := srv.Stop(); err != nil {
+		t.Errorf("Stop() after ctx-cancel close: %v", err)
+	}
+}
+
 // ─── Integration: Start with port ─────────────────────────────────────────────
 
 func TestSSHServer_StartListensOnPort(t *testing.T) {

@@ -23,8 +23,10 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse-hub",
-		Short: "HubFuse hub server",
+		Use:           "hubfuse-hub",
+		Short:         "HubFuse hub server",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
 	return cmd

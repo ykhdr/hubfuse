@@ -27,8 +27,10 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse",
-		Short: "HubFuse agent daemon",
+		Use:           "hubfuse",
+		Short:         "HubFuse agent daemon",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 
 	shareCmd := &cobra.Command{
