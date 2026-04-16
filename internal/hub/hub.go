@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net"
@@ -60,13 +59,13 @@ func NewHub(config HubConfig) (*Hub, error) {
 		return nil, fmt.Errorf("setup logger: %w", err)
 	}
 
-	dataDir := expandHome(config.DataDir)
+	dataDir := common.ExpandHome(config.DataDir)
 
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir %q: %w", dataDir, err)
 	}
 
-	dbPath := filepath.Join(dataDir, "hubfuse.db")
+	dbPath := filepath.Join(dataDir, common.DBFile)
 	s, err := store.NewSQLiteStore(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
@@ -94,13 +93,13 @@ func NewHub(config HubConfig) (*Hub, error) {
 // invokes OnReady (if set) once the listener is up, and blocks until the
 // gRPC server stops.
 func (h *Hub) Start(ctx context.Context) error {
-	dataDir := expandHome(h.config.DataDir)
-	tlsDir := filepath.Join(dataDir, "tls")
+	dataDir := common.ExpandHome(h.config.DataDir)
+	tlsDir := filepath.Join(dataDir, common.TLSDir)
 
 	tlsCfg, err := common.LoadTLSServerConfig(
-		filepath.Join(tlsDir, "ca.crt"),
-		filepath.Join(tlsDir, "server.crt"),
-		filepath.Join(tlsDir, "server.key"),
+		filepath.Join(tlsDir, common.CACertFile),
+		filepath.Join(tlsDir, common.ServerCertFile),
+		filepath.Join(tlsDir, common.ServerKeyFile),
 	)
 	if err != nil {
 		return fmt.Errorf("load TLS config: %w", err)
@@ -181,12 +180,12 @@ func (h *Hub) Stop() error {
 // dataDir/tls/, or generates and saves them if they do not exist. When
 // generating, it auto-detects local IPs/hostnames and merges extraSANs.
 func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, error) {
-	tlsDir := filepath.Join(dataDir, "tls")
+	tlsDir := filepath.Join(dataDir, common.TLSDir)
 
-	caCertPath := filepath.Join(tlsDir, "ca.crt")
-	caKeyPath := filepath.Join(tlsDir, "ca.key")
-	serverCertPath := filepath.Join(tlsDir, "server.crt")
-	serverKeyPath := filepath.Join(tlsDir, "server.key")
+	caCertPath := filepath.Join(tlsDir, common.CACertFile)
+	caKeyPath := filepath.Join(tlsDir, common.CAKeyFile)
+	serverCertPath := filepath.Join(tlsDir, common.ServerCertFile)
+	serverKeyPath := filepath.Join(tlsDir, common.ServerKeyFile)
 
 	if fileExists(caCertPath) && fileExists(caKeyPath) && fileExists(serverCertPath) && fileExists(serverKeyPath) {
 		logger.Info("loading existing TLS certificates", slog.String("tls_dir", tlsDir))
@@ -204,9 +203,8 @@ func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger
 		return nil, nil, fmt.Errorf("generate CA: %w", err)
 	}
 
-	// Save CA cert.
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
-	caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(caKey)})
+	caCertPEM := common.EncodeCACertPEM(caCert)
+	caKeyPEM := common.EncodeCAKeyPEM(caKey)
 
 	if err := os.WriteFile(caCertPath, caCertPEM, 0644); err != nil {
 		return nil, nil, fmt.Errorf("write CA cert: %w", err)
@@ -264,18 +262,6 @@ func loadCACertAndKey(caCertPath, caKeyPath string) (*x509.Certificate, *rsa.Pri
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
-}
-
-// expandHome replaces a leading "~" with the user's home directory.
-func expandHome(path string) string {
-	if len(path) == 0 || path[0] != '~' {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	return filepath.Join(home, path[1:])
 }
 
 // dedup returns a sorted, deduplicated copy of ss.

@@ -1,13 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	kdl "github.com/sblinch/kdl-go"
 	"github.com/sblinch/kdl-go/document"
+	"github.com/ykhdr/hubfuse/internal/common"
 )
 
 // Config holds the full agent configuration.
@@ -68,7 +68,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("load config %q: %w", path, err)
 	}
 
-	doc, err := kdl.Parse(strings.NewReader(string(data)))
+	doc, err := kdl.Parse(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("load config %q: failed to unmarshal KDL: %w", path, err)
 	}
@@ -238,16 +238,7 @@ func NormalizePermissions(perm string) string {
 	}
 }
 
-// ExpandTilde replaces a leading "~" in path with the current user's home
-// directory. If the home directory cannot be determined the path is returned
-// unchanged.
+// ExpandTilde is a thin alias for common.ExpandHome kept for KDL layer callers.
 func ExpandTilde(path string) string {
-	if !strings.HasPrefix(path, "~") {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	return filepath.Join(home, path[1:])
+	return common.ExpandHome(path)
 }
