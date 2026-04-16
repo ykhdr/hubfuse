@@ -28,7 +28,7 @@ type Store interface {
 	ListAllDevices(ctx context.Context) ([]*Device, error)
 
 	// UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
-	UpdateDeviceStatus(ctx context.Context, deviceID string, status string, ip string, sshPort int) error
+	UpdateDeviceStatus(ctx context.Context, deviceID string, status DeviceStatus, ip string, sshPort int) error
 
 	// UpdateDeviceNickname changes the nickname of a device.
 	UpdateDeviceNickname(ctx context.Context, deviceID string, nickname string) error
@@ -51,6 +51,11 @@ type Store interface {
 
 	// GetShares returns all shares registered for the given device.
 	GetShares(ctx context.Context, deviceID string) ([]*Share, error)
+
+	// GetSharesForDevices returns shares for every device ID in the given
+	// slice in a single query. The result is keyed by device_id; missing
+	// keys mean no shares for that device.
+	GetSharesForDevices(ctx context.Context, deviceIDs []string) (map[string][]*Share, error)
 
 	// Pairings
 

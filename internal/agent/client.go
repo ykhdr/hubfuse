@@ -125,10 +125,9 @@ func (c *HubClient) Deregister(ctx context.Context) error {
 }
 
 // Subscribe opens a server-streaming RPC to receive events from the hub.
-func (c *HubClient) Subscribe(ctx context.Context, deviceID string) (pb.HubFuse_SubscribeClient, error) {
-	stream, err := c.client.Subscribe(ctx, &pb.SubscribeRequest{
-		DeviceId: deviceID,
-	})
+// The hub identifies the subscriber from the mTLS client certificate.
+func (c *HubClient) Subscribe(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+	stream, err := c.client.Subscribe(ctx, &pb.SubscribeRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("Subscribe RPC: %w", err)
 	}
@@ -157,11 +156,11 @@ func (c *HubClient) ListDevices(ctx context.Context) (*pb.ListDevicesResponse, e
 }
 
 // ConfirmPairing completes a pairing handshake and returns the peer's public key.
-func (c *HubClient) ConfirmPairing(ctx context.Context, deviceID, inviteCode, publicKey string) (string, error) {
+// The hub identifies the caller from the mTLS client certificate.
+func (c *HubClient) ConfirmPairing(ctx context.Context, inviteCode, publicKey string) (string, error) {
 	resp, err := c.client.ConfirmPairing(ctx, &pb.ConfirmPairingRequest{
-		DeviceId:  deviceID,
 		InviteCode: inviteCode,
-		PublicKey: publicKey,
+		PublicKey:  publicKey,
 	})
 	if err != nil {
 		return "", fmt.Errorf("ConfirmPairing RPC: %w", err)

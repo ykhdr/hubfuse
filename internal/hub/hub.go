@@ -5,7 +5,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,24 +19,14 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// HubConfig holds configuration for a Hub instance.
-type HubConfig struct {
-	ListenAddr string   // e.g. ":9090"
-	DataDir    string   // e.g. "~/.hubfuse-hub"
-	LogFile    string   // path to JSON log file ("" = no file logging)
-	LogLevel   string   // file log level: "debug", "info", "warn", "error" (default: "debug")
-	Verbose    bool     // show debug logs in console
-	ExtraSANs  []string // additional SANs for the server TLS certificate
-}
-
-// Hub wires together the store, registry, heartbeat monitor, and gRPC server.
-type Hub struct {
-	config     HubConfig
-	store      store.Store
-	registry   *Registry
-	heartbeat  *HeartbeatMonitor
-	grpcServer *grpc.Server
-	logger     *slog.Logger
+// Config holds configuration for a Hub instance.
+type Config struct {
+	ListenAddr string     // e.g. ":9090"
+	DataDir    string     // e.g. "~/.hubfuse-hub"
+	LogFile    string     // path to JSON log file ("" = no file logging)
+	LogLevel   slog.Level // file log level (default: Debug)
+	Verbose    bool       // show debug logs in console
+	ExtraSANs  []string   // additional SANs for the server TLS certificate
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
 	// after net.Listen returns — the TCP listener is bound and the
@@ -47,33 +36,43 @@ type Hub struct {
 	OnReady func()
 }
 
+// Hub wires together the store, registry, heartbeat monitor, and gRPC server.
+type Hub struct {
+	config     Config
+	store      store.Store
+	registry   *Registry
+	heartbeat  *HeartbeatMonitor
+	grpcServer *grpc.Server
+	tlsCfg     *tls.Config
+	logger     *slog.Logger
+}
+
 // NewHub creates a Hub from the given config. It sets up the logger, opens
 // (or creates) the SQLite database, and loads (or generates) the CA and
 // server TLS certificates.
-func NewHub(config HubConfig) (*Hub, error) {
-	fileLevel := common.ParseLogLevel(config.LogLevel)
+func NewHub(config Config) (*Hub, error) {
 	logger, err := common.SetupLogger(common.LoggerOptions{
 		LogFile:   config.LogFile,
-		FileLevel: fileLevel,
+		FileLevel: config.LogLevel,
 		Verbose:   config.Verbose,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("setup logger: %w", err)
 	}
 
-	dataDir := expandHome(config.DataDir)
+	dataDir := common.ExpandHome(config.DataDir)
 
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir %q: %w", dataDir, err)
 	}
 
-	dbPath := filepath.Join(dataDir, "hubfuse.db")
+	dbPath := filepath.Join(dataDir, common.DBFile)
 	s, err := store.NewSQLiteStore(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
-	caCert, caKey, err := loadOrGenerateCerts(dataDir, config.ExtraSANs, logger)
+	caCert, caKey, tlsCfg, err := loadOrGenerateCerts(dataDir, config.ExtraSANs, logger)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("load/generate certs: %w", err)
@@ -87,6 +86,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 		store:     s,
 		registry:  registry,
 		heartbeat: heartbeat,
+		tlsCfg:    tlsCfg,
 		logger:    logger,
 	}, nil
 }
@@ -95,19 +95,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 // invokes OnReady (if set) once the listener is up, and blocks until the
 // gRPC server stops.
 func (h *Hub) Start(ctx context.Context) error {
-	dataDir := expandHome(h.config.DataDir)
-	tlsDir := filepath.Join(dataDir, "tls")
-
-	tlsCfg, err := common.LoadTLSServerConfig(
-		filepath.Join(tlsDir, "ca.crt"),
-		filepath.Join(tlsDir, "server.crt"),
-		filepath.Join(tlsDir, "server.key"),
-	)
-	if err != nil {
-		return fmt.Errorf("load TLS config: %w", err)
-	}
-
-	creds := credentials.NewTLS(tlsCfg)
+	creds := credentials.NewTLS(h.tlsCfg)
 
 	h.grpcServer = grpc.NewServer(
 		grpc.Creds(creds),
@@ -123,11 +111,10 @@ func (h *Hub) Start(ctx context.Context) error {
 		return fmt.Errorf("listen on %q: %w", h.config.ListenAddr, err)
 	}
 
-	if h.OnReady != nil {
-		h.OnReady()
+	if h.config.OnReady != nil {
+		h.config.OnReady()
 	}
 
-	// Start heartbeat monitor in the background.
 	go h.heartbeat.Start(ctx)
 
 	h.logger.Info("hub gRPC server starting", slog.String("addr", h.config.ListenAddr))
@@ -144,7 +131,6 @@ func (h *Hub) Start(ctx context.Context) error {
 func (h *Hub) Stop() error {
 	ctx := context.Background()
 
-	// Mark all online devices offline.
 	online, err := h.store.ListOnlineDevices(ctx)
 	if err != nil {
 		h.logger.Warn("stop: list online devices", slog.Any("error", err))
@@ -158,8 +144,8 @@ func (h *Hub) Stop() error {
 					},
 				},
 			}
-			h.registry.Broadcast(event, "")
-			if err := h.store.UpdateDeviceStatus(ctx, d.DeviceID, "offline", d.LastIP, d.SSHPort); err != nil {
+			h.registry.BroadcastAll(event)
+			if err := h.store.UpdateDeviceStatus(ctx, d.DeviceID, store.StatusOffline, d.LastIP, d.SSHPort); err != nil {
 				h.logger.Warn("stop: mark device offline",
 					slog.String("device_id", d.DeviceID),
 					slog.Any("error", err))
@@ -181,59 +167,69 @@ func (h *Hub) Stop() error {
 // loadOrGenerateCerts loads existing CA and server TLS certificates from
 // dataDir/tls/, or generates and saves them if they do not exist. When
 // generating, it auto-detects local IPs/hostnames and merges extraSANs.
-func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, error) {
-	tlsDir := filepath.Join(dataDir, "tls")
+func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, *tls.Config, error) {
+	tlsDir := filepath.Join(dataDir, common.TLSDir)
 
-	caCertPath := filepath.Join(tlsDir, "ca.crt")
-	caKeyPath := filepath.Join(tlsDir, "ca.key")
-	serverCertPath := filepath.Join(tlsDir, "server.crt")
-	serverKeyPath := filepath.Join(tlsDir, "server.key")
+	caCertPath := filepath.Join(tlsDir, common.CACertFile)
+	caKeyPath := filepath.Join(tlsDir, common.CAKeyFile)
+	serverCertPath := filepath.Join(tlsDir, common.ServerCertFile)
+	serverKeyPath := filepath.Join(tlsDir, common.ServerKeyFile)
 
 	if fileExists(caCertPath) && fileExists(caKeyPath) && fileExists(serverCertPath) && fileExists(serverKeyPath) {
 		logger.Info("loading existing TLS certificates", slog.String("tls_dir", tlsDir))
-		return loadCACertAndKey(caCertPath, caKeyPath)
+		caCert, caKey, err := loadCACertAndKey(caCertPath, caKeyPath)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		tlsCfg, err := common.LoadTLSServerConfig(caCertPath, serverCertPath, serverKeyPath)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load TLS config: %w", err)
+		}
+		return caCert, caKey, tlsCfg, nil
 	}
 
 	logger.Info("generating new TLS certificates", slog.String("tls_dir", tlsDir))
 
 	if err := os.MkdirAll(tlsDir, 0700); err != nil {
-		return nil, nil, fmt.Errorf("create tls dir %q: %w", tlsDir, err)
+		return nil, nil, nil, fmt.Errorf("create tls dir %q: %w", tlsDir, err)
 	}
 
 	caCert, caKey, err := common.GenerateCA()
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate CA: %w", err)
+		return nil, nil, nil, fmt.Errorf("generate CA: %w", err)
 	}
 
-	// Save CA cert.
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
-	caKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(caKey)})
+	caCertPEM := common.EncodeCACertPEM(caCert)
+	caKeyPEM := common.EncodeCAKeyPEM(caKey)
 
 	if err := os.WriteFile(caCertPath, caCertPEM, 0644); err != nil {
-		return nil, nil, fmt.Errorf("write CA cert: %w", err)
+		return nil, nil, nil, fmt.Errorf("write CA cert: %w", err)
 	}
 	if err := os.WriteFile(caKeyPath, caKeyPEM, 0600); err != nil {
-		return nil, nil, fmt.Errorf("write CA key: %w", err)
+		return nil, nil, nil, fmt.Errorf("write CA key: %w", err)
 	}
 
-	// Build SAN list: auto-detected local hosts + extra SANs from config.
 	hosts := common.LocalHosts()
 	hosts = append(hosts, extraSANs...)
 	hosts = dedup(hosts)
 
 	logger.Info("generating server TLS certificate", slog.Any("sans", hosts))
 
-	// Generate and save server cert.
 	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, hosts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate server cert: %w", err)
+		return nil, nil, nil, fmt.Errorf("generate server cert: %w", err)
 	}
 
 	if err := common.SaveCertAndKey(serverCertPath, serverKeyPath, serverCertPEM, serverKeyPEM); err != nil {
-		return nil, nil, fmt.Errorf("save server cert/key: %w", err)
+		return nil, nil, nil, fmt.Errorf("save server cert/key: %w", err)
 	}
 
-	return caCert, caKey, nil
+	tlsCfg, err := common.LoadTLSServerConfig(caCertPath, serverCertPath, serverKeyPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load TLS config: %w", err)
+	}
+
+	return caCert, caKey, tlsCfg, nil
 }
 
 // loadCACertAndKey reads the CA certificate and private key from disk.
@@ -267,18 +263,6 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// expandHome replaces a leading "~" with the user's home directory.
-func expandHome(path string) string {
-	if len(path) == 0 || path[0] != '~' {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	return filepath.Join(home, path[1:])
-}
-
 // dedup returns a sorted, deduplicated copy of ss.
 func dedup(ss []string) []string {
 	seen := make(map[string]struct{}, len(ss))
@@ -293,23 +277,3 @@ func dedup(ss []string) []string {
 	return out
 }
 
-// TLSConfig returns a tls.Config that trusts the hub's CA and presents the
-// client certificate identified by the given PEM bytes. This is a convenience
-// helper used in tests.
-func tlsConfigFromPEM(certPEM, keyPEM, caCertPEM []byte) (*tls.Config, error) {
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("parse client cert/key: %w", err)
-	}
-
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("parse CA cert PEM")
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS13,
-	}, nil
-}

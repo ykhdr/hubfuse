@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	caKeyBits  = 4096
+	caKeyBits   = 3072
 	certKeyBits = 2048
 
 	caValidity   = 10 * 365 * 24 * time.Hour
@@ -32,7 +32,7 @@ const (
 	permCert os.FileMode = 0644
 )
 
-// GenerateCA creates a self-signed CA certificate using RSA 4096.
+// GenerateCA creates a self-signed CA certificate using RSA 3072.
 // The CA is valid for 10 years and belongs to the "HubFuse" organization.
 func GenerateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	key, err := rsa.GenerateKey(rand.Reader, caKeyBits)
@@ -283,4 +283,17 @@ func randomSerial() (*big.Int, error) {
 		return nil, fmt.Errorf("generate serial number: %w", err)
 	}
 	return serial, nil
+}
+
+// EncodeCACertPEM returns the PEM-encoded certificate suitable for
+// writing to disk or embedding in a TLS config. The input cert must
+// be either freshly generated (with Raw populated) or parsed from an
+// existing PEM.
+func EncodeCACertPEM(cert *x509.Certificate) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: pemTypeCert, Bytes: cert.Raw})
+}
+
+// EncodeCAKeyPEM returns the PEM-encoded PKCS#1 private key.
+func EncodeCAKeyPEM(key *rsa.PrivateKey) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: pemTypeKey, Bytes: x509.MarshalPKCS1PrivateKey(key)})
 }

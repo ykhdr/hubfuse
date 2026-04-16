@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -89,7 +90,7 @@ func (s *sqliteStore) CreateDevice(ctx context.Context, d *Device) error {
 		INSERT INTO devices (device_id, nickname, last_ip, ssh_port, status, last_heartbeat)
 		VALUES (?, ?, ?, ?, ?, ?)`
 	_, err := s.db.ExecContext(ctx, q,
-		d.DeviceID, d.Nickname, d.LastIP, d.SSHPort, d.Status, d.LastHeartbeat.UTC(),
+		d.DeviceID, d.Nickname, d.LastIP, d.SSHPort, string(d.Status), d.LastHeartbeat.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("create device %q: %w", d.DeviceID, err)
@@ -150,9 +151,9 @@ func (s *sqliteStore) ListAllDevices(ctx context.Context) ([]*Device, error) {
 }
 
 // UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
-func (s *sqliteStore) UpdateDeviceStatus(ctx context.Context, deviceID string, status string, ip string, sshPort int) error {
+func (s *sqliteStore) UpdateDeviceStatus(ctx context.Context, deviceID string, status DeviceStatus, ip string, sshPort int) error {
 	const q = `UPDATE devices SET status = ?, last_ip = ?, ssh_port = ? WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, status, ip, sshPort, deviceID)
+	_, err := s.db.ExecContext(ctx, q, string(status), ip, sshPort, deviceID)
 	if err != nil {
 		return fmt.Errorf("update device status %q: %w", deviceID, err)
 	}
@@ -224,7 +225,7 @@ func (s *sqliteStore) SetShares(ctx context.Context, deviceID string, shares []*
 		if err != nil {
 			return fmt.Errorf("marshal allowed_devices for share %q: %w", sh.Alias, err)
 		}
-		if _, err := tx.ExecContext(ctx, ins, deviceID, sh.Alias, sh.Permissions, string(adJSON)); err != nil {
+		if _, err := tx.ExecContext(ctx, ins, deviceID, sh.Alias, string(sh.Permissions), string(adJSON)); err != nil {
 			return fmt.Errorf("insert share %q for device %q: %w", sh.Alias, deviceID, err)
 		}
 	}
@@ -247,10 +248,12 @@ func (s *sqliteStore) GetShares(ctx context.Context, deviceID string) ([]*Share,
 	var shares []*Share
 	for rows.Next() {
 		var sh Share
+		var permStr string
 		var adJSON string
-		if err := rows.Scan(&sh.DeviceID, &sh.Alias, &sh.Permissions, &adJSON); err != nil {
+		if err := rows.Scan(&sh.DeviceID, &sh.Alias, &permStr, &adJSON); err != nil {
 			return nil, fmt.Errorf("scan share row: %w", err)
 		}
+		sh.Permissions = Permission(permStr)
 		if err := json.Unmarshal([]byte(adJSON), &sh.AllowedDevices); err != nil {
 			return nil, fmt.Errorf("unmarshal allowed_devices: %w", err)
 		}
@@ -260,6 +263,49 @@ func (s *sqliteStore) GetShares(ctx context.Context, deviceID string) ([]*Share,
 		return nil, fmt.Errorf("iterate share rows: %w", err)
 	}
 	return shares, nil
+}
+
+// GetSharesForDevices returns shares for the given deviceIDs in a single
+// query, grouped by device_id. Devices with no shares are absent from the
+// returned map.
+func (s *sqliteStore) GetSharesForDevices(ctx context.Context, deviceIDs []string) (map[string][]*Share, error) {
+	result := make(map[string][]*Share, len(deviceIDs))
+	if len(deviceIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(deviceIDs))
+	args := make([]any, len(deviceIDs))
+	for i, id := range deviceIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := "SELECT device_id, alias, permissions, allowed_devices FROM shares WHERE device_id IN (" +
+		strings.Join(placeholders, ",") + ")"
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get shares for devices: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sh Share
+		var permStr string
+		var adJSON string
+		if err := rows.Scan(&sh.DeviceID, &sh.Alias, &permStr, &adJSON); err != nil {
+			return nil, fmt.Errorf("scan share row: %w", err)
+		}
+		sh.Permissions = Permission(permStr)
+		if err := json.Unmarshal([]byte(adJSON), &sh.AllowedDevices); err != nil {
+			return nil, fmt.Errorf("unmarshal allowed_devices: %w", err)
+		}
+		result[sh.DeviceID] = append(result[sh.DeviceID], &sh)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate share rows: %w", err)
+	}
+	return result, nil
 }
 
 // --- Pairings ---
@@ -382,10 +428,12 @@ type rowScanner interface {
 // scanDevice scans a single device row.
 func scanDevice(row rowScanner) (*Device, error) {
 	var d Device
+	var statusStr string
 	var lastHeartbeat string
-	if err := row.Scan(&d.DeviceID, &d.Nickname, &d.LastIP, &d.SSHPort, &d.Status, &lastHeartbeat); err != nil {
+	if err := row.Scan(&d.DeviceID, &d.Nickname, &d.LastIP, &d.SSHPort, &statusStr, &lastHeartbeat); err != nil {
 		return nil, err
 	}
+	d.Status = DeviceStatus(statusStr)
 	t, err := parseDateTime(lastHeartbeat)
 	if err != nil {
 		return nil, fmt.Errorf("parse last_heartbeat: %w", err)

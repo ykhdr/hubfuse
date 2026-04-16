@@ -8,27 +8,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
-)
-
-const (
-	defaultDataDir = "~/.hubfuse"
-	configFile     = "config.kdl"
-	pidFile        = "hubfuse.pid"
-	identityFile   = "device.json"
-	tlsDir         = "tls"
-	keysDir        = "keys"
-	privateKeyFile = "id_ed25519"
-	publicKeyFile  = "id_ed25519.pub"
 )
 
 func main() {
@@ -91,8 +78,7 @@ func joinCmd() *cobra.Command {
 				return fmt.Errorf("nickname cannot be empty")
 			}
 
-			// Generate device ID.
-			deviceID := uuid.New().String()
+			deviceID := agent.GenerateDeviceID()
 
 			// Dial hub insecurely (no client cert yet).
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -112,19 +98,19 @@ func joinCmd() *cobra.Command {
 			}
 
 			// Save certs to ~/.hubfuse/tls/.
-			dataDir := expandHome(defaultDataDir)
-			tlsDirPath := filepath.Join(dataDir, tlsDir)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			tlsDirPath := filepath.Join(dataDir, common.TLSDir)
 			if err := os.MkdirAll(tlsDirPath, 0700); err != nil {
 				return fmt.Errorf("create tls dir: %w", err)
 			}
 
-			if err := os.WriteFile(filepath.Join(tlsDirPath, "ca.crt"), resp.CaCert, 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(tlsDirPath, common.CACertFile), resp.CaCert, 0644); err != nil {
 				return fmt.Errorf("write ca.crt: %w", err)
 			}
-			if err := os.WriteFile(filepath.Join(tlsDirPath, "client.crt"), resp.ClientCert, 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(tlsDirPath, common.ClientCertFile), resp.ClientCert, 0644); err != nil {
 				return fmt.Errorf("write client.crt: %w", err)
 			}
-			if err := os.WriteFile(filepath.Join(tlsDirPath, "client.key"), resp.ClientKey, 0600); err != nil {
+			if err := os.WriteFile(filepath.Join(tlsDirPath, common.ClientKeyFile), resp.ClientKey, 0600); err != nil {
 				return fmt.Errorf("write client.key: %w", err)
 			}
 
@@ -133,17 +119,16 @@ func joinCmd() *cobra.Command {
 				DeviceID: deviceID,
 				Nickname: nickname,
 			}
-			identityPath := filepath.Join(dataDir, identityFile)
+			identityPath := filepath.Join(dataDir, common.IdentityFile)
 			if err := agent.SaveIdentity(identityPath, identity); err != nil {
 				return fmt.Errorf("save identity: %w", err)
 			}
 
-			// Write initial config.kdl.
-			cfgPath := filepath.Join(dataDir, configFile)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 			cfg := config.DefaultConfig()
 			cfg.Device.Nickname = nickname
 			cfg.Hub.Address = hubAddr
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -166,10 +151,10 @@ func startCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the agent daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
-			pidPath := filepath.Join(dataDir, pidFile)
-			defaultLog := filepath.Join(dataDir, "agent.log")
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
+			pidPath := filepath.Join(dataDir, common.AgentPIDFile)
+			defaultLog := filepath.Join(dataDir, common.AgentLogFile)
 
 			// Reject second concurrent start regardless of daemon flag.
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
@@ -200,14 +185,15 @@ func startCmd() *cobra.Command {
 				return fmt.Errorf("setup logger: %w", err)
 			}
 
-			d, err := agent.NewDaemon(cfgPath, logger)
+			d, err := agent.NewDaemon(cfgPath, logger, agent.DaemonOptions{
+				OnReady: func() {
+					if err := daemonize.WritePIDFile(pidPath); err != nil {
+						logger.Warn("write pid file", "path", pidPath, "error", err)
+					}
+				},
+			})
 			if err != nil {
 				return fmt.Errorf("create daemon: %w", err)
-			}
-			d.OnReady = func() {
-				if err := daemonize.WritePIDFile(pidPath); err != nil {
-					logger.Warn("write pid file", "path", pidPath, "error", err)
-				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
@@ -247,20 +233,8 @@ func stopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the running agent daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pidPath := expandHome(filepath.Join(defaultDataDir, pidFile))
-			pid, err := readPID(pidPath)
-			if err != nil {
-				return fmt.Errorf("read PID file %q: %w", pidPath, err)
-			}
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				return fmt.Errorf("find process %d: %w", pid, err)
-			}
-			if err := proc.Signal(syscall.SIGTERM); err != nil {
-				return fmt.Errorf("send SIGTERM to %d: %w", pid, err)
-			}
-			fmt.Printf("sent SIGTERM to agent (pid %d)\n", pid)
-			return nil
+			pidPath := common.ExpandHome(filepath.Join(common.AgentDataDir, common.AgentPIDFile))
+			return daemonize.SignalStop(pidPath, "agent")
 		},
 	}
 }
@@ -271,23 +245,8 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show agent daemon status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pidPath := expandHome(filepath.Join(defaultDataDir, pidFile))
-			pid, err := readPID(pidPath)
-			if err != nil {
-				fmt.Println("agent is not running (no PID file)")
-				return nil
-			}
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				fmt.Printf("agent is not running (pid %d not found)\n", pid)
-				return nil
-			}
-			if err := proc.Signal(syscall.Signal(0)); err != nil {
-				fmt.Printf("agent is not running (pid %d, signal error: %v)\n", pid, err)
-				return nil
-			}
-			fmt.Printf("agent is running (pid %d)\n", pid)
-			return nil
+			pidPath := common.ExpandHome(filepath.Join(common.AgentDataDir, common.AgentPIDFile))
+			return daemonize.ReportStatus(pidPath, "agent")
 		},
 	}
 }
@@ -301,9 +260,9 @@ func pairCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			toDevice := args[0]
 
-			dataDir := expandHome(defaultDataDir)
-			keysDirPath := filepath.Join(dataDir, keysDir)
-			pubKeyPath := filepath.Join(keysDirPath, publicKeyFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			keysDirPath := filepath.Join(dataDir, common.KeysDir)
+			pubKeyPath := filepath.Join(keysDirPath, common.PublicKeyFile)
 
 			// Load or generate SSH key pair.
 			var publicKey string
@@ -346,7 +305,7 @@ func devicesCmd() *cobra.Command {
 		Use:   "devices",
 		Short: "List all devices",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dataDir := expandHome(defaultDataDir)
+			dataDir := common.ExpandHome(common.AgentDataDir)
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, _, err := dialHub(dataDir, logger)
@@ -386,7 +345,7 @@ func renameCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			newNickname := args[0]
 
-			dataDir := expandHome(defaultDataDir)
+			dataDir := common.ExpandHome(common.AgentDataDir)
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 			hubClient, identity, err := dialHub(dataDir, logger)
@@ -401,19 +360,19 @@ func renameCmd() *cobra.Command {
 
 			// Update local identity.
 			identity.Nickname = newNickname
-			identityPath := filepath.Join(dataDir, identityFile)
+			identityPath := filepath.Join(dataDir, common.IdentityFile)
 			if err := agent.SaveIdentity(identityPath, identity); err != nil {
 				return fmt.Errorf("save identity: %w", err)
 			}
 
 			// Update config.kdl.
-			cfgPath := filepath.Join(dataDir, configFile)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
 			cfg.Device.Nickname = newNickname
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -438,8 +397,8 @@ func shareAddCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sharePath := args[0]
 
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -465,7 +424,7 @@ func shareAddCmd() *cobra.Command {
 				AllowedDevices: allow,
 			})
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -491,8 +450,8 @@ func shareRemoveCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			alias := args[0]
 
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -513,7 +472,7 @@ func shareRemoveCmd() *cobra.Command {
 			}
 			cfg.Shares = newShares
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -529,8 +488,8 @@ func shareListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List shared directories",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -572,8 +531,8 @@ func mountAddCmd() *cobra.Command {
 			deviceName := parts[0]
 			shareName := parts[1]
 
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -593,7 +552,7 @@ func mountAddCmd() *cobra.Command {
 				To:     to,
 			})
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -622,8 +581,8 @@ func mountRemoveCmd() *cobra.Command {
 			deviceName := parts[0]
 			shareName := parts[1]
 
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -644,7 +603,7 @@ func mountRemoveCmd() *cobra.Command {
 			}
 			cfg.Mounts = newMounts
 
-			if err := writeConfig(cfgPath, cfg); err != nil {
+			if err := config.Save(cfgPath, cfg); err != nil {
 				return fmt.Errorf("write config: %w", err)
 			}
 
@@ -660,8 +619,8 @@ func mountListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List remote mounts",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dataDir := expandHome(defaultDataDir)
-			cfgPath := filepath.Join(dataDir, configFile)
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
 
 			cfg, err := loadConfig(cfgPath)
 			if err != nil {
@@ -683,32 +642,20 @@ func mountListCmd() *cobra.Command {
 	}
 }
 
-// expandHome replaces a leading "~" with the user's home directory.
-func expandHome(path string) string {
-	if len(path) == 0 || path[0] != '~' {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	return filepath.Join(home, path[1:])
-}
-
 // dialHub loads the device identity and connects to the hub with mTLS.
 func dialHub(dataDir string, logger *slog.Logger) (*agent.HubClient, *agent.DeviceIdentity, error) {
-	identityPath := filepath.Join(dataDir, identityFile)
+	identityPath := filepath.Join(dataDir, common.IdentityFile)
 	identity, err := agent.LoadIdentity(identityPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load identity: %w", err)
 	}
 
-	tlsDirPath := filepath.Join(dataDir, tlsDir)
-	caCertPath := filepath.Join(tlsDirPath, "ca.crt")
-	clientCertPath := filepath.Join(tlsDirPath, "client.crt")
-	clientKeyPath := filepath.Join(tlsDirPath, "client.key")
+	tlsDirPath := filepath.Join(dataDir, common.TLSDir)
+	caCertPath := filepath.Join(tlsDirPath, common.CACertFile)
+	clientCertPath := filepath.Join(tlsDirPath, common.ClientCertFile)
+	clientKeyPath := filepath.Join(tlsDirPath, common.ClientKeyFile)
 
-	cfgPath := filepath.Join(dataDir, configFile)
+	cfgPath := filepath.Join(dataDir, common.ConfigFile)
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load config: %w", err)
@@ -736,74 +683,4 @@ func loadConfig(path string) (*config.Config, error) {
 	return cfg, nil
 }
 
-// writeConfig serialises cfg to a KDL file at path, creating parent
-// directories as needed. The format matches what config.Load expects.
-func writeConfig(path string, cfg *config.Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
 
-	var sb strings.Builder
-
-	// device block.
-	fmt.Fprintf(&sb, "device {\n")
-	fmt.Fprintf(&sb, "    nickname %q\n", cfg.Device.Nickname)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// hub block.
-	fmt.Fprintf(&sb, "hub {\n")
-	fmt.Fprintf(&sb, "    address %q\n", cfg.Hub.Address)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// agent block.
-	fmt.Fprintf(&sb, "agent {\n")
-	fmt.Fprintf(&sb, "    ssh-port %d\n", cfg.Agent.SSHPort)
-	fmt.Fprintf(&sb, "}\n\n")
-
-	// shares block.
-	if len(cfg.Shares) > 0 {
-		fmt.Fprintf(&sb, "shares {\n")
-		for _, s := range cfg.Shares {
-			fmt.Fprintf(&sb, "    share %q alias=%q permissions=%q", s.Path, s.Alias, s.Permissions)
-			if len(s.AllowedDevices) > 0 {
-				fmt.Fprintf(&sb, " {\n")
-				fmt.Fprintf(&sb, "        allowed-devices")
-				for _, d := range s.AllowedDevices {
-					fmt.Fprintf(&sb, " %q", d)
-				}
-				fmt.Fprintf(&sb, "\n")
-				fmt.Fprintf(&sb, "    }\n")
-			} else {
-				fmt.Fprintf(&sb, "\n")
-			}
-		}
-		fmt.Fprintf(&sb, "}\n\n")
-	}
-
-	// mounts block.
-	if len(cfg.Mounts) > 0 {
-		fmt.Fprintf(&sb, "mounts {\n")
-		for _, m := range cfg.Mounts {
-			fmt.Fprintf(&sb, "    mount device=%q share=%q to=%q\n", m.Device, m.Share, m.To)
-		}
-		fmt.Fprintf(&sb, "}\n")
-	}
-
-	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
-		return fmt.Errorf("write config %q: %w", path, err)
-	}
-	return nil
-}
-
-// readPID reads an integer PID from the file at path.
-func readPID(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, fmt.Errorf("parse PID: %w", err)
-	}
-	return pid, nil
-}

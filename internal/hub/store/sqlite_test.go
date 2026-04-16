@@ -24,7 +24,7 @@ func makeDevice(id, nickname string) *Device {
 		Nickname:      nickname,
 		LastIP:        "192.168.1.1",
 		SSHPort:       22,
-		Status:        "offline",
+		Status:        StatusOffline,
 		LastHeartbeat: time.Now().UTC().Truncate(time.Second),
 	}
 }
@@ -128,9 +128,9 @@ func TestListOnlineDevices(t *testing.T) {
 	ctx := context.Background()
 
 	online := makeDevice("dev-1", "alice")
-	online.Status = "online"
+	online.Status = StatusOnline
 	offline := makeDevice("dev-2", "bob")
-	offline.Status = "offline"
+	offline.Status = StatusOffline
 
 	if err := s.CreateDevice(ctx, online); err != nil {
 		t.Fatalf("CreateDevice online: %v", err)
@@ -172,7 +172,7 @@ func TestUpdateDeviceStatus(t *testing.T) {
 		t.Fatalf("CreateDevice: %v", err)
 	}
 
-	if err := s.UpdateDeviceStatus(ctx, "dev-1", "online", "10.0.0.5", 2222); err != nil {
+	if err := s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.5", 2222); err != nil {
 		t.Fatalf("UpdateDeviceStatus: %v", err)
 	}
 
@@ -180,8 +180,8 @@ func TestUpdateDeviceStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDevice: %v", err)
 	}
-	if got.Status != "online" {
-		t.Errorf("Status = %q, want %q", got.Status, "online")
+	if got.Status != StatusOnline {
+		t.Errorf("Status = %q, want %q", got.Status, StatusOnline)
 	}
 	if got.LastIP != "10.0.0.5" {
 		t.Errorf("LastIP = %q, want %q", got.LastIP, "10.0.0.5")
@@ -243,15 +243,15 @@ func TestGetStaleDevices(t *testing.T) {
 	ctx := context.Background()
 
 	old := makeDevice("dev-old", "alice")
-	old.Status = "online"
+	old.Status = StatusOnline
 	old.LastHeartbeat = time.Now().UTC().Add(-10 * time.Minute)
 
 	fresh := makeDevice("dev-fresh", "bob")
-	fresh.Status = "online"
+	fresh.Status = StatusOnline
 	fresh.LastHeartbeat = time.Now().UTC()
 
 	offlineOld := makeDevice("dev-offline", "charlie")
-	offlineOld.Status = "offline"
+	offlineOld.Status = StatusOffline
 	offlineOld.LastHeartbeat = time.Now().UTC().Add(-10 * time.Minute)
 
 	for _, d := range []*Device{old, fresh, offlineOld} {
@@ -279,7 +279,7 @@ func TestGetStaleDevices_NoneStale(t *testing.T) {
 	ctx := context.Background()
 
 	d := makeDevice("dev-1", "alice")
-	d.Status = "online"
+	d.Status = StatusOnline
 	d.LastHeartbeat = time.Now().UTC()
 	if err := s.CreateDevice(ctx, d); err != nil {
 		t.Fatalf("CreateDevice: %v", err)
@@ -324,8 +324,8 @@ func TestSetShares_AndGet(t *testing.T) {
 	}
 
 	shares := []*Share{
-		{DeviceID: "dev-1", Alias: "docs", Permissions: "ro", AllowedDevices: []string{"dev-2", "dev-3"}},
-		{DeviceID: "dev-1", Alias: "music", Permissions: "rw", AllowedDevices: []string{}},
+		{DeviceID: "dev-1", Alias: "docs", Permissions: PermRO, AllowedDevices: []string{"dev-2", "dev-3"}},
+		{DeviceID: "dev-1", Alias: "music", Permissions: PermRW, AllowedDevices: []string{}},
 	}
 	if err := s.SetShares(ctx, "dev-1", shares); err != nil {
 		t.Fatalf("SetShares: %v", err)
@@ -349,8 +349,8 @@ func TestSetShares_AndGet(t *testing.T) {
 	if !ok {
 		t.Fatal("share 'docs' not found")
 	}
-	if docs.Permissions != "ro" {
-		t.Errorf("docs.Permissions = %q, want %q", docs.Permissions, "ro")
+	if docs.Permissions != PermRO {
+		t.Errorf("docs.Permissions = %q, want %q", docs.Permissions, PermRO)
 	}
 	if len(docs.AllowedDevices) != 2 {
 		t.Errorf("docs.AllowedDevices len = %d, want 2", len(docs.AllowedDevices))
@@ -360,8 +360,8 @@ func TestSetShares_AndGet(t *testing.T) {
 	if !ok {
 		t.Fatal("share 'music' not found")
 	}
-	if music.Permissions != "rw" {
-		t.Errorf("music.Permissions = %q, want %q", music.Permissions, "rw")
+	if music.Permissions != PermRW {
+		t.Errorf("music.Permissions = %q, want %q", music.Permissions, PermRW)
 	}
 }
 
@@ -374,14 +374,14 @@ func TestSetShares_ReplacesExisting(t *testing.T) {
 	}
 
 	original := []*Share{
-		{DeviceID: "dev-1", Alias: "old-share", Permissions: "ro", AllowedDevices: []string{}},
+		{DeviceID: "dev-1", Alias: "old-share", Permissions: PermRO, AllowedDevices: []string{}},
 	}
 	if err := s.SetShares(ctx, "dev-1", original); err != nil {
 		t.Fatalf("SetShares original: %v", err)
 	}
 
 	replacement := []*Share{
-		{DeviceID: "dev-1", Alias: "new-share", Permissions: "rw", AllowedDevices: []string{"dev-2"}},
+		{DeviceID: "dev-1", Alias: "new-share", Permissions: PermRW, AllowedDevices: []string{"dev-2"}},
 	}
 	if err := s.SetShares(ctx, "dev-1", replacement); err != nil {
 		t.Fatalf("SetShares replacement: %v", err)
@@ -754,7 +754,7 @@ func TestListAllDevices(t *testing.T) {
 		t.Fatalf("CreateDevice d2: %v", err)
 	}
 	// Mark d1 online.
-	if err := s.UpdateDeviceStatus(ctx, "dev-1", "online", "10.0.0.1", 2222); err != nil {
+	if err := s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222); err != nil {
 		t.Fatalf("UpdateDeviceStatus: %v", err)
 	}
 
@@ -766,15 +766,15 @@ func TestListAllDevices(t *testing.T) {
 		t.Fatalf("expected 2 devices, got %d", len(devices))
 	}
 
-	statusMap := map[string]string{}
+	statusMap := map[string]DeviceStatus{}
 	for _, d := range devices {
 		statusMap[d.DeviceID] = d.Status
 	}
-	if statusMap["dev-1"] != "online" {
-		t.Errorf("dev-1 status = %q, want %q", statusMap["dev-1"], "online")
+	if statusMap["dev-1"] != StatusOnline {
+		t.Errorf("dev-1 status = %q, want %q", statusMap["dev-1"], StatusOnline)
 	}
-	if statusMap["dev-2"] != "offline" {
-		t.Errorf("dev-2 status = %q, want %q", statusMap["dev-2"], "offline")
+	if statusMap["dev-2"] != StatusOffline {
+		t.Errorf("dev-2 status = %q, want %q", statusMap["dev-2"], StatusOffline)
 	}
 }
 
@@ -817,7 +817,7 @@ func TestSetShares_NilAllowedDevices(t *testing.T) {
 	}
 
 	shares := []*Share{
-		{DeviceID: "dev-1", Alias: "data", Permissions: "ro", AllowedDevices: nil},
+		{DeviceID: "dev-1", Alias: "data", Permissions: PermRO, AllowedDevices: nil},
 	}
 	if err := s.SetShares(ctx, "dev-1", shares); err != nil {
 		t.Fatalf("SetShares: %v", err)

@@ -6,13 +6,19 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 )
+
+// mountKey is the map key for an active mount, uniquely identifying a
+// device+share pair without string concatenation.
+type mountKey struct {
+	Device string
+	Share  string
+}
 
 // Mount represents an active SSHFS mount.
 type Mount struct {
@@ -26,11 +32,10 @@ type Mount struct {
 
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
-	keyPath         string // path to agent's SSH private key
-	knownDevicesDir string // path to known_devices directory
-	logger          *slog.Logger
-	activeMounts    map[string]*Mount // key: "device:share"
-	mu              sync.Mutex
+	keyPath      string // path to agent's SSH private key
+	logger       *slog.Logger
+	activeMounts map[mountKey]*Mount
+	mu           sync.Mutex
 
 	// execCommand is used to build commands; override in tests.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
@@ -39,40 +44,25 @@ type Mounter struct {
 }
 
 // NewMounter creates a new Mounter.
-func NewMounter(keyPath, knownDevicesDir string, logger *slog.Logger) *Mounter {
+func NewMounter(keyPath string, logger *slog.Logger) *Mounter {
 	return &Mounter{
-		keyPath:         keyPath,
-		knownDevicesDir: knownDevicesDir,
-		logger:          logger,
-		activeMounts:    make(map[string]*Mount),
-		execCommand:     exec.CommandContext,
-		unmount:         unmountPath,
+		keyPath:      keyPath,
+		logger:       logger,
+		activeMounts: make(map[mountKey]*Mount),
+		execCommand:  exec.CommandContext,
+		unmount:      unmountPath,
 	}
-}
-
-// mountKey returns the map key for a device+share pair.
-func mountKey(device, share string) string {
-	return device + ":" + share
 }
 
 // Mount mounts the remote share described by mc from deviceIP:sshPort using SSHFS.
-// It verifies the peer device is paired (has a key in known_devices) before mounting.
+// Callers are responsible for ensuring the device is paired before calling Mount.
 func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceIP string, sshPort int) error {
-	// Verify peer device is paired.
-	pubKeyPath := filepath.Join(m.knownDevicesDir, mc.Device+".pub")
-	if _, err := os.Stat(pubKeyPath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("device %q is not paired: no key found at %q", mc.Device, pubKeyPath)
-		}
-		return fmt.Errorf("check pairing for device %q: %w", mc.Device, err)
-	}
-
 	// Create mount point directory if needed.
 	if err := os.MkdirAll(mc.To, 0755); err != nil {
 		return fmt.Errorf("create mount point %q: %w", mc.To, err)
 	}
 
-	key := mountKey(mc.Device, mc.Share)
+	key := mountKey{Device: mc.Device, Share: mc.Share}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -81,7 +71,6 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		return fmt.Errorf("share %q from device %q is already mounted", mc.Share, mc.Device)
 	}
 
-	// Build sshfs command.
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
 	cmd := m.execCommand(ctx, "sshfs",
 		"-p", fmt.Sprintf("%d", sshPort),
@@ -117,9 +106,8 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 }
 
 // Unmount unmounts the share identified by device and share name.
-// It uses the platform-appropriate unmount command.
 func (m *Mounter) Unmount(device, share string) error {
-	key := mountKey(device, share)
+	key := mountKey{Device: device, Share: share}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -151,7 +139,6 @@ func unmountPath(path string) error {
 	case "darwin":
 		cmd = exec.Command("umount", path)
 	default:
-		// Linux and others.
 		cmd = exec.Command("fusermount", "-u", path)
 	}
 
@@ -166,7 +153,7 @@ func unmountPath(path string) error {
 // It attempts to unmount each mount and accumulates errors.
 func (m *Mounter) UnmountAll() error {
 	m.mu.Lock()
-	keys := make([]string, 0, len(m.activeMounts))
+	keys := make([]mountKey, 0, len(m.activeMounts))
 	for k := range m.activeMounts {
 		keys = append(keys, k)
 	}
@@ -174,11 +161,7 @@ func (m *Mounter) UnmountAll() error {
 
 	var errs []string
 	for _, key := range keys {
-		parts := strings.SplitN(key, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		if err := m.Unmount(parts[0], parts[1]); err != nil {
+		if err := m.Unmount(key.Device, key.Share); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -192,9 +175,9 @@ func (m *Mounter) UnmountAll() error {
 // UnmountDevice unmounts all shares from the named device.
 func (m *Mounter) UnmountDevice(deviceNickname string) error {
 	m.mu.Lock()
-	var keys []string
-	for k, mnt := range m.activeMounts {
-		if mnt.Device == deviceNickname {
+	var keys []mountKey
+	for k := range m.activeMounts {
+		if k.Device == deviceNickname {
 			keys = append(keys, k)
 		}
 	}
@@ -202,11 +185,7 @@ func (m *Mounter) UnmountDevice(deviceNickname string) error {
 
 	var errs []string
 	for _, key := range keys {
-		parts := strings.SplitN(key, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		if err := m.Unmount(parts[0], parts[1]); err != nil {
+		if err := m.Unmount(key.Device, key.Share); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -221,7 +200,7 @@ func (m *Mounter) UnmountDevice(deviceNickname string) error {
 func (m *Mounter) IsActive(device, share string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.activeMounts[mountKey(device, share)]
+	_, ok := m.activeMounts[mountKey{Device: device, Share: share}]
 	return ok
 }
 

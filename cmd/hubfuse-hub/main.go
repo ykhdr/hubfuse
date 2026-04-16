@@ -6,11 +6,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
 )
@@ -46,20 +45,16 @@ func startCmd() *cobra.Command {
 		Use:   "start",
 		Short: "Start the hub server",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			expandedData := expandHome(dataDir)
-			pidPath := filepath.Join(expandedData, "hubfuse-hub.pid")
-			defaultLog := filepath.Join(expandedData, "hub.log")
+			expandedData := common.ExpandHome(dataDir)
+			pidPath := filepath.Join(expandedData, common.HubPIDFile)
+			defaultLog := filepath.Join(expandedData, common.HubLogFile)
 
-			// Reject second concurrent start regardless of daemon flag.
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
 				return fmt.Errorf("check existing hub: %w", err)
 			} else if alive {
 				return fmt.Errorf("hub already running (pid %d)", pid)
 			}
 
-			// If we're the parent and --daemon was requested, re-exec.
-			// The detached child's stdout/stderr (which is where the
-			// console-handler logs land) gets redirected into defaultLog.
 			if daemon && !daemonize.IsChild() {
 				if err := os.MkdirAll(expandedData, 0o700); err != nil {
 					return fmt.Errorf("create data dir: %w", err)
@@ -70,23 +65,23 @@ func startCmd() *cobra.Command {
 				})
 			}
 
-			cfg := hub.HubConfig{
+			cfg := hub.Config{
 				ListenAddr: listen,
 				DataDir:    dataDir,
 				LogFile:    logFile,
-				LogLevel:   logLevel,
+				LogLevel:   common.ParseLogLevel(logLevel),
 				Verbose:    verbose,
 				ExtraSANs:  extraSANs,
+				OnReady: func() {
+					if err := daemonize.WritePIDFile(pidPath); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
+					}
+				},
 			}
 
 			h, err := hub.NewHub(cfg)
 			if err != nil {
 				return fmt.Errorf("create hub: %w", err)
-			}
-			h.OnReady = func() {
-				if err := daemonize.WritePIDFile(pidPath); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
-				}
 			}
 			defer func() {
 				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
@@ -116,7 +111,7 @@ func startCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&listen, "listen", ":9090", "address to listen on")
-	cmd.Flags().StringVar(&dataDir, "data-dir", "~/.hubfuse-hub", "data directory")
+	cmd.Flags().StringVar(&dataDir, "data-dir", common.HubDataDir, "data directory")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
@@ -131,20 +126,8 @@ func stopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop a running hub server",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pidFile := expandHome("~/.hubfuse-hub/hubfuse-hub.pid")
-			pid, err := readPID(pidFile)
-			if err != nil {
-				return fmt.Errorf("read PID file %q: %w", pidFile, err)
-			}
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				return fmt.Errorf("find process %d: %w", pid, err)
-			}
-			if err := proc.Signal(syscall.SIGTERM); err != nil {
-				return fmt.Errorf("send SIGTERM to %d: %w", pid, err)
-			}
-			fmt.Printf("sent SIGTERM to hub (pid %d)\n", pid)
-			return nil
+			pidPath := common.ExpandHome(filepath.Join(common.HubDataDir, common.HubPIDFile))
+			return daemonize.SignalStop(pidPath, "hub")
 		},
 	}
 }
@@ -154,48 +137,8 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show hub server status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pidFile := expandHome("~/.hubfuse-hub/hubfuse-hub.pid")
-			pid, err := readPID(pidFile)
-			if err != nil {
-				fmt.Println("hub is not running (no PID file)")
-				return nil
-			}
-			proc, err := os.FindProcess(pid)
-			if err != nil {
-				fmt.Printf("hub is not running (pid %d not found)\n", pid)
-				return nil
-			}
-			if err := proc.Signal(syscall.Signal(0)); err != nil {
-				fmt.Printf("hub is not running (pid %d, signal error: %v)\n", pid, err)
-				return nil
-			}
-			fmt.Printf("hub is running (pid %d)\n", pid)
-			return nil
+			pidPath := common.ExpandHome(filepath.Join(common.HubDataDir, common.HubPIDFile))
+			return daemonize.ReportStatus(pidPath, "hub")
 		},
 	}
-}
-
-// expandHome replaces a leading "~" with the user's home directory.
-func expandHome(path string) string {
-	if len(path) == 0 || path[0] != '~' {
-		return path
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
-	}
-	return filepath.Join(home, path[1:])
-}
-
-// readPID reads an integer PID from the file at path.
-func readPID(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, fmt.Errorf("parse PID: %w", err)
-	}
-	return pid, nil
 }

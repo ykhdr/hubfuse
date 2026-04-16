@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
@@ -43,7 +44,7 @@ func recvEvent(t *testing.T, stream pb.HubFuse_SubscribeClient, timeout time.Dur
 //  4. A updates shares → B receives SharesUpdated.
 //  5. A deregisters → B receives DeviceOffline.
 func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	devA := "lc-a-" + uuid.New().String()
 	devB := "lc-b-" + uuid.New().String()
@@ -71,7 +72,7 @@ func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) 
 	// B subscribes.
 	subCtxB, cancelB := context.WithCancel(context.Background())
 	t.Cleanup(cancelB)
-	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{DeviceId: devB})
+	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{})
 	if err != nil {
 		t.Fatalf("Subscribe B: %v", err)
 	}

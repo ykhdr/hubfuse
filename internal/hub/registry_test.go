@@ -77,8 +77,8 @@ func TestJoin_Success(t *testing.T) {
 	if d.Nickname != "alice" {
 		t.Errorf("Nickname = %q, want %q", d.Nickname, "alice")
 	}
-	if d.Status != "offline" {
-		t.Errorf("Status = %q, want %q", d.Status, "offline")
+	if d.Status != store.StatusOffline {
+		t.Errorf("Status = %q, want %q", d.Status, store.StatusOffline)
 	}
 }
 
@@ -317,7 +317,7 @@ func TestDeregister_MarksOfflineAndBroadcasts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDevice: %v", err)
 	}
-	if d.Status != "offline" {
+	if d.Status != store.StatusOffline {
 		t.Errorf("Status = %q, want offline", d.Status)
 	}
 
@@ -459,7 +459,11 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
 
-	if err := r.MarkOffline(ctx, "dev-1"); err != nil {
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	if err != nil {
+		t.Fatalf("GetDevice before MarkOffline: %v", err)
+	}
+	if err := r.MarkOffline(ctx, d1); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 
@@ -467,7 +471,7 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDevice: %v", err)
 	}
-	if d.Status != "offline" {
+	if d.Status != store.StatusOffline {
 		t.Errorf("Status = %q, want offline", d.Status)
 	}
 

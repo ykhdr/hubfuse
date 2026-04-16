@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/store"
 	pb "github.com/ykhdr/hubfuse/proto"
 	"google.golang.org/grpc/peer"
 )
@@ -58,20 +59,24 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 		return &pb.RegisterResponse{Success: false, Error: err.Error()}, nil
 	}
 
+	ids := make([]string, 0, len(online))
+	for _, d := range online {
+		ids = append(ids, d.DeviceID)
+	}
+	sharesByDevice, err := s.registry.GetSharesForDevices(ctx, ids)
+	if err != nil {
+		s.logger.Warn("register: get shares", slog.Any("error", err))
+		sharesByDevice = map[string][]*store.Share{}
+	}
+
 	devices := make([]*pb.DeviceInfo, 0, len(online))
 	for _, d := range online {
-		shares, err := s.registry.store.GetShares(ctx, d.DeviceID)
-		if err != nil {
-			s.logger.Warn("register: get shares",
-				slog.String("device_id", d.DeviceID),
-				slog.Any("error", err))
-		}
 		devices = append(devices, &pb.DeviceInfo{
 			DeviceId: d.DeviceID,
 			Nickname: d.Nickname,
 			Ip:       d.LastIP,
 			SshPort:  int32(d.SSHPort),
-			Shares:   sharesToProto(shares),
+			Shares:   sharesToProto(sharesByDevice[d.DeviceID]),
 		})
 	}
 
@@ -138,9 +143,13 @@ func (s *Server) Deregister(ctx context.Context, req *pb.DeregisterRequest) (*pb
 }
 
 // Subscribe opens a server-streaming RPC that pushes events to the device
-// until the context is cancelled.
+// until the context is cancelled. The device_id is taken from the mTLS client
+// certificate; req.DeviceId is ignored (deprecated, see proto comment).
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.HubFuse_SubscribeServer) error {
-	deviceID := req.DeviceId
+	deviceID, err := common.ExtractDeviceID(stream.Context())
+	if err != nil {
+		return err
+	}
 
 	ch, unsub := s.registry.Subscribe(deviceID)
 	defer unsub()
@@ -184,9 +193,16 @@ func (s *Server) RequestPairing(ctx context.Context, req *pb.RequestPairingReque
 	return &pb.RequestPairingResponse{InviteCode: code}, nil
 }
 
-// ConfirmPairing completes a pairing by validating an invite code.
+// ConfirmPairing completes a pairing by validating an invite code. The
+// device_id is taken from the mTLS client certificate; req.DeviceId is ignored
+// (deprecated, see proto comment).
 func (s *Server) ConfirmPairing(ctx context.Context, req *pb.ConfirmPairingRequest) (*pb.ConfirmPairingResponse, error) {
-	peerPublicKey, err := s.registry.ConfirmPairing(ctx, req.DeviceId, req.InviteCode, req.PublicKey)
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	peerPublicKey, err := s.registry.ConfirmPairing(ctx, deviceID, req.InviteCode, req.PublicKey)
 	if err != nil {
 		return &pb.ConfirmPairingResponse{Success: false, Error: err.Error()}, nil
 	}
@@ -203,28 +219,20 @@ func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*
 		return nil, err
 	}
 
-	all, err := s.registry.store.ListAllDevices(ctx)
+	all, sharesByDevice, err := s.registry.ListDevicesWithShares(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list all devices: %w", err)
+		return nil, fmt.Errorf("list devices: %w", err)
 	}
 
 	devices := make([]*pb.DeviceInfo, 0, len(all))
 	for _, d := range all {
-		shares, err := s.registry.store.GetShares(ctx, d.DeviceID)
-		if err != nil {
-			s.logger.Warn("ListDevices: get shares",
-				slog.String("device_id", d.DeviceID),
-				slog.Any("error", err))
-			continue
-		}
-
 		devices = append(devices, &pb.DeviceInfo{
 			DeviceId: d.DeviceID,
 			Nickname: d.Nickname,
 			Ip:       d.LastIP,
 			SshPort:  int32(d.SSHPort),
-			Shares:   sharesToProto(shares),
-			Status:   d.Status,
+			Shares:   sharesToProto(sharesByDevice[d.DeviceID]),
+			Status:   string(d.Status),
 		})
 	}
 

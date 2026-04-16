@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -14,7 +15,7 @@ import (
 
 // joinAndRegister is a helper that joins and registers a device, returning the
 // authenticated gRPC client.
-func joinAndRegister(t *testing.T, h hubHandle, deviceID, nickname string) pb.HubFuseClient {
+func joinAndRegister(t *testing.T, h *hubtest.Harness, deviceID, nickname string) pb.HubFuseClient {
 	t.Helper()
 
 	unauthClient := dialNoClientCert(t, h)
@@ -54,7 +55,7 @@ func joinAndRegister(t *testing.T, h hubHandle, deviceID, nickname string) pb.Hu
 //  4. B calls ConfirmPairing(code) → receives A's public key.
 //  5. A receives PairingCompleted event with B's public key.
 func TestIntegration_Pairing_FullFlow(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	devA := "pair-a-" + uuid.New().String()
 	devB := "pair-b-" + uuid.New().String()
@@ -66,7 +67,7 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	// B subscribes before A initiates pairing so the event can be received.
 	subCtxB, cancelB := context.WithCancel(context.Background())
 	t.Cleanup(cancelB)
-	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{DeviceId: devB})
+	streamB, err := clientB.Subscribe(subCtxB, &pb.SubscribeRequest{})
 	if err != nil {
 		t.Fatalf("Subscribe B: %v", err)
 	}
@@ -80,7 +81,7 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	// A subscribes so it can receive PairingCompleted.
 	subCtxA, cancelA := context.WithCancel(context.Background())
 	t.Cleanup(cancelA)
-	streamA, err := clientA.Subscribe(subCtxA, &pb.SubscribeRequest{DeviceId: devA})
+	streamA, err := clientA.Subscribe(subCtxA, &pb.SubscribeRequest{})
 	if err != nil {
 		t.Fatalf("Subscribe A: %v", err)
 	}
@@ -132,7 +133,6 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 
 	// B confirms pairing.
 	confirmResp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-		DeviceId:  devB,
 		InviteCode: inviteCode,
 		PublicKey: pubKeyB,
 	})
@@ -177,7 +177,7 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 // TestIntegration_Pairing_WrongInviteCode verifies that ConfirmPairing with
 // a wrong invite code returns success=false.
 func TestIntegration_Pairing_WrongInviteCode(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	devA := "wic-a-" + uuid.New().String()
 	devB := "wic-b-" + uuid.New().String()
@@ -197,7 +197,6 @@ func TestIntegration_Pairing_WrongInviteCode(t *testing.T) {
 
 	// B tries to confirm with an incorrect code.
 	resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-		DeviceId:  devB,
 		InviteCode: "HUB-BAD-CODE",
 		PublicKey: "pk-b",
 	})
@@ -215,7 +214,7 @@ func TestIntegration_Pairing_WrongInviteCode(t *testing.T) {
 // TestIntegration_Pairing_MaxAttempts verifies that exceeding the max number
 // of ConfirmPairing attempts returns success=false.
 func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	devA := "ma-a-" + uuid.New().String()
 	devB := "ma-b-" + uuid.New().String()
@@ -236,7 +235,6 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	// Use 5 wrong-code attempts to exhaust the limit without consuming the real code.
 	for i := 0; i < 5; i++ {
 		resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-			DeviceId:  devB,
 			InviteCode: "HUB-BAD-XYZ",
 			PublicKey: "pk-b",
 		})
@@ -263,7 +261,6 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	// We'll verify the 6th call fails, relying on the fact that the invite was deleted on
 	// first ConfirmPairing success. After success the invite is gone, so subsequent calls fail.
 	resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-		DeviceId:  devB,
 		InviteCode: code,
 		PublicKey: "pk-b",
 	})
@@ -276,7 +273,6 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 
 	// Second attempt must fail since the invite was deleted.
 	resp2, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
-		DeviceId:  devB,
 		InviteCode: code,
 		PublicKey: "pk-b",
 	})
@@ -291,7 +287,7 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 // TestPairing_OfflineDevice verifies that RequestPairing returns a gRPC
 // Unavailable error when the target device is not currently online.
 func TestPairing_OfflineDevice(t *testing.T) {
-	h := startTestHub(t)
+	h := hubtest.StartTestHub(t)
 
 	unauthClient := dialNoClientCert(t, h)
 

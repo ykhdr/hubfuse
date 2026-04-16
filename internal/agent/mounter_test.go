@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -21,9 +20,9 @@ func discardLogger() *slog.Logger {
 // newTestMounter creates a Mounter with test overrides.
 // capturedArgs receives the args of the most recent sshfs invocation.
 // unmountFn is called when Unmount is invoked; if nil, a no-op is used.
-func newTestMounter(t *testing.T, knownDevicesDir, keyPath string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
+func newTestMounter(t *testing.T, _, keyPath string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
 	t.Helper()
-	m := NewMounter(keyPath, knownDevicesDir, discardLogger())
+	m := NewMounter(keyPath, discardLogger())
 
 	m.execCommand = func(_ context.Context, name string, args ...string) *exec.Cmd {
 		if capturedArgs != nil {
@@ -129,33 +128,6 @@ func TestMount_CreatesMountPointDirectory(t *testing.T) {
 	}
 }
 
-func TestMount_RejectsUnpairedDevice(t *testing.T) {
-	dir := t.TempDir()
-	knownDir := filepath.Join(dir, "known_devices")
-	keyPath := filepath.Join(dir, "id_ed25519")
-	mountTo := filepath.Join(dir, "mnt")
-
-	// Do NOT write a .pub file for "unknown-device".
-	if err := os.MkdirAll(knownDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-
-	m := newTestMounter(t, knownDir, keyPath, nil, nil)
-
-	mc := agentconfig.MountConfig{
-		Device: "unknown-device",
-		Share:  "docs",
-		To:     mountTo,
-	}
-
-	err := m.Mount(context.Background(), mc, "10.0.0.1", 2222)
-	if err == nil {
-		t.Fatal("Mount() expected error for unpaired device, got nil")
-	}
-	if !strings.Contains(err.Error(), "not paired") {
-		t.Errorf("Mount() error = %q, want to contain \"not paired\"", err.Error())
-	}
-}
 
 func TestMount_RejectsDuplicateMount(t *testing.T) {
 	dir := t.TempDir()

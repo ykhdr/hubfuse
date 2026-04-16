@@ -71,14 +71,14 @@ agent {
 	}
 
 	d := &Daemon{
-		config:       cfg,
-		configPath:   cfgPath,
-		identity:     identity,
-		mounter:      mounter,
-		sshServer:    sshServer,
-		logger:       discardLogger(),
-		knownDevices: make(map[string]*DeviceInfo),
-		dataDir:      dir,
+		config:        cfg,
+		configPath:    cfgPath,
+		identity:      identity,
+		mounter:       mounter,
+		sshServer:     sshServer,
+		logger:        discardLogger(),
+		onlineDevices: make(map[string]*OnlineDevice),
+		dataDir:       dir,
 	}
 
 	return d, dir
@@ -134,7 +134,7 @@ agent {
 		}
 	}
 
-	daemon, err := NewDaemon(cfgPath, discardLogger())
+	daemon, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
 	if err != nil {
 		t.Fatalf("NewDaemon() error: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestNewDaemon_MissingIdentityReturnsError(t *testing.T) {
 		t.Fatalf("GenerateSSHKeyPair: %v", err)
 	}
 
-	_, err := NewDaemon(cfgPath, discardLogger())
+	_, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
 	if err == nil {
 		t.Fatal("NewDaemon() expected error for missing identity, got nil")
 	}
@@ -190,7 +190,7 @@ func TestHandleDeviceOnline_AddsToKnownDevices(t *testing.T) {
 	d.handleDeviceOnline(evt)
 
 	d.mu.RLock()
-	info, ok := d.knownDevices["device-123"]
+	info, ok := d.onlineDevices["device-123"]
 	d.mu.RUnlock()
 
 	if !ok {
@@ -218,8 +218,8 @@ func TestHandleDeviceOnline_AutoMountsWhenPairedAndConfigured(t *testing.T) {
 		{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt", "docs")},
 	}
 
-	// The mounter looks up the key by mc.Device ("laptop"), so write "laptop.pub".
-	writePubKey(t, dir, "laptop")
+	// isPaired checks by device_id.
+	writePubKey(t, dir, "device-123")
 
 	evt := &pb.DeviceOnlineEvent{
 		DeviceId: "device-123",
@@ -264,7 +264,7 @@ func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 
 	d.mu.Lock()
-	d.knownDevices["device-123"] = &DeviceInfo{
+	d.onlineDevices["device-123"] = &OnlineDevice{
 		DeviceID: "device-123",
 		Nickname: "laptop",
 		IP:       "10.0.0.5",
@@ -276,7 +276,7 @@ func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
 	d.handleDeviceOffline(evt)
 
 	d.mu.RLock()
-	_, ok := d.knownDevices["device-123"]
+	_, ok := d.onlineDevices["device-123"]
 	d.mu.RUnlock()
 
 	if ok {
@@ -287,15 +287,13 @@ func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
 func TestHandleDeviceOffline_UnmountsShares(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
-	// The mounter uses mc.Device ("laptop") for the pub key lookup.
-	writePubKey(t, dir, "laptop")
 	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")}
 	if err := d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222); err != nil {
 		t.Fatalf("pre-mount: %v", err)
 	}
 
 	d.mu.Lock()
-	d.knownDevices["device-123"] = &DeviceInfo{
+	d.onlineDevices["device-123"] = &OnlineDevice{
 		DeviceID: "device-123",
 		Nickname: "laptop",
 		IP:       "10.0.0.5",
@@ -340,7 +338,7 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 
 	// The peer is online.
 	d.mu.Lock()
-	d.knownDevices["peer-device-999"] = &DeviceInfo{
+	d.onlineDevices["peer-device-999"] = &OnlineDevice{
 		DeviceID: "peer-device-999",
 		Nickname: "peer-laptop",
 		IP:       "10.0.0.7",
@@ -459,10 +457,10 @@ func TestOnConfigChange_SharesChangedUpdatesShares(t *testing.T) {
 func TestOnConfigChange_MountsAdded(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
-	// The mounter looks for mc.Device+".pub" = "remote.pub".
-	writePubKey(t, dir, "remote")
+	// isPaired checks by device_id.
+	writePubKey(t, dir, "device-abc")
 	d.mu.Lock()
-	d.knownDevices["device-abc"] = &DeviceInfo{
+	d.onlineDevices["device-abc"] = &OnlineDevice{
 		DeviceID: "device-abc",
 		Nickname: "remote",
 		IP:       "10.0.0.9",
@@ -487,8 +485,6 @@ func TestOnConfigChange_MountsAdded(t *testing.T) {
 func TestOnConfigChange_MountsRemoved(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
-	// The mounter uses mc.Device ("remote") for its pub key lookup.
-	writePubKey(t, dir, "remote")
 	mc := agentconfig.MountConfig{
 		Device: "remote",
 		Share:  "music",
@@ -570,13 +566,13 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if len(d.knownDevices) != 2 {
-		t.Fatalf("knownDevices len = %d, want 2", len(d.knownDevices))
+	if len(d.onlineDevices) != 2 {
+		t.Fatalf("knownDevices len = %d, want 2", len(d.onlineDevices))
 	}
-	if _, ok := d.knownDevices["dev-1"]; !ok {
+	if _, ok := d.onlineDevices["dev-1"]; !ok {
 		t.Error("knownDevices missing dev-1")
 	}
-	if _, ok := d.knownDevices["dev-2"]; !ok {
+	if _, ok := d.onlineDevices["dev-2"]; !ok {
 		t.Error("knownDevices missing dev-2")
 	}
 }

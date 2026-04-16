@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 
 	kdl "github.com/sblinch/kdl-go"
 	"github.com/sblinch/kdl-go/document"
+	"github.com/ykhdr/hubfuse/internal/common"
 )
 
 // Config holds the full agent configuration.
@@ -68,7 +70,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("load config %q: %w", path, err)
 	}
 
-	doc, err := kdl.Parse(strings.NewReader(string(data)))
+	doc, err := kdl.Parse(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("load config %q: failed to unmarshal KDL: %w", path, err)
 	}
@@ -238,16 +240,66 @@ func NormalizePermissions(perm string) string {
 	}
 }
 
-// ExpandTilde replaces a leading "~" in path with the current user's home
-// directory. If the home directory cannot be determined the path is returned
-// unchanged.
+// ExpandTilde is a thin alias for common.ExpandHome kept for KDL layer callers.
 func ExpandTilde(path string) string {
-	if !strings.HasPrefix(path, "~") {
-		return path
+	return common.ExpandHome(path)
+}
+
+// Save serialises cfg to a KDL file at path, creating parent directories as
+// needed. The format matches what Load expects.
+func Save(path string, cfg *Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
+
+	var sb strings.Builder
+
+	// device block.
+	fmt.Fprintf(&sb, "device {\n")
+	fmt.Fprintf(&sb, "    nickname %q\n", cfg.Device.Nickname)
+	fmt.Fprintf(&sb, "}\n\n")
+
+	// hub block.
+	fmt.Fprintf(&sb, "hub {\n")
+	fmt.Fprintf(&sb, "    address %q\n", cfg.Hub.Address)
+	fmt.Fprintf(&sb, "}\n\n")
+
+	// agent block.
+	fmt.Fprintf(&sb, "agent {\n")
+	fmt.Fprintf(&sb, "    ssh-port %d\n", cfg.Agent.SSHPort)
+	fmt.Fprintf(&sb, "}\n\n")
+
+	// shares block.
+	if len(cfg.Shares) > 0 {
+		fmt.Fprintf(&sb, "shares {\n")
+		for _, s := range cfg.Shares {
+			fmt.Fprintf(&sb, "    share %q alias=%q permissions=%q", s.Path, s.Alias, s.Permissions)
+			if len(s.AllowedDevices) > 0 {
+				fmt.Fprintf(&sb, " {\n")
+				fmt.Fprintf(&sb, "        allowed-devices")
+				for _, d := range s.AllowedDevices {
+					fmt.Fprintf(&sb, " %q", d)
+				}
+				fmt.Fprintf(&sb, "\n")
+				fmt.Fprintf(&sb, "    }\n")
+			} else {
+				fmt.Fprintf(&sb, "\n")
+			}
+		}
+		fmt.Fprintf(&sb, "}\n\n")
 	}
-	return filepath.Join(home, path[1:])
+
+	// mounts block.
+	if len(cfg.Mounts) > 0 {
+		fmt.Fprintf(&sb, "mounts {\n")
+		for _, m := range cfg.Mounts {
+			fmt.Fprintf(&sb, "    mount device=%q share=%q to=%q\n", m.Device, m.Share, m.To)
+		}
+		fmt.Fprintf(&sb, "}\n")
+	}
+
+	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
+		return fmt.Errorf("write config %q: %w", path, err)
+	}
+	return nil
 }

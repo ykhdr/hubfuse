@@ -109,7 +109,9 @@ message DeregisterResponse {
 // ─── Subscribe / Events ──────────────────────────────────────────────────────
 
 message SubscribeRequest {
-  string device_id = 1;
+  // Server derives device_id from the mTLS client certificate.
+  reserved 1;
+  reserved "device_id";
 }
 
 message Event {
@@ -167,7 +169,9 @@ message RequestPairingResponse {
 // ─── ConfirmPairing ──────────────────────────────────────────────────────────
 
 message ConfirmPairingRequest {
-  string device_id = 1;
+  // Server derives device_id from the mTLS client certificate.
+  reserved 1;
+  reserved "device_id";
   string invite_code = 2;
   string public_key = 3;
 }

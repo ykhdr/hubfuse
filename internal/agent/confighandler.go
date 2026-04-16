@@ -69,8 +69,8 @@ func sharesToMap(shares []agentconfig.ShareConfig) map[string]string {
 // currently online and paired.
 func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 	d.mu.RLock()
-	var info *DeviceInfo
-	for _, dev := range d.knownDevices {
+	var info *OnlineDevice
+	for _, dev := range d.onlineDevices {
 		if dev.Nickname == mc.Device {
 			info = dev
 			break
@@ -79,7 +79,6 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 	d.mu.RUnlock()
 
 	if info == nil {
-		// Device is not online; will be mounted when it comes online.
 		d.logger.Debug("tryMount: device not online, skipping",
 			"device", mc.Device,
 			"share", mc.Share,
