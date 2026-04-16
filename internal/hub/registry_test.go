@@ -459,7 +459,11 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
 
-	if err := r.MarkOffline(ctx, "dev-1"); err != nil {
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	if err != nil {
+		t.Fatalf("GetDevice before MarkOffline: %v", err)
+	}
+	if err := r.MarkOffline(ctx, d1); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 

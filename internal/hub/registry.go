@@ -221,15 +221,11 @@ func (r *Registry) Broadcast(event *pb.Event, excludeDevice string) {
 	}
 }
 
-// MarkOffline marks a device offline and broadcasts DeviceOffline. Used by
-// the heartbeat monitor for stale devices.
-func (r *Registry) MarkOffline(ctx context.Context, deviceID string) error {
-	device, err := r.store.GetDevice(ctx, deviceID)
-	if err != nil {
-		return err
-	}
-
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, "offline", device.LastIP, device.SSHPort); err != nil {
+// MarkOffline marks the given device offline and broadcasts DeviceOffline.
+// Used by the heartbeat monitor for stale devices. The caller passes the
+// *Device already in hand, avoiding a redundant store lookup.
+func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error {
+	if err := r.store.UpdateDeviceStatus(ctx, device.DeviceID, "offline", device.LastIP, device.SSHPort); err != nil {
 		return err
 	}
 
@@ -241,7 +237,7 @@ func (r *Registry) MarkOffline(ctx context.Context, deviceID string) error {
 			},
 		},
 	}
-	r.Broadcast(event, deviceID)
+	r.Broadcast(event, device.DeviceID)
 
 	return nil
 }

@@ -109,6 +109,8 @@ message DeregisterResponse {
 // ─── Subscribe / Events ──────────────────────────────────────────────────────
 
 message SubscribeRequest {
+  // Deprecated: server derives device_id from the mTLS client certificate.
+  // Field is kept for wire compatibility with older clients and ignored.
   string device_id = 1;
 }
 
@@ -167,6 +169,8 @@ message RequestPairingResponse {
 // ─── ConfirmPairing ──────────────────────────────────────────────────────────
 
 message ConfirmPairingRequest {
+  // Deprecated: server derives device_id from the mTLS client certificate.
+  // Field is kept for wire compatibility with older clients and ignored.
   string device_id = 1;
   string invite_code = 2;
   string public_key = 3;

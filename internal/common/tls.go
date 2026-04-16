@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	caKeyBits  = 4096
+	caKeyBits   = 3072
 	certKeyBits = 2048
 
 	caValidity   = 10 * 365 * 24 * time.Hour
@@ -32,7 +32,7 @@ const (
 	permCert os.FileMode = 0644
 )
 
-// GenerateCA creates a self-signed CA certificate using RSA 4096.
+// GenerateCA creates a self-signed CA certificate using RSA 3072.
 // The CA is valid for 10 years and belongs to the "HubFuse" organization.
 func GenerateCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	key, err := rsa.GenerateKey(rand.Reader, caKeyBits)

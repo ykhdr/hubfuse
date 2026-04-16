@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -260,6 +261,47 @@ func (s *sqliteStore) GetShares(ctx context.Context, deviceID string) ([]*Share,
 		return nil, fmt.Errorf("iterate share rows: %w", err)
 	}
 	return shares, nil
+}
+
+// GetSharesForDevices returns shares for the given deviceIDs in a single
+// query, grouped by device_id. Devices with no shares are absent from the
+// returned map.
+func (s *sqliteStore) GetSharesForDevices(ctx context.Context, deviceIDs []string) (map[string][]*Share, error) {
+	result := make(map[string][]*Share, len(deviceIDs))
+	if len(deviceIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(deviceIDs))
+	args := make([]any, len(deviceIDs))
+	for i, id := range deviceIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := "SELECT device_id, alias, permissions, allowed_devices FROM shares WHERE device_id IN (" +
+		strings.Join(placeholders, ",") + ")"
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get shares for devices: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sh Share
+		var adJSON string
+		if err := rows.Scan(&sh.DeviceID, &sh.Alias, &sh.Permissions, &adJSON); err != nil {
+			return nil, fmt.Errorf("scan share row: %w", err)
+		}
+		if err := json.Unmarshal([]byte(adJSON), &sh.AllowedDevices); err != nil {
+			return nil, fmt.Errorf("unmarshal allowed_devices: %w", err)
+		}
+		result[sh.DeviceID] = append(result[sh.DeviceID], &sh)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate share rows: %w", err)
+	}
+	return result, nil
 }
 
 // --- Pairings ---

@@ -52,6 +52,11 @@ type Store interface {
 	// GetShares returns all shares registered for the given device.
 	GetShares(ctx context.Context, deviceID string) ([]*Share, error)
 
+	// GetSharesForDevices returns shares for every device ID in the given
+	// slice in a single query. The result is keyed by device_id; missing
+	// keys mean no shares for that device.
+	GetSharesForDevices(ctx context.Context, deviceIDs []string) (map[string][]*Share, error)
+
 	// Pairings
 
 	// CreatePairing records a bidirectional trust relationship between two

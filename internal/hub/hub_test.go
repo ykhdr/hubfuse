@@ -15,7 +15,7 @@ func TestLoadOrGenerateCerts_AutoSANs(t *testing.T) {
 	dataDir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	_, _, err := loadOrGenerateCerts(dataDir, nil, logger)
+	_, _, _, err := loadOrGenerateCerts(dataDir, nil, logger)
 	if err != nil {
 		t.Fatalf("loadOrGenerateCerts: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestLoadOrGenerateCerts_ExtraSANs(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	extra := []string{"10.99.99.1", "custom.example.com"}
-	_, _, err := loadOrGenerateCerts(dataDir, extra, logger)
+	_, _, _, err := loadOrGenerateCerts(dataDir, extra, logger)
 	if err != nil {
 		t.Fatalf("loadOrGenerateCerts: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestLoadOrGenerateCerts_ExistingCertsNotRegenerated(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// First generation.
-	_, _, err := loadOrGenerateCerts(dataDir, nil, logger)
+	_, _, _, err := loadOrGenerateCerts(dataDir, nil, logger)
 	if err != nil {
 		t.Fatalf("first loadOrGenerateCerts: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoadOrGenerateCerts_ExistingCertsNotRegenerated(t *testing.T) {
 	cert1 := parseServerCert(t, dataDir)
 
 	// Second call with different extra SANs — should load existing, not regenerate.
-	_, _, err = loadOrGenerateCerts(dataDir, []string{"10.0.0.1"}, logger)
+	_, _, _, err = loadOrGenerateCerts(dataDir, []string{"10.0.0.1"}, logger)
 	if err != nil {
 		t.Fatalf("second loadOrGenerateCerts: %v", err)
 	}

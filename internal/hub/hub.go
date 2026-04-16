@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"log/slog"
@@ -35,6 +36,7 @@ type Hub struct {
 	registry   *Registry
 	heartbeat  *HeartbeatMonitor
 	grpcServer *grpc.Server
+	tlsCfg     *tls.Config
 	logger     *slog.Logger
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
@@ -71,7 +73,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
-	caCert, caKey, err := loadOrGenerateCerts(dataDir, config.ExtraSANs, logger)
+	caCert, caKey, tlsCfg, err := loadOrGenerateCerts(dataDir, config.ExtraSANs, logger)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("load/generate certs: %w", err)
@@ -85,6 +87,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 		store:     s,
 		registry:  registry,
 		heartbeat: heartbeat,
+		tlsCfg:    tlsCfg,
 		logger:    logger,
 	}, nil
 }
@@ -93,19 +96,7 @@ func NewHub(config HubConfig) (*Hub, error) {
 // invokes OnReady (if set) once the listener is up, and blocks until the
 // gRPC server stops.
 func (h *Hub) Start(ctx context.Context) error {
-	dataDir := common.ExpandHome(h.config.DataDir)
-	tlsDir := filepath.Join(dataDir, common.TLSDir)
-
-	tlsCfg, err := common.LoadTLSServerConfig(
-		filepath.Join(tlsDir, common.CACertFile),
-		filepath.Join(tlsDir, common.ServerCertFile),
-		filepath.Join(tlsDir, common.ServerKeyFile),
-	)
-	if err != nil {
-		return fmt.Errorf("load TLS config: %w", err)
-	}
-
-	creds := credentials.NewTLS(tlsCfg)
+	creds := credentials.NewTLS(h.tlsCfg)
 
 	h.grpcServer = grpc.NewServer(
 		grpc.Creds(creds),
@@ -179,7 +170,7 @@ func (h *Hub) Stop() error {
 // loadOrGenerateCerts loads existing CA and server TLS certificates from
 // dataDir/tls/, or generates and saves them if they do not exist. When
 // generating, it auto-detects local IPs/hostnames and merges extraSANs.
-func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, error) {
+func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger) (*x509.Certificate, *rsa.PrivateKey, *tls.Config, error) {
 	tlsDir := filepath.Join(dataDir, common.TLSDir)
 
 	caCertPath := filepath.Join(tlsDir, common.CACertFile)
@@ -189,48 +180,59 @@ func loadOrGenerateCerts(dataDir string, extraSANs []string, logger *slog.Logger
 
 	if fileExists(caCertPath) && fileExists(caKeyPath) && fileExists(serverCertPath) && fileExists(serverKeyPath) {
 		logger.Info("loading existing TLS certificates", slog.String("tls_dir", tlsDir))
-		return loadCACertAndKey(caCertPath, caKeyPath)
+		caCert, caKey, err := loadCACertAndKey(caCertPath, caKeyPath)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		tlsCfg, err := common.LoadTLSServerConfig(caCertPath, serverCertPath, serverKeyPath)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("load TLS config: %w", err)
+		}
+		return caCert, caKey, tlsCfg, nil
 	}
 
 	logger.Info("generating new TLS certificates", slog.String("tls_dir", tlsDir))
 
 	if err := os.MkdirAll(tlsDir, 0700); err != nil {
-		return nil, nil, fmt.Errorf("create tls dir %q: %w", tlsDir, err)
+		return nil, nil, nil, fmt.Errorf("create tls dir %q: %w", tlsDir, err)
 	}
 
 	caCert, caKey, err := common.GenerateCA()
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate CA: %w", err)
+		return nil, nil, nil, fmt.Errorf("generate CA: %w", err)
 	}
 
 	caCertPEM := common.EncodeCACertPEM(caCert)
 	caKeyPEM := common.EncodeCAKeyPEM(caKey)
 
 	if err := os.WriteFile(caCertPath, caCertPEM, 0644); err != nil {
-		return nil, nil, fmt.Errorf("write CA cert: %w", err)
+		return nil, nil, nil, fmt.Errorf("write CA cert: %w", err)
 	}
 	if err := os.WriteFile(caKeyPath, caKeyPEM, 0600); err != nil {
-		return nil, nil, fmt.Errorf("write CA key: %w", err)
+		return nil, nil, nil, fmt.Errorf("write CA key: %w", err)
 	}
 
-	// Build SAN list: auto-detected local hosts + extra SANs from config.
 	hosts := common.LocalHosts()
 	hosts = append(hosts, extraSANs...)
 	hosts = dedup(hosts)
 
 	logger.Info("generating server TLS certificate", slog.Any("sans", hosts))
 
-	// Generate and save server cert.
 	serverCertPEM, serverKeyPEM, err := common.GenerateServerCert(caCert, caKey, hosts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate server cert: %w", err)
+		return nil, nil, nil, fmt.Errorf("generate server cert: %w", err)
 	}
 
 	if err := common.SaveCertAndKey(serverCertPath, serverKeyPath, serverCertPEM, serverKeyPEM); err != nil {
-		return nil, nil, fmt.Errorf("save server cert/key: %w", err)
+		return nil, nil, nil, fmt.Errorf("save server cert/key: %w", err)
 	}
 
-	return caCert, caKey, nil
+	tlsCfg, err := common.LoadTLSServerConfig(caCertPath, serverCertPath, serverKeyPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load TLS config: %w", err)
+	}
+
+	return caCert, caKey, tlsCfg, nil
 }
 
 // loadCACertAndKey reads the CA certificate and private key from disk.
