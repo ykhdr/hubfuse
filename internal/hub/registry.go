@@ -75,7 +75,13 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
+	device, err := r.store.GetDevice(ctx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	online, err := r.store.ListOnlineDevices(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -88,14 +94,27 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, err
 	}
 
-	online, err := r.store.ListOnlineDevices(ctx)
-	if err != nil {
+	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
 		return nil, err
 	}
 
-	device, err := r.store.GetDevice(ctx, deviceID)
-	if err != nil {
-		return nil, err
+	current := &store.Device{
+		DeviceID: device.DeviceID,
+		Nickname: device.Nickname,
+		LastIP:   ip,
+		SSHPort:  sshPort,
+		Status:   store.StatusOnline,
+	}
+	found := false
+	for i, d := range online {
+		if d.DeviceID == deviceID {
+			online[i] = current
+			found = true
+			break
+		}
+	}
+	if !found {
+		online = append(online, current)
 	}
 
 	event := &pb.Event{
