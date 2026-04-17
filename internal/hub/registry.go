@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
@@ -45,10 +46,11 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip string) (cer
 	}
 
 	d := &store.Device{
-		DeviceID: deviceID,
-		Nickname: nickname,
-		LastIP:   ip,
-		Status:   store.StatusRegistered,
+		DeviceID:      deviceID,
+		Nickname:      nickname,
+		LastIP:        ip,
+		Status:        store.StatusRegistered,
+		LastHeartbeat: time.Now().UTC(),
 	}
 	if err := r.store.CreateDevice(ctx, d); err != nil {
 		return nil, nil, nil, err
