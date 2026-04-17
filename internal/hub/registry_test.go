@@ -147,7 +147,7 @@ func TestRegister_SetsHeartbeat(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice", "")
 
 	before := time.Now()
-	if _, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, nil, 1); err != nil {
+	if _, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, nil, common.ProtocolVersion); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 

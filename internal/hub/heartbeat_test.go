@@ -132,9 +132,17 @@ func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	joinDevice(t, r, "dev-prune", "prune-me")
-	joinDevice(t, r, "dev-active", "active-sub")
-	joinDevice(t, r, "dev-recent", "recent-offline")
+	joinDevice(t, r, "dev-prune", "prune-me", "")
+	joinDevice(t, r, "dev-active", "active-sub", "")
+	joinDevice(t, r, "dev-recent", "recent-offline", "")
+
+	// Join now leaves devices in StatusRegistered; pruning only considers
+	// StatusOffline, so demote all three explicitly.
+	for _, id := range []string{"dev-prune", "dev-active", "dev-recent"} {
+		if err := r.store.UpdateDeviceStatus(ctx, id, store.StatusOffline, "", 0); err != nil {
+			t.Fatalf("UpdateDeviceStatus %s: %v", id, err)
+		}
+	}
 
 	// Make dev-recent fresh so it should not be pruned.
 	if err := r.Heartbeat(ctx, "dev-recent"); err != nil {

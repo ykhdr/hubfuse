@@ -14,6 +14,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub"
 	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
+	"github.com/ykhdr/hubfuse/internal/hub/store"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
@@ -65,6 +66,11 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 	})
 	if err != nil || !joinStale.Success {
 		t.Fatalf("join stale: err=%v success=%v", err, joinStale.GetSuccess())
+	}
+	// Join now leaves devices in StatusRegistered; pruning only considers
+	// StatusOffline, so demote stale-dev explicitly.
+	if err := h.Store.UpdateDeviceStatus(context.Background(), "stale-dev", store.StatusOffline, "", 0); err != nil {
+		t.Fatalf("UpdateDeviceStatus stale-dev: %v", err)
 	}
 
 	// Set up a stubbed mounter that records unmounts.
