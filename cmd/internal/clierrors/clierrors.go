@@ -249,11 +249,10 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		}
 		return "hub did not respond in time", true
 	default:
-		code := strings.ToLower(st.Code().String())
 		if msg == "" {
-			return code, true
+			return strings.ToLower(st.Code().String()), true
 		}
-		return fmt.Sprintf("%s: %s", code, msg), true
+		return msg, true
 	}
 }
 

@@ -132,3 +132,14 @@ func TestFormat_FailedPrecondition_UnsupportedProtocol(t *testing.T) {
 		t.Fatalf("Format() = %q, want %q", got, want)
 	}
 }
+
+func TestFormat_UnknownCodeWithMessage_DropsCodePrefix(t *testing.T) {
+	err := grpcstatus.Error(codes.Code(99), "too many foos")
+
+	got := Format(err, nil)
+	want := "error: too many foos"
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
