@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/cmd/internal/clierrors"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
@@ -16,19 +17,18 @@ import (
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, clierrors.Format(err, nil))
 		os.Exit(1)
 	}
 }
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "hubfuse-hub",
-		Short:         "HubFuse hub server",
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Use:   "hubfuse-hub",
+		Short: "HubFuse hub server",
 	}
 	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
+	silenceAll(cmd)
 	return cmd
 }
 
@@ -142,5 +142,13 @@ func statusCmd() *cobra.Command {
 			pidPath := common.ExpandHome(filepath.Join(common.HubDataDir, common.HubPIDFile))
 			return daemonize.ReportStatus(pidPath, "hub")
 		},
+	}
+}
+
+func silenceAll(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	for _, child := range cmd.Commands() {
+		silenceAll(child)
 	}
 }
