@@ -13,6 +13,11 @@ import (
 
 var binDir string
 
+// TestMain compiles the project's binaries into a tempdir and exposes them
+// on PATH for testscript scenarios. Cleanup uses an explicit RemoveAll
+// before os.Exit because deferred calls do not run after os.Exit, and each
+// error path must replicate the cleanup. The discarded errors on RemoveAll
+// satisfy golangci-lint's errcheck — the failures are not actionable here.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "hubfuse-cli-bin-*")
 	if err != nil {
@@ -47,6 +52,15 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// TestCLI runs every .txtar scenario under testdata/.
+//
+// HOME is pinned to a per-script $WORK/home so scenarios can't read or
+// write the developer's real ~/.hubfuse. Individual scripts may still
+// override via `env HOME=...`.
+//
+// Binaries are reachable through PATH only — testscript does NOT resolve
+// PATH binaries as bare commands, so scripts must call them with the
+// `exec` prefix (e.g. `! exec hubfuse join`).
 func TestCLI(t *testing.T) {
 	testscript.Run(t, testscript.Params{
 		Dir: "testdata",
