@@ -14,7 +14,7 @@ import (
 
 // HubConfigFile represents options parsed from config.kdl in the hub data dir.
 type HubConfigFile struct {
-	DeviceRetention time.Duration
+	DeviceRetention *time.Duration
 }
 
 // LoadHubConfigFile parses an optional KDL config file. Missing files return
@@ -47,7 +47,7 @@ func LoadHubConfigFile(path string) (HubConfigFile, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("parse device-retention: %w", err)
 		}
-		cfg.DeviceRetention = dur
+		cfg.DeviceRetention = &dur
 	}
 
 	return cfg, nil

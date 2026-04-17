@@ -195,9 +195,9 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 		r.mu.Lock()
 		if existing, ok := r.subscribers[deviceID]; ok && existing == ch {
 			delete(r.subscribers, deviceID)
+			close(ch)
 		}
 		r.mu.Unlock()
-		close(ch)
 	}
 
 	return ch, unsub

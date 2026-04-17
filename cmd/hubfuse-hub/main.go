@@ -54,16 +54,6 @@ func startCmd() *cobra.Command {
 			defaultLog := filepath.Join(expandedData, common.HubLogFile)
 			configPath := filepath.Join(expandedData, common.ConfigFile)
 
-			if !cmd.Flags().Changed("device-retention") {
-				fileCfg, err := hub.LoadHubConfigFile(configPath)
-				if err != nil {
-					return fmt.Errorf("load hub config: %w", err)
-				}
-				if fileCfg.DeviceRetention != 0 {
-					deviceRet = fileCfg.DeviceRetention.String()
-				}
-			}
-
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
 				return fmt.Errorf("check existing hub: %w", err)
 			} else if alive {
@@ -80,12 +70,9 @@ func startCmd() *cobra.Command {
 				})
 			}
 
-			retention, err := time.ParseDuration(deviceRet)
+			retention, err := resolveDeviceRetention(deviceRet, cmd.Flags().Changed("device-retention"), configPath)
 			if err != nil {
-				return fmt.Errorf("parse device-retention: %w", err)
-			}
-			if retention < 0 {
-				return fmt.Errorf("device-retention cannot be negative")
+				return err
 			}
 
 			cfg := hub.Config{

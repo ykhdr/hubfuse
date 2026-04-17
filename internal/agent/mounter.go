@@ -214,3 +214,17 @@ func (m *Mounter) ActiveMounts() []*Mount {
 	}
 	return result
 }
+
+// SetExecCommandForTests overrides the command builder (used in tests).
+func (m *Mounter) SetExecCommandForTests(fn func(ctx context.Context, name string, args ...string) *exec.Cmd) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.execCommand = fn
+}
+
+// SetUnmountForTests overrides the unmount implementation (used in tests).
+func (m *Mounter) SetUnmountForTests(fn func(path string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unmount = fn
+}

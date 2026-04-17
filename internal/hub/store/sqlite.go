@@ -53,6 +53,9 @@ type sqliteStore struct {
 	db *sql.DB
 }
 
+// Maximum number of devices pruned per call.
+const pruneBatchLimit = 500
+
 // NewSQLiteStore opens (or creates) a SQLite database at dbPath, runs the
 // schema migrations, and returns a ready-to-use Store. Use ":memory:" for
 // an in-process, ephemeral database suitable for tests.
@@ -225,7 +228,9 @@ func (s *sqliteStore) DeletePrunedDevices(ctx context.Context, threshold time.Ti
 	q := `
 		SELECT device_id, nickname, last_ip, ssh_port, status, last_heartbeat
 		FROM devices
-		WHERE status = 'offline' AND last_heartbeat < ?`
+		WHERE status = 'offline' AND last_heartbeat < ?
+		ORDER BY last_heartbeat ASC
+		LIMIT ?`
 	args := []any{threshold.UTC()}
 	if len(activeDeviceIDs) > 0 {
 		placeholders := make([]string, len(activeDeviceIDs))
@@ -233,8 +238,14 @@ func (s *sqliteStore) DeletePrunedDevices(ctx context.Context, threshold time.Ti
 			placeholders[i] = "?"
 			args = append(args, id)
 		}
-		q += " AND device_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+		q = `
+		SELECT device_id, nickname, last_ip, ssh_port, status, last_heartbeat
+		FROM devices
+		WHERE status = 'offline' AND last_heartbeat < ? AND device_id NOT IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY last_heartbeat ASC
+		LIMIT ?`
 	}
+	args = append(args, pruneBatchLimit)
 
 	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {

@@ -42,7 +42,7 @@ func joinDevice(t *testing.T, r *Registry, deviceID, nickname string) {
 // registerDevice is a helper that calls Register (online) and fatals on error.
 func registerDevice(t *testing.T, r *Registry, deviceID, ip string, port int) []*store.Device {
 	t.Helper()
-	online, err := r.Register(context.Background(), deviceID, ip, port, nil, 1)
+	online, err := r.Register(context.Background(), deviceID, ip, port, nil, common.ProtocolVersion)
 	if err != nil {
 		t.Fatalf("Register(%q): %v", deviceID, err)
 	}
@@ -171,7 +171,7 @@ func TestRegister_WithShares(t *testing.T) {
 	shares := []*pb.Share{
 		{Alias: "docs", Permissions: "ro", AllowedDevices: []string{"all"}},
 	}
-	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, shares, 1)
+	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, shares, common.ProtocolVersion)
 	if err != nil {
 		t.Fatalf("Register with shares: %v", err)
 	}
