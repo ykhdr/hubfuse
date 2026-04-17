@@ -51,16 +51,28 @@ func TestCLI(t *testing.T) {
 	testscript.Run(t, testscript.Params{
 		Dir: "testdata",
 		Setup: func(env *testscript.Env) error {
+			home := filepath.Join(env.WorkDir, "home")
+			if err := os.MkdirAll(home, 0o755); err != nil {
+				return err
+			}
+			env.Setenv("HOME", home)
 			env.Setenv("PATH", binDir+string(os.PathListSeparator)+env.Getenv("PATH"))
 			return nil
 		},
 	})
 }
 
+// repoRoot returns the directory containing go.mod by asking the Go toolchain.
+// This avoids depending on `git` being installed and works in non-git contexts
+// like module zip extracts or source snapshots.
 func repoRoot() (string, error) {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	out, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimRight(string(out), "\n"), nil
+	gomod := strings.TrimSpace(string(out))
+	if gomod == "" || gomod == os.DevNull {
+		return "", fmt.Errorf("not in a Go module")
+	}
+	return filepath.Dir(gomod), nil
 }
