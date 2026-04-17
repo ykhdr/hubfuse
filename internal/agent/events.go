@@ -179,6 +179,10 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 		return
 	}
 
+	// Reload the SSH server's allowed-key set so the newly paired peer can
+	// immediately authenticate inbound SSHFS connections.
+	d.reloadSSHAllowedKeys()
+
 	d.mu.RLock()
 	info, online := d.onlineDevices[e.PeerDeviceId]
 	d.mu.RUnlock()
