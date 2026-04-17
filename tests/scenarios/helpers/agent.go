@@ -95,8 +95,8 @@ func (a *Agent) runWithStdin(t *testing.T, stdin []byte, args ...string) string 
 		cmd.Stdin = strings.NewReader(string(stdin))
 	}
 	out, err := cmd.CombinedOutput()
-	a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "\n"))
-	a.logBuf.Write(out)
+	_, _ = a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "\n"))
+	_, _ = a.logBuf.Write(out)
 	if err != nil {
 		t.Fatalf("hubfuse %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
@@ -113,8 +113,8 @@ func (a *Agent) tryRun(t *testing.T, args ...string) (string, bool) {
 	cmd := exec.CommandContext(ctx, AgentBinaryPath, args...)
 	cmd.Env = a.env()
 	out, err := cmd.CombinedOutput()
-	a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "  (try)\n"))
-	a.logBuf.Write(out)
+	_, _ = a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "  (try)\n"))
+	_, _ = a.logBuf.Write(out)
 	return string(out), err == nil
 }
 
@@ -127,8 +127,8 @@ func (a *Agent) runExpectFail(t *testing.T, args ...string) string {
 	cmd := exec.CommandContext(ctx, AgentBinaryPath, args...)
 	cmd.Env = a.env()
 	out, _ := cmd.CombinedOutput()
-	a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "  (expecting failure)\n"))
-	a.logBuf.Write(out)
+	_, _ = a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "  (expecting failure)\n"))
+	_, _ = a.logBuf.Write(out)
 	return string(out)
 }
 
@@ -224,18 +224,36 @@ func (a *Agent) StartDaemon(t *testing.T) {
 
 // Stop signals the daemon to exit and waits up to 5s for it to do so.
 // Idempotent — safe to call multiple times.
+//
+// The daemon is launched with Setpgid=true so its mounter children (including
+// stub-sshfs, which blocks on SIGTERM and is not a real FUSE mount) live in
+// the daemon's process group. We signal the whole group so children do not
+// leak across tests — important for -count=N and for the prune/reconnect
+// scenarios that spawn multiple daemons in sequence.
 func (a *Agent) Stop(t *testing.T) {
 	t.Helper()
 	if a.daemonCmd == nil || a.daemonCmd.Process == nil {
 		return
 	}
-	_ = a.daemonCmd.Process.Signal(syscall.SIGTERM)
+
+	pid := a.daemonCmd.Process.Pid
+	pgid, pgidErr := syscall.Getpgid(pid)
+	if pgidErr == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	} else {
+		_ = a.daemonCmd.Process.Signal(syscall.SIGTERM)
+	}
+
 	done := make(chan error, 1)
 	go func() { done <- a.daemonCmd.Wait() }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		_ = a.daemonCmd.Process.Kill()
+		if pgidErr == nil {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		} else {
+			_ = a.daemonCmd.Process.Kill()
+		}
 		<-done
 	}
 	if a.daemonCancel != nil {

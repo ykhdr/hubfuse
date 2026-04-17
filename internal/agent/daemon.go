@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
+	"github.com/ykhdr/hubfuse/internal/common"
 	pb "github.com/ykhdr/hubfuse/proto"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -118,8 +119,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// Load any peer keys that were paired before this run (e.g. the daemon
-	// was restarted after previous pairings). This must happen after startSSH
-	// so that sshServer is non-nil.
+	// was restarted after previous pairings). Keep this after startSSH so the
+	// running SSH service has the persisted authorized keys loaded immediately.
 	d.reloadSSHAllowedKeys()
 
 	if err := d.registerAndSubscribe(ctx); err != nil {
@@ -313,12 +314,12 @@ func (d *Daemon) isPaired(deviceID string) bool {
 	return err == nil
 }
 
-// reloadSSHAllowedKeys reads all *.pub files from the known_devices directory
+// reloadSSHAllowedKeys reads all *.pub files from the known-devices directory
 // and updates the SSH server's allowed-key set. This must be called after a
 // new peer key is saved (e.g. from handlePairingCompleted) so that inbound
 // SSHFS connections from the newly paired peer are immediately authenticated.
 func (d *Daemon) reloadSSHAllowedKeys() {
-	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
+	knownDevicesDir := filepath.Join(d.dataDir, common.KnownDevicesDir)
 	deviceIDs, err := ListPairedDevices(knownDevicesDir)
 	if err != nil {
 		d.logger.Warn("reload ssh allowed keys: list paired devices", "error", err)
