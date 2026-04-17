@@ -16,6 +16,11 @@ var HubBinaryPath string
 // the package compiles in Task 4 even though its consumers arrive in Task 5.
 var AgentBinaryPath string
 
+// StubSSHFSBinaryPath points to the test-only sshfs replacement. Tests that
+// trigger a mount should prepend filepath.Dir(StubSSHFSBinaryPath) to PATH so
+// the agent's mounter invokes the stub instead of any real sshfs on the host.
+var StubSSHFSBinaryPath string
+
 type Hub struct {
 	Address string // "127.0.0.1:NNNN"
 	DataDir string

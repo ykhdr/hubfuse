@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	HubBinary   string
-	AgentBinary string
+	HubBinary       string
+	AgentBinary     string
+	StubSSHFSBinary string
 )
 
 func TestMain(m *testing.M) {
@@ -37,7 +38,7 @@ func TestMain(m *testing.M) {
 	}{
 		{&HubBinary, "hubfuse-hub", "./cmd/hubfuse-hub"},
 		{&AgentBinary, "hubfuse", "./cmd/hubfuse"},
-		// stub-sshfs will be added in Task 6
+		{&StubSSHFSBinary, "sshfs", "./tests/tools/stub-sshfs"},
 	}
 	for _, b := range builds {
 		out := filepath.Join(dir, b.out)
@@ -53,6 +54,7 @@ func TestMain(m *testing.M) {
 
 	helpers.HubBinaryPath = HubBinary
 	helpers.AgentBinaryPath = AgentBinary
+	helpers.StubSSHFSBinaryPath = StubSSHFSBinary
 
 	code := m.Run()
 	_ = os.RemoveAll(dir)
