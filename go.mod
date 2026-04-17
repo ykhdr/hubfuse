@@ -9,6 +9,7 @@ require (
 	github.com/pkg/sftp v1.13.10
 	github.com/sblinch/kdl-go v0.0.0-20240410000746-21754ba9ac55
 	github.com/spf13/cobra v1.10.2
+	github.com/stretchr/testify v1.10.0
 	golang.org/x/crypto v0.49.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -14,9 +15,7 @@ func TestFormatAlreadyExistsWithContext(t *testing.T) {
 	got := Format(Wrap(err, &Context{Nickname: "alice"}), nil)
 	want := `error: nickname "alice" is already in use; choose a different one`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	require.Equal(t, want, got)
 }
 
 func TestFormatUnauthenticated(t *testing.T) {
@@ -25,9 +24,7 @@ func TestFormatUnauthenticated(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: not joined to this hub; run "hubfuse join <hub-address>" first`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	require.Equal(t, want, got)
 }
 
 func TestFormatDeviceNotFound(t *testing.T) {
@@ -36,21 +33,15 @@ func TestFormatDeviceNotFound(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: device "bob" not found`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	require.Equal(t, want, got)
 }
 
 func TestIsNicknameTaken(t *testing.T) {
 	statusErr := grpcstatus.Error(codes.AlreadyExists, "nickname already taken")
 	stringErr := errors.New("rpc error: code = AlreadyExists desc = nickname already taken")
 
-	if !IsNicknameTaken(statusErr) {
-		t.Fatal("expected IsNicknameTaken to detect status error")
-	}
-	if !IsNicknameTaken(stringErr) {
-		t.Fatal("expected IsNicknameTaken to detect string error")
-	}
+	require.True(t, IsNicknameTaken(statusErr))
+	require.True(t, IsNicknameTaken(stringErr))
 }
 
 func TestFormatFallsBackToOriginal(t *testing.T) {
@@ -58,7 +49,5 @@ func TestFormatFallsBackToOriginal(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: plain failure"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	require.Equal(t, want, got)
 }
