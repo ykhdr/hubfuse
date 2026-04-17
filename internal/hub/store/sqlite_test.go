@@ -313,6 +313,88 @@ func TestDeleteDevice(t *testing.T) {
 	}
 }
 
+func TestDeletePrunedDevices(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	old := makeDevice("dev-old", "oldie")
+	old.LastHeartbeat = time.Now().UTC().Add(-48 * time.Hour)
+
+	active := makeDevice("dev-active", "active")
+	active.LastHeartbeat = time.Now().UTC().Add(-48 * time.Hour)
+
+	recent := makeDevice("dev-recent", "recent")
+
+	online := makeDevice("dev-online", "online")
+	online.Status = StatusOnline
+	online.LastHeartbeat = time.Now().UTC().Add(-48 * time.Hour)
+
+	other := makeDevice("dev-other", "other")
+
+	for _, d := range []*Device{old, active, recent, online, other} {
+		if err := s.CreateDevice(ctx, d); err != nil {
+			t.Fatalf("CreateDevice %q: %v", d.DeviceID, err)
+		}
+	}
+
+	shares := []*Share{{DeviceID: old.DeviceID, Alias: "docs", Permissions: PermRO}}
+	if err := s.SetShares(ctx, old.DeviceID, shares); err != nil {
+		t.Fatalf("SetShares: %v", err)
+	}
+
+	if err := s.CreatePairing(ctx, old.DeviceID, other.DeviceID); err != nil {
+		t.Fatalf("CreatePairing: %v", err)
+	}
+
+	invite := &PendingInvite{
+		InviteCode:    "INV-1",
+		FromDevice:    old.DeviceID,
+		ToDevice:      other.DeviceID,
+		FromPublicKey: "ssh-ed25519 AAAAC3Nza",
+		ExpiresAt:     time.Now().UTC().Add(time.Hour),
+	}
+	if err := s.CreateInvite(ctx, invite); err != nil {
+		t.Fatalf("CreateInvite: %v", err)
+	}
+
+	threshold := time.Now().UTC().Add(-24 * time.Hour)
+	pruned, err := s.DeletePrunedDevices(ctx, threshold, []string{active.DeviceID})
+	if err != nil {
+		t.Fatalf("DeletePrunedDevices: %v", err)
+	}
+	if len(pruned) != 1 || pruned[0].DeviceID != old.DeviceID {
+		t.Fatalf("pruned devices = %v, want only %s", pruned, old.DeviceID)
+	}
+
+	if _, err := s.GetDevice(ctx, old.DeviceID); err == nil {
+		t.Fatal("expected pruned device to be removed")
+	}
+
+	if _, err := s.GetDevice(ctx, active.DeviceID); err != nil {
+		t.Fatalf("active device should remain: %v", err)
+	}
+	if _, err := s.GetDevice(ctx, recent.DeviceID); err != nil {
+		t.Fatalf("recent device should remain: %v", err)
+	}
+	if _, err := s.GetDevice(ctx, online.DeviceID); err != nil {
+		t.Fatalf("online device should remain: %v", err)
+	}
+
+	if paired, err := s.IsPaired(ctx, old.DeviceID, other.DeviceID); err == nil && paired {
+		t.Fatal("pairing still exists after pruning old device")
+	}
+
+	if shares, err := s.GetShares(ctx, old.DeviceID); err != nil {
+		t.Fatalf("GetShares pruned device: %v", err)
+	} else if len(shares) != 0 {
+		t.Fatalf("expected shares to be removed, got %d", len(shares))
+	}
+
+	if _, err := s.GetInvite(ctx, invite.InviteCode); err == nil {
+		t.Fatal("expected invite to be removed after pruning device")
+	}
+}
+
 // --- Share tests ---
 
 func TestSetShares_AndGet(t *testing.T) {
@@ -846,4 +928,3 @@ func TestPairing_Duplicate(t *testing.T) {
 		t.Fatal("expected error for duplicate pairing, got nil")
 	}
 }
-

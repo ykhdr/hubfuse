@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
@@ -21,12 +22,13 @@ import (
 
 // Config holds configuration for a Hub instance.
 type Config struct {
-	ListenAddr string     // e.g. ":9090"
-	DataDir    string     // e.g. "~/.hubfuse-hub"
-	LogFile    string     // path to JSON log file ("" = no file logging)
-	LogLevel   slog.Level // file log level (default: Debug)
-	Verbose    bool       // show debug logs in console
-	ExtraSANs  []string   // additional SANs for the server TLS certificate
+	ListenAddr      string        // e.g. ":9090"
+	DataDir         string        // e.g. "~/.hubfuse-hub"
+	LogFile         string        // path to JSON log file ("" = no file logging)
+	LogLevel        slog.Level    // file log level (default: Debug)
+	Verbose         bool          // show debug logs in console
+	ExtraSANs       []string      // additional SANs for the server TLS certificate
+	DeviceRetention time.Duration // how long to keep offline devices before pruning (0 = never prune)
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
 	// after net.Listen returns — the TCP listener is bound and the
@@ -79,7 +81,7 @@ func NewHub(config Config) (*Hub, error) {
 	}
 
 	registry := NewRegistry(s, caCert, caKey, logger)
-	heartbeat := NewHeartbeatMonitor(registry, s, 0, logger)
+	heartbeat := NewHeartbeatMonitor(registry, s, 0, config.DeviceRetention, logger)
 
 	return &Hub{
 		config:    config,
@@ -276,4 +278,3 @@ func dedup(ss []string) []string {
 	sort.Strings(out)
 	return out
 }
-

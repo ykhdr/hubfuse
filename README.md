@@ -60,9 +60,11 @@ Changes to `config.kdl` are hot-reloaded — no restart needed.
 
 | Command | Description |
 |---|---|
-| `start [--listen :9090] [-d]` | Start the hub server (use `-d` to run in the background) |
+| `start [--listen :9090] [--device-retention 168h] [-d]` | Start the hub server (use `-d` to run in the background) |
 | `stop` | Stop the running hub |
 | `status` | Show hub status (running/stopped, pid) |
+
+Offline devices older than one week (`168h`) are pruned automatically. Customize the window with `--device-retention <duration>` or set `device-retention "<duration>"` in `~/.hubfuse-hub/config.kdl`. Use `0` to disable pruning.
 
 ### `hubfuse` (agent)
 

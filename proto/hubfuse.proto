@@ -122,6 +122,7 @@ message Event {
     PairingRequestedEvent pairing_requested = 4;
     PairingCompletedEvent pairing_completed = 5;
     SubscribeReadyEvent subscribe_ready = 6;
+    DeviceRemovedEvent device_removed = 7;
   }
 }
 
@@ -136,6 +137,11 @@ message DeviceOnlineEvent {
 }
 
 message DeviceOfflineEvent {
+  string device_id = 1;
+  string nickname = 2;
+}
+
+message DeviceRemovedEvent {
   string device_id = 1;
   string nickname = 2;
 }

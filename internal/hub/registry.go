@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
@@ -45,10 +46,11 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip string) (cer
 	}
 
 	d := &store.Device{
-		DeviceID: deviceID,
-		Nickname: nickname,
-		LastIP:   ip,
-		Status:   store.StatusRegistered,
+		DeviceID:      deviceID,
+		Nickname:      nickname,
+		LastIP:        ip,
+		Status:        store.StatusRegistered,
+		LastHeartbeat: time.Now().UTC(),
 	}
 	if err := r.store.CreateDevice(ctx, d); err != nil {
 		return nil, nil, nil, err
@@ -220,12 +222,25 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 		r.mu.Lock()
 		if existing, ok := r.subscribers[deviceID]; ok && existing == ch {
 			delete(r.subscribers, deviceID)
+			close(ch)
 		}
 		r.mu.Unlock()
-		close(ch)
 	}
 
 	return ch, unsub
+}
+
+// ActiveSubscribers returns the device IDs that currently have an active
+// subscription stream.
+func (r *Registry) ActiveSubscribers() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ids := make([]string, 0, len(r.subscribers))
+	for id := range r.subscribers {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Broadcast sends event to all subscribers except excludeDevice. If a
@@ -315,6 +330,30 @@ func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error 
 	r.Broadcast(event, device.DeviceID)
 
 	return nil
+}
+
+// BroadcastDeviceRemoved sends a DeviceRemoved event to all subscribers except
+// the removed device.
+func (r *Registry) BroadcastDeviceRemoved(device *store.Device) {
+	event := &pb.Event{
+		Payload: &pb.Event_DeviceRemoved{
+			DeviceRemoved: &pb.DeviceRemovedEvent{
+				DeviceId: device.DeviceID,
+				Nickname: device.Nickname,
+			},
+		},
+	}
+	r.Broadcast(event, device.DeviceID)
+}
+
+// removeSubscriber removes and closes a subscriber channel if present.
+func (r *Registry) removeSubscriber(deviceID string) {
+	r.mu.Lock()
+	if ch, ok := r.subscribers[deviceID]; ok {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	r.mu.Unlock()
 }
 
 // sharesToProto converts store.Share records to pb.Share messages.
