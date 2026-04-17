@@ -99,22 +99,22 @@ func joinCmd() *cobra.Command {
 				}
 
 				// Call Join.
-				resp, err = hubClient.Join(context.Background(), deviceID, nickname)
-				if err != nil {
-					if clierrors.IsNicknameTaken(err) {
-						fmt.Fprintf(os.Stderr, "error: nickname %q is already in use; choose a different one\n", nickname)
-						continue
-					}
-					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), &clierrors.Context{Nickname: nickname})
+			resp, err = hubClient.Join(context.Background(), deviceID, nickname)
+			if err != nil {
+				if clierrors.IsNicknameTaken(err) {
+					fmt.Fprintln(os.Stderr, clierrors.Format(err, &clierrors.Context{Nickname: nickname}))
+					continue
 				}
-				if !resp.Success {
-					respErr := errors.New(resp.Error)
-					if clierrors.IsNicknameTaken(respErr) {
-						fmt.Fprintf(os.Stderr, "error: nickname %q is already in use; choose a different one\n", nickname)
-						continue
-					}
-					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), nil)
+				return clierrors.Wrap(fmt.Errorf("join hub: %w", err), &clierrors.Context{Nickname: nickname})
+			}
+			if !resp.Success {
+				respErr := errors.New(resp.Error)
+				if clierrors.IsNicknameTaken(respErr) {
+					fmt.Fprintln(os.Stderr, clierrors.Format(respErr, &clierrors.Context{Nickname: nickname}))
+					continue
 				}
+				return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), nil)
+			}
 
 				break
 			}

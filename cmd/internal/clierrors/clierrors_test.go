@@ -36,6 +36,15 @@ func TestFormat_DeviceNotFound(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
+func TestFormat_InternalWithoutMessage(t *testing.T) {
+	err := grpcstatus.Error(codes.Internal, "")
+
+	got := Format(err, nil)
+	want := "error: internal"
+
+	require.Equal(t, want, got)
+}
+
 func TestIsNicknameTaken(t *testing.T) {
 	statusErr := grpcstatus.Error(codes.AlreadyExists, "nickname already taken")
 	stringErr := errors.New("rpc error: code = AlreadyExists desc = nickname already taken")

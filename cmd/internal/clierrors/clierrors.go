@@ -96,28 +96,29 @@ func statusFromError(err error) (*grpcstatus.Status, bool) {
 }
 
 func codeFromString(name string) (codes.Code, bool) {
-	switch strings.ToUpper(name) {
+	normalized := strings.ToUpper(strings.ReplaceAll(name, "_", ""))
+	switch normalized {
 	case "CANCELED", "CANCELLED":
 		return codes.Canceled, true
 	case "UNKNOWN":
 		return codes.Unknown, true
-	case "INVALID_ARGUMENT":
+	case "INVALIDARGUMENT":
 		return codes.InvalidArgument, true
-	case "DEADLINE_EXCEEDED":
+	case "DEADLINEEXCEEDED":
 		return codes.DeadlineExceeded, true
-	case "NOT_FOUND":
+	case "NOTFOUND":
 		return codes.NotFound, true
-	case "ALREADY_EXISTS":
+	case "ALREADYEXISTS":
 		return codes.AlreadyExists, true
-	case "PERMISSION_DENIED":
+	case "PERMISSIONDENIED":
 		return codes.PermissionDenied, true
-	case "RESOURCE_EXHAUSTED":
+	case "RESOURCEEXHAUSTED":
 		return codes.ResourceExhausted, true
-	case "FAILED_PRECONDITION":
+	case "FAILEDPRECONDITION":
 		return codes.FailedPrecondition, true
 	case "ABORTED":
 		return codes.Aborted, true
-	case "OUT_OF_RANGE":
+	case "OUTOFRANGE":
 		return codes.OutOfRange, true
 	case "UNIMPLEMENTED":
 		return codes.Unimplemented, true
@@ -125,7 +126,7 @@ func codeFromString(name string) (codes.Code, bool) {
 		return codes.Internal, true
 	case "UNAVAILABLE":
 		return codes.Unavailable, true
-	case "DATA_LOSS":
+	case "DATALOSS":
 		return codes.DataLoss, true
 	case "UNAUTHENTICATED":
 		return codes.Unauthenticated, true
@@ -189,7 +190,11 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		}
 		return msg, true
 	default:
-		return fmt.Sprintf("%s: %s", strings.ToLower(st.Code().String()), msg), true
+		code := strings.ToLower(st.Code().String())
+		if msg == "" {
+			return code, true
+		}
+		return fmt.Sprintf("%s: %s", code, msg), true
 	}
 }
 
