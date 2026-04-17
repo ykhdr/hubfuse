@@ -21,7 +21,7 @@ import (
 
 // Argument shape (matching real sshfs CLI):
 //
-//	stub-sshfs user@host:/remote/path /local/mount-point -p PORT -o IdentityFile=PATH [-o ...]
+//	stub-sshfs -p PORT -o IdentityFile=PATH [-o ...] user@host:/remote/path /local/mount-point
 
 type Marker struct {
 	Src         string   `json:"src"`
@@ -37,20 +37,31 @@ type Marker struct {
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: stub-sshfs user@host:/path /mount-point [-p PORT] [-o KEY=VAL ...]")
+		fmt.Fprintln(os.Stderr, "usage: stub-sshfs [options] user@host:/path /mount-point")
 		os.Exit(2)
 	}
-	src := os.Args[1]
-	dst := os.Args[2]
 
+	// Parse all flags first. The mounter calls sshfs with flags before the
+	// positional arguments (real-sshfs style):
+	//   sshfs -p PORT -o KEY=VAL ... user@host:share /local/path
+	// The Go flag package stops at the first non-flag argument, so the
+	// remaining args (src and dst) end up in fs.Args().
 	fs := flag.NewFlagSet("stub-sshfs", flag.ContinueOnError)
 	port := fs.Int("p", 22, "ssh port")
 	var opts arrayFlag
 	fs.Var(&opts, "o", "ssh option (KEY=VAL)")
-	if err := fs.Parse(os.Args[3:]); err != nil {
+	if err := fs.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+
+	positional := fs.Args()
+	if len(positional) < 2 {
+		fmt.Fprintln(os.Stderr, "stub-sshfs: need both user@host:/path and /mount-point")
+		os.Exit(2)
+	}
+	src := positional[0]
+	dst := positional[1]
 
 	user, host, remotePath := parseSrc(src)
 	if user == "" || host == "" {
