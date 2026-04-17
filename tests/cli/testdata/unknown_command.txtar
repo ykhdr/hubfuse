@@ -1,0 +1,2 @@
+! exec hubfuse blargh
+stderr 'unknown command "blargh"'

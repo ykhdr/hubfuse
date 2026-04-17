@@ -1,0 +1,9 @@
+exec hubfuse --help
+stdout 'Available Commands:'
+stdout 'join'
+stdout 'pair'
+stdout 'start'
+stdout 'status'
+stdout 'devices'
+stdout 'mount'
+stdout 'share'

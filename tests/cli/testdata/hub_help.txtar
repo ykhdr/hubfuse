@@ -1,0 +1,5 @@
+exec hubfuse-hub --help
+stdout 'Available Commands:'
+stdout 'start'
+stdout 'stop'
+stdout 'status'

@@ -1,0 +1,8 @@
+# Passing an arg without the required device:share format should produce
+# a descriptive error, not a panic. The --to flag is also required.
+env HOME=$WORK/home
+mkdir $WORK/home
+! exec hubfuse mount add no-colon-here --to /local/path
+stderr 'argument must be in.*device.*share.*format|format|invalid'
+! stderr 'Usage:'
+! stderr 'panic'

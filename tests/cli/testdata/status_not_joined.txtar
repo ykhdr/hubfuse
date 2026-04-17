@@ -1,0 +1,7 @@
+# With empty state, status must report cleanly without panic or usage block.
+env HOME=$WORK/home
+mkdir $WORK/home
+exec hubfuse status
+stdout 'agent is not running'
+! stderr 'Usage:'
+! stderr 'panic'

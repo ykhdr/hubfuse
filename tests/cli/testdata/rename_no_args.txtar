@@ -1,7 +1,6 @@
 # REGRESSION for issue #20. Remove the `skip` line below once #20 is fixed.
 skip 'tracks issue #20: usage suppressed for arg-validation errors'
 
-! exec hubfuse join
+! exec hubfuse rename
 stderr 'accepts 1 arg\(s\), received 0'
 stderr 'Usage:'
-stderr 'hubfuse join'
