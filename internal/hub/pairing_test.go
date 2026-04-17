@@ -16,8 +16,8 @@ import (
 func setupPairingDevices(t *testing.T, r *Registry) {
 	t.Helper()
 
-	joinDevice(t, r, "dev-a", "alice")
-	joinDevice(t, r, "dev-b", "bob")
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
 	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
 	registerDevice(t, r, "dev-b", "10.0.0.2", 22)
 }
@@ -120,13 +120,27 @@ func TestRequestPairing_OfflineDevice(t *testing.T) {
 	ctx := context.Background()
 
 	// Create two devices but only register (online) dev-a.
-	joinDevice(t, r, "dev-a", "alice")
-	joinDevice(t, r, "dev-b", "bob")
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
 	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
 	// dev-b remains offline.
 
 	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
-	assert.Error(t, err, "expected error for offline target device")
+	require.Error(t, err, "expected error for offline target device")
+	assert.Equal(t, common.ErrDeviceOffline, err)
+}
+
+func TestRequestPairing_RegisteredDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
+	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
+
+	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
+	require.Error(t, err, "expected error for registered target device")
+	assert.Equal(t, common.ErrDeviceOffline, err)
 }
 
 // --- ConfirmPairing ---

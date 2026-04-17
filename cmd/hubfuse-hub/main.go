@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/ykhdr/hubfuse/cmd/internal/clierrors"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
@@ -16,7 +17,7 @@ import (
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, clierrors.Format(err, nil))
 		os.Exit(1)
 	}
 }
@@ -27,6 +28,7 @@ func rootCmd() *cobra.Command {
 		Short: "HubFuse hub server",
 	}
 	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
+	silenceAll(cmd)
 	return cmd
 }
 
@@ -39,6 +41,7 @@ func startCmd() *cobra.Command {
 		verbose   bool
 		extraSANs []string
 		daemon    bool
+		deviceRet string
 	)
 
 	cmd := &cobra.Command{
@@ -48,6 +51,7 @@ func startCmd() *cobra.Command {
 			expandedData := common.ExpandHome(dataDir)
 			pidPath := filepath.Join(expandedData, common.HubPIDFile)
 			defaultLog := filepath.Join(expandedData, common.HubLogFile)
+			configPath := filepath.Join(expandedData, common.ConfigFile)
 
 			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
 				return fmt.Errorf("check existing hub: %w", err)
@@ -65,13 +69,19 @@ func startCmd() *cobra.Command {
 				})
 			}
 
+			retention, err := resolveDeviceRetention(deviceRet, cmd.Flags().Changed("device-retention"), configPath)
+			if err != nil {
+				return err
+			}
+
 			cfg := hub.Config{
-				ListenAddr: listen,
-				DataDir:    dataDir,
-				LogFile:    logFile,
-				LogLevel:   common.ParseLogLevel(logLevel),
-				Verbose:    verbose,
-				ExtraSANs:  extraSANs,
+				ListenAddr:      listen,
+				DataDir:         dataDir,
+				LogFile:         logFile,
+				LogLevel:        common.ParseLogLevel(logLevel),
+				Verbose:         verbose,
+				ExtraSANs:       extraSANs,
+				DeviceRetention: retention,
 				OnReady: func() {
 					if err := daemonize.WritePIDFile(pidPath); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
@@ -117,6 +127,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
 	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
+	cmd.Flags().StringVar(&deviceRet, "device-retention", hub.DefaultDeviceRetention.String(), "prune offline devices older than this duration (0 = never prune)")
 
 	return cmd
 }
@@ -140,5 +151,13 @@ func statusCmd() *cobra.Command {
 			pidPath := common.ExpandHome(filepath.Join(common.HubDataDir, common.HubPIDFile))
 			return daemonize.ReportStatus(pidPath, "hub")
 		},
+	}
+}
+
+func silenceAll(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	for _, child := range cmd.Commands() {
+		silenceAll(child)
 	}
 }

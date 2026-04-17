@@ -283,7 +283,7 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	require.Error(t, err, "expected error for offline device")
 	st := status.Convert(err)
 	assert.Equal(t, codes.Unavailable, st.Code())
-	assert.Contains(t, st.Message(), "not currently connected")
+	assert.Contains(t, st.Message(), "device offline")
 }
 
 func TestListDevices(t *testing.T) {
@@ -306,7 +306,7 @@ func TestListDevices(t *testing.T) {
 	require.NoError(t, err, "Join dev2")
 	require.True(t, joinResp2.GetSuccess(), "Join dev2 success=false")
 
-	// Register only device 1 (device 2 stays offline).
+	// Register only device 1 (device 2 stays in registered state, not yet online).
 	client1 := dialWithClientCert(t, h.Addr, joinResp1.ClientCert, joinResp1.ClientKey, h.CAPEM)
 	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
@@ -324,5 +324,5 @@ func TestListDevices(t *testing.T) {
 		statusMap[d.Nickname] = d.Status
 	}
 	assert.Equal(t, "online", statusMap["list-alice"])
-	assert.Equal(t, "offline", statusMap["list-bob"])
+	assert.Equal(t, "registered", statusMap["list-bob"])
 }

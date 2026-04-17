@@ -30,7 +30,7 @@ make install
 hubfuse-hub start
 
 # On each device — join the hub and start the agent
-hubfuse join --hub <hub-address>:9090
+hubfuse join <hub-address>:9090
 hubfuse start
 ```
 
@@ -54,6 +54,36 @@ mounts {
 
 Changes to `config.kdl` are hot-reloaded — no restart needed.
 
+## Commands
+
+### `hubfuse-hub`
+
+| Command | Description |
+|---|---|
+| `start [--listen :9090] [--device-retention 168h] [-d]` | Start the hub server (use `-d` to run in the background) |
+| `stop` | Stop the running hub |
+| `status` | Show hub status (running/stopped, pid) |
+
+Offline devices older than one week (`168h`) are pruned automatically. Customize the window with `--device-retention <duration>` or set `device-retention "<duration>"` in `~/.hubfuse-hub/config.kdl`. Use `0` to disable pruning.
+
+### `hubfuse` (agent)
+
+| Command | Description |
+|---|---|
+| `join <hub-address>` | Register this device with a hub; receives TLS certs |
+| `start [-d]` | Start the agent daemon |
+| `stop` | Stop the running agent |
+| `status` | Show agent status |
+| `devices` | List all devices known to the hub |
+| `rename <nickname>` | Change this device's nickname |
+| `pair <device>` | Request pairing with a remote device (prints invite code) |
+| `share add <path> --alias <name> [--permissions ro\|rw] [--allow ...]` | Share a local directory |
+| `share remove <alias>` | Remove a share |
+| `share list` | List local shares |
+| `mount add <device>:<share> --to <path>` | Mount a remote share |
+| `mount remove <device>:<share>` | Unmount |
+| `mount list` | List mounts |
+
 ## Development
 
 ```bash
@@ -63,22 +93,4 @@ make test-unit          # unit tests only
 make test-integration   # integration tests (120s timeout)
 make vet                # static analysis
 make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
-```
-
-## Project structure
-
-```
-cmd/
-  hubfuse-hub/          # hub CLI entry point
-  hubfuse/              # agent CLI entry point
-proto/
-  hubfuse.proto         # gRPC service definition
-internal/
-  hub/                  # hub server: registry, heartbeat, pairing, gRPC handlers
-    store/              # Store interface + SQLite implementation
-  agent/                # agent daemon: connector, mounter, SSH server, config
-    config/             # KDL config parser, diff detection, hot-reload
-  common/               # TLS helpers, logging, shared types
-tests/
-  integration/          # end-to-end gRPC tests with in-process hub
 ```

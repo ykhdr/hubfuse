@@ -1,3 +1,3 @@
 package common
 
-const ProtocolVersion = 1
+const ProtocolVersion = 2

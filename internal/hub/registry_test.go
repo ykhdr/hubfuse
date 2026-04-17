@@ -30,16 +30,16 @@ func newTestRegistry(t *testing.T) *Registry {
 }
 
 // joinDevice is a helper that calls Join and fatals on error.
-func joinDevice(t *testing.T, r *Registry, deviceID, nickname string) {
+func joinDevice(t *testing.T, r *Registry, deviceID, nickname, ip string) {
 	t.Helper()
-	_, _, _, err := r.Join(context.Background(), deviceID, nickname)
+	_, _, _, err := r.Join(context.Background(), deviceID, nickname, ip)
 	require.NoError(t, err, "Join(%q, %q)", deviceID, nickname)
 }
 
 // registerDevice is a helper that calls Register (online) and fatals on error.
 func registerDevice(t *testing.T, r *Registry, deviceID, ip string, port int) []*store.Device {
 	t.Helper()
-	online, err := r.Register(context.Background(), deviceID, ip, port, nil, 1)
+	online, err := r.Register(context.Background(), deviceID, ip, port, nil, common.ProtocolVersion)
 	require.NoError(t, err, "Register(%q)", deviceID)
 	return online
 }
@@ -50,7 +50,7 @@ func TestJoin_Success(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice")
+	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice", "1.2.3.4")
 	require.NoError(t, err, "Join")
 	assert.NotEmpty(t, certPEM, "certPEM is empty")
 	assert.NotEmpty(t, keyPEM, "keyPEM is empty")
@@ -60,17 +60,18 @@ func TestJoin_Success(t *testing.T) {
 	d, err := r.store.GetDevice(ctx, "dev-1")
 	require.NoError(t, err, "GetDevice")
 	assert.Equal(t, "alice", d.Nickname)
-	assert.Equal(t, store.StatusOffline, d.Status)
+	assert.Equal(t, store.StatusRegistered, d.Status)
+	assert.Equal(t, "1.2.3.4", d.LastIP)
 }
 
 func TestJoin_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	_, _, _, err := r.Join(ctx, "dev-1", "alice")
+	_, _, _, err := r.Join(ctx, "dev-1", "alice", "")
 	require.NoError(t, err, "first Join")
 
-	_, _, _, err = r.Join(ctx, "dev-2", "alice")
+	_, _, _, err = r.Join(ctx, "dev-2", "alice", "")
 	require.Error(t, err, "expected error for duplicate nickname")
 	assert.Equal(t, common.ErrNicknameTaken, err)
 }
@@ -79,11 +80,11 @@ func TestJoin_DuplicateDeviceID(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	_, _, _, err := r.Join(ctx, "dev-1", "alice")
+	_, _, _, err := r.Join(ctx, "dev-1", "alice", "")
 	require.NoError(t, err, "first Join")
 
 	// Same device_id, different nickname — store should reject the duplicate.
-	_, _, _, err = r.Join(ctx, "dev-1", "bob")
+	_, _, _, err = r.Join(ctx, "dev-1", "bob", "")
 	require.Error(t, err, "expected error for duplicate device_id")
 }
 
@@ -92,8 +93,8 @@ func TestJoin_DuplicateDeviceID(t *testing.T) {
 func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	r := newTestRegistry(t)
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	online := registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 	require.Len(t, online, 1, "online count after first register")
@@ -104,11 +105,28 @@ func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	assert.Len(t, online, 2, "online count after second register")
 }
 
+func TestRegister_SetsHeartbeat(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+
+	before := time.Now()
+	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, nil, common.ProtocolVersion)
+	require.NoError(t, err, "Register")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.False(t, d.LastHeartbeat.IsZero() || d.LastHeartbeat.Before(before),
+		"LastHeartbeat not set on register, got %v", d.LastHeartbeat)
+	assert.Equal(t, store.StatusOnline, d.Status)
+}
+
 func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
 	r := newTestRegistry(t)
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	// Subscribe dev-2 before dev-1 registers.
 	ch, unsub := r.Subscribe("dev-2")
@@ -131,12 +149,12 @@ func TestRegister_WithShares(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	shares := []*pb.Share{
 		{Alias: "docs", Permissions: "ro", AllowedDevices: []string{"all"}},
 	}
-	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, shares, 1)
+	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, shares, common.ProtocolVersion)
 	require.NoError(t, err, "Register with shares")
 
 	stored, err := r.store.GetShares(ctx, "dev-1")
@@ -151,7 +169,7 @@ func TestHeartbeat_UpdatesTimestamp(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	before := time.Now()
 	err := r.Heartbeat(ctx, "dev-1")
@@ -251,8 +269,8 @@ func TestDeregister_MarksOfflineAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, unsub := r.Subscribe("dev-2")
@@ -282,7 +300,7 @@ func TestDeregister_RemovesSubscriber(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, _ := r.Subscribe("dev-1")
@@ -311,8 +329,8 @@ func TestUpdateShares_StoresAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
@@ -347,7 +365,7 @@ func TestRename_Success(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	err := r.Rename(ctx, "dev-1", "alice2")
 	require.NoError(t, err, "Rename")
@@ -361,8 +379,8 @@ func TestRename_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	err := r.Rename(ctx, "dev-1", "bob")
 	require.Error(t, err, "expected error for duplicate nickname")
@@ -375,8 +393,8 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, unsub := r.Subscribe("dev-2")

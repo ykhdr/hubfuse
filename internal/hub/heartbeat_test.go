@@ -14,14 +14,14 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 	r := newTestRegistry(t)
 	bg := context.Background()
 
-	joinDevice(t, r, "dev-stale2", "stale-device2")
+	joinDevice(t, r, "dev-stale2", "stale-device2", "")
 
 	// Set the device online. Its last_heartbeat stays at zero (always stale).
 	err := r.store.UpdateDeviceStatus(bg, "dev-stale2", store.StatusOnline, "10.0.0.1", 22)
 	require.NoError(t, err, "UpdateDeviceStatus")
 
 	timeout := 50 * time.Millisecond
-	monitor := NewHeartbeatMonitor(r, r.store, timeout, r.logger)
+	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 
 	monCtx, cancel := context.WithCancel(bg)
 	go monitor.Start(monCtx)
@@ -45,7 +45,7 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	monCtx, cancel := context.WithCancel(context.Background())
 	bg := context.Background()
 
-	joinDevice(t, r, "dev-fresh", "fresh-device")
+	joinDevice(t, r, "dev-fresh", "fresh-device", "")
 	registerDevice(t, r, "dev-fresh", "10.0.0.1", 22)
 
 	// Update heartbeat to now so the device is fresh.
@@ -53,7 +53,7 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	require.NoError(t, err, "Heartbeat")
 
 	timeout := 10 * time.Second // long timeout — device won't go stale
-	monitor := NewHeartbeatMonitor(r, r.store, timeout, r.logger)
+	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 
 	go monitor.Start(monCtx)
 	time.Sleep(100 * time.Millisecond)
@@ -69,8 +69,8 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	joinDevice(t, r, "dev-stale", "stale-device")
-	joinDevice(t, r, "dev-watcher", "watcher")
+	joinDevice(t, r, "dev-stale", "stale-device", "")
+	joinDevice(t, r, "dev-watcher", "watcher", "")
 
 	// Put dev-stale online with stale heartbeat.
 	err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22)
@@ -80,7 +80,7 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	defer unsub()
 
 	timeout := 50 * time.Millisecond
-	monitor := NewHeartbeatMonitor(r, r.store, timeout, r.logger)
+	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 	go monitor.Start(ctx)
 
 	select {
@@ -100,7 +100,7 @@ func TestHeartbeatMonitor_StopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	timeout := time.Minute // won't fire
-	monitor := NewHeartbeatMonitor(r, r.store, timeout, r.logger)
+	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 
 	done := make(chan struct{})
 	go func() {
@@ -118,10 +118,91 @@ func TestHeartbeatMonitor_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	joinDevice(t, r, "dev-prune", "prune-me", "")
+	joinDevice(t, r, "dev-active", "active-sub", "")
+	joinDevice(t, r, "dev-recent", "recent-offline", "")
+
+	// Join now leaves devices in StatusRegistered; pruning only considers
+	// StatusOffline, so demote all three explicitly.
+	for _, id := range []string{"dev-prune", "dev-active", "dev-recent"} {
+		if err := r.store.UpdateDeviceStatus(ctx, id, store.StatusOffline, "", 0); err != nil {
+			t.Fatalf("UpdateDeviceStatus %s: %v", id, err)
+		}
+	}
+
+	// Make dev-recent fresh so it should not be pruned.
+	if err := r.Heartbeat(ctx, "dev-recent"); err != nil {
+		t.Fatalf("Heartbeat dev-recent: %v", err)
+	}
+
+	// Simulate an active subscriber for dev-active to ensure it is skipped.
+	activeCh, activeUnsub := r.Subscribe("dev-active")
+	defer activeUnsub()
+	// Drain to avoid blocking (channel may never get events).
+	go func() {
+		for range activeCh {
+		}
+	}()
+
+	watchCh, watchUnsub := r.Subscribe("watcher")
+	defer watchUnsub()
+
+	stopHeartbeats := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeats:
+				return
+			case <-ticker.C:
+				_ = r.Heartbeat(ctx, "dev-recent")
+			}
+		}
+	}()
+	defer close(stopHeartbeats)
+
+	retention := 50 * time.Millisecond
+	monitor := NewHeartbeatMonitor(r, r.store, 0, retention, r.logger)
+	go monitor.Start(ctx)
+
+	var gotRemoved bool
+	select {
+	case event := <-watchCh:
+		if removed := event.GetDeviceRemoved(); removed != nil {
+			if removed.DeviceId != "dev-prune" {
+				t.Fatalf("DeviceRemoved device_id = %q, want dev-prune", removed.DeviceId)
+			}
+			gotRemoved = true
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for DeviceRemoved event")
+	}
+
+	if !gotRemoved {
+		t.Fatal("expected DeviceRemoved event for dev-prune")
+	}
+
+	if _, err := r.store.GetDevice(ctx, "dev-prune"); err == nil {
+		t.Fatal("dev-prune still present after pruning")
+	}
+	if _, err := r.store.GetDevice(ctx, "dev-active"); err != nil {
+		t.Fatalf("dev-active should not be pruned: %v", err)
+	}
+	if _, err := r.store.GetDevice(ctx, "dev-recent"); err != nil {
+		t.Fatalf("dev-recent should not be pruned: %v", err)
+	}
+}
+
 func TestNewHeartbeatMonitor_DefaultCheckInterval(t *testing.T) {
 	r := newTestRegistry(t)
 	timeout := 30 * time.Second
-	monitor := NewHeartbeatMonitor(r, r.store, timeout, r.logger)
+	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 
 	expectedCheck := timeout / 3
 	assert.Equal(t, expectedCheck, monitor.check)

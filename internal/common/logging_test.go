@@ -86,6 +86,5 @@ func TestSetupLogger_CreatesLogDir(t *testing.T) {
 	_, err := SetupLogger(LoggerOptions{LogFile: logPath})
 	require.NoError(t, err)
 
-	_, err = os.Stat(filepath.Dir(logPath))
-	assert.False(t, os.IsNotExist(err), "expected log directory to be created")
+	require.DirExists(t, filepath.Dir(logPath), "expected log directory to be created")
 }

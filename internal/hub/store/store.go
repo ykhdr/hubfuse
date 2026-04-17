@@ -43,6 +43,11 @@ type Store interface {
 	// DeleteDevice removes a device and all its associated data.
 	DeleteDevice(ctx context.Context, deviceID string) error
 
+	// DeletePrunedDevices removes offline devices whose last_heartbeat is older
+	// than threshold. Devices with IDs listed in activeDeviceIDs are skipped.
+	// It returns the pruned devices.
+	DeletePrunedDevices(ctx context.Context, threshold time.Time, activeDeviceIDs []string) ([]*Device, error)
+
 	// Shares
 
 	// SetShares replaces all shares for the given device with the provided

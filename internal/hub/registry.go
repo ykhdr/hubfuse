@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
@@ -36,17 +37,20 @@ func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey,
 
 // Join creates a device record in the store and returns a signed client TLS
 // certificate, private key, and the CA certificate in PEM form. It returns
-// common.ErrNicknameTaken if the nickname is already in use.
-func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM, keyPEM, caCertPEM []byte, err error) {
+// common.ErrNicknameTaken if the nickname is already in use. ip is the
+// caller's apparent address (best effort; may be empty).
+func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip string) (certPEM, keyPEM, caCertPEM []byte, err error) {
 	existing, _ := r.store.GetDeviceByNickname(ctx, nickname)
 	if existing != nil {
 		return nil, nil, nil, common.ErrNicknameTaken
 	}
 
 	d := &store.Device{
-		DeviceID: deviceID,
-		Nickname: nickname,
-		Status:   store.StatusOffline,
+		DeviceID:      deviceID,
+		Nickname:      nickname,
+		LastIP:        ip,
+		Status:        store.StatusRegistered,
+		LastHeartbeat: time.Now().UTC(),
 	}
 	if err := r.store.CreateDevice(ctx, d); err != nil {
 		return nil, nil, nil, err
@@ -73,12 +77,8 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
-		return nil, err
-	}
-
-	storeShares := sharesFromProto(deviceID, shares)
-	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
+	device, err := r.store.GetDevice(ctx, deviceID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -87,9 +87,36 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, err
 	}
 
-	device, err := r.store.GetDevice(ctx, deviceID)
-	if err != nil {
+	storeShares := sharesFromProto(deviceID, shares)
+	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
 		return nil, err
+	}
+
+	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
+		return nil, err
+	}
+
+	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
+		return nil, err
+	}
+
+	current := &store.Device{
+		DeviceID: device.DeviceID,
+		Nickname: device.Nickname,
+		LastIP:   ip,
+		SSHPort:  sshPort,
+		Status:   store.StatusOnline,
+	}
+	found := false
+	for i, d := range online {
+		if d.DeviceID == deviceID {
+			online[i] = current
+			found = true
+			break
+		}
+	}
+	if !found {
+		online = append(online, current)
 	}
 
 	event := &pb.Event{
@@ -195,12 +222,25 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 		r.mu.Lock()
 		if existing, ok := r.subscribers[deviceID]; ok && existing == ch {
 			delete(r.subscribers, deviceID)
+			close(ch)
 		}
 		r.mu.Unlock()
-		close(ch)
 	}
 
 	return ch, unsub
+}
+
+// ActiveSubscribers returns the device IDs that currently have an active
+// subscription stream.
+func (r *Registry) ActiveSubscribers() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ids := make([]string, 0, len(r.subscribers))
+	for id := range r.subscribers {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Broadcast sends event to all subscribers except excludeDevice. If a
@@ -290,6 +330,30 @@ func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error 
 	r.Broadcast(event, device.DeviceID)
 
 	return nil
+}
+
+// BroadcastDeviceRemoved sends a DeviceRemoved event to all subscribers except
+// the removed device.
+func (r *Registry) BroadcastDeviceRemoved(device *store.Device) {
+	event := &pb.Event{
+		Payload: &pb.Event_DeviceRemoved{
+			DeviceRemoved: &pb.DeviceRemovedEvent{
+				DeviceId: device.DeviceID,
+				Nickname: device.Nickname,
+			},
+		},
+	}
+	r.Broadcast(event, device.DeviceID)
+}
+
+// removeSubscriber removes and closes a subscriber channel if present.
+func (r *Registry) removeSubscriber(deviceID string) {
+	r.mu.Lock()
+	if ch, ok := r.subscribers[deviceID]; ok {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	r.mu.Unlock()
 }
 
 // sharesToProto converts store.Share records to pb.Share messages.
