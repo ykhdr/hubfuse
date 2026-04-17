@@ -9,7 +9,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 )
 
-func TestFormatAlreadyExistsWithContext(t *testing.T) {
+func TestFormat_AlreadyExistsWithContext(t *testing.T) {
 	err := grpcstatus.Error(codes.AlreadyExists, "nickname already taken")
 
 	got := Format(Wrap(err, &Context{Nickname: "alice"}), nil)
@@ -18,7 +18,7 @@ func TestFormatAlreadyExistsWithContext(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
-func TestFormatUnauthenticated(t *testing.T) {
+func TestFormat_Unauthenticated(t *testing.T) {
 	err := grpcstatus.Error(codes.Unauthenticated, "client certificate required")
 
 	got := Format(err, nil)
@@ -27,7 +27,7 @@ func TestFormatUnauthenticated(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
-func TestFormatDeviceNotFound(t *testing.T) {
+func TestFormat_DeviceNotFound(t *testing.T) {
 	err := grpcstatus.Error(codes.NotFound, `no device with nickname "bob"`)
 
 	got := Format(err, nil)
@@ -44,7 +44,7 @@ func TestIsNicknameTaken(t *testing.T) {
 	require.True(t, IsNicknameTaken(stringErr))
 }
 
-func TestFormatFallsBackToOriginal(t *testing.T) {
+func TestFormat_FallsBackToOriginal(t *testing.T) {
 	err := errors.New("plain failure")
 	got := Format(err, nil)
 	want := "error: plain failure"
