@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rogpeppe/go-internal/testscript"
@@ -18,11 +19,11 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "mkdtemp: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(dir)
 	binDir = dir
 
 	repo, err := repoRoot()
 	if err != nil {
+		os.RemoveAll(dir)
 		fmt.Fprintf(os.Stderr, "find repo root: %v\n", err)
 		os.Exit(1)
 	}
@@ -35,12 +36,15 @@ func TestMain(m *testing.M) {
 		cmd := exec.Command("go", "build", "-o", out, b.pkg)
 		cmd.Dir = repo
 		if combined, err := cmd.CombinedOutput(); err != nil {
+			os.RemoveAll(dir)
 			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", b.pkg, err, combined)
 			os.Exit(1)
 		}
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func TestCLI(t *testing.T) {
@@ -58,5 +62,5 @@ func repoRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(out[:len(out)-1]), nil // strip trailing newline
+	return strings.TrimRight(string(out), "\n"), nil
 }
