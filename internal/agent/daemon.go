@@ -10,6 +10,7 @@ import (
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	pb "github.com/ykhdr/hubfuse/proto"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // OnlineDevice holds the known state of a currently-online remote device.
@@ -115,6 +116,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.startSSH(ctx); err != nil {
 		return err
 	}
+
+	// Load any peer keys that were paired before this run (e.g. the daemon
+	// was restarted after previous pairings). This must happen after startSSH
+	// so that sshServer is non-nil.
+	d.reloadSSHAllowedKeys()
 
 	if err := d.registerAndSubscribe(ctx); err != nil {
 		return err
@@ -305,6 +311,36 @@ func (d *Daemon) isPaired(deviceID string) bool {
 	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
 	_, err := os.Stat(filepath.Join(knownDevicesDir, deviceID+".pub"))
 	return err == nil
+}
+
+// reloadSSHAllowedKeys reads all *.pub files from the known_devices directory
+// and updates the SSH server's allowed-key set. This must be called after a
+// new peer key is saved (e.g. from handlePairingCompleted) so that inbound
+// SSHFS connections from the newly paired peer are immediately authenticated.
+func (d *Daemon) reloadSSHAllowedKeys() {
+	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
+	deviceIDs, err := ListPairedDevices(knownDevicesDir)
+	if err != nil {
+		d.logger.Warn("reload ssh allowed keys: list paired devices", "error", err)
+		return
+	}
+
+	keys := make(map[string]gossh.PublicKey, len(deviceIDs))
+	for _, id := range deviceIDs {
+		raw, loadErr := LoadPeerPublicKey(knownDevicesDir, id)
+		if loadErr != nil {
+			d.logger.Warn("reload ssh allowed keys: load peer key", "device_id", id, "error", loadErr)
+			continue
+		}
+		parsed, _, _, _, parseErr := gossh.ParseAuthorizedKey([]byte(raw))
+		if parseErr != nil {
+			d.logger.Warn("reload ssh allowed keys: parse peer key", "device_id", id, "error", parseErr)
+			continue
+		}
+		keys[id] = parsed
+	}
+
+	d.sshServer.UpdateAllowedKeys(keys)
 }
 
 // protoToOnlineDevice converts a proto DeviceInfo to our local OnlineDevice type.
