@@ -1,4 +1,4 @@
-.PHONY: proto-gen build test test-unit test-integration test-cli vet lint clean install
+.PHONY: proto-gen build test test-unit test-integration test-cli test-scenarios vet lint clean install
 
 proto-gen:
 	protoc --go_out=. --go-grpc_out=. --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative proto/hubfuse.proto
@@ -6,7 +6,7 @@ proto-gen:
 build:
 	go build ./...
 
-test: test-unit test-integration test-cli
+test: test-unit test-integration test-cli test-scenarios
 
 test-unit:
 	go test ./internal/...
@@ -16,6 +16,9 @@ test-integration:
 
 test-cli:
 	go test ./tests/cli/...
+
+test-scenarios:
+	go test ./tests/scenarios/... -timeout 180s
 
 vet:
 	go vet ./...

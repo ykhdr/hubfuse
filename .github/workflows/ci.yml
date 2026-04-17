@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  merge_group:
 
 permissions:
   contents: read
@@ -106,6 +107,20 @@ jobs:
 
       - name: Run CLI tests
         run: make test-cli
+
+  test-scenarios:
+    name: Scenario Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run scenario tests
+        run: make test-scenarios
 
   proto-check:
     name: Proto Staleness Check
