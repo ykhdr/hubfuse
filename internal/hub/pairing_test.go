@@ -14,8 +14,8 @@ import (
 func setupPairingDevices(t *testing.T, r *Registry) {
 	t.Helper()
 
-	joinDevice(t, r, "dev-a", "alice")
-	joinDevice(t, r, "dev-b", "bob")
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
 	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
 	registerDevice(t, r, "dev-b", "10.0.0.2", 22)
 }
@@ -147,14 +147,34 @@ func TestRequestPairing_OfflineDevice(t *testing.T) {
 	ctx := context.Background()
 
 	// Create two devices but only register (online) dev-a.
-	joinDevice(t, r, "dev-a", "alice")
-	joinDevice(t, r, "dev-b", "bob")
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
 	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
 	// dev-b remains offline.
 
 	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	if err == nil {
 		t.Fatal("expected error for offline target device, got nil")
+	}
+	if err != common.ErrDeviceOffline {
+		t.Fatalf("error = %v, want ErrDeviceOffline", err)
+	}
+}
+
+func TestRequestPairing_RegisteredDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
+	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
+
+	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
+	if err == nil {
+		t.Fatal("expected error for registered target device, got nil")
+	}
+	if err != common.ErrDeviceOffline {
+		t.Fatalf("error = %v, want ErrDeviceOffline", err)
 	}
 }
 

@@ -12,7 +12,7 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 	r := newTestRegistry(t)
 	bg := context.Background()
 
-	joinDevice(t, r, "dev-stale2", "stale-device2")
+	joinDevice(t, r, "dev-stale2", "stale-device2", "")
 
 	// Set the device online. Its last_heartbeat stays at zero (always stale).
 	if err := r.store.UpdateDeviceStatus(bg, "dev-stale2", store.StatusOnline, "10.0.0.1", 22); err != nil {
@@ -46,7 +46,7 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	monCtx, cancel := context.WithCancel(context.Background())
 	bg := context.Background()
 
-	joinDevice(t, r, "dev-fresh", "fresh-device")
+	joinDevice(t, r, "dev-fresh", "fresh-device", "")
 	registerDevice(t, r, "dev-fresh", "10.0.0.1", 22)
 
 	// Update heartbeat to now so the device is fresh.
@@ -75,8 +75,8 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	joinDevice(t, r, "dev-stale", "stale-device")
-	joinDevice(t, r, "dev-watcher", "watcher")
+	joinDevice(t, r, "dev-stale", "stale-device", "")
+	joinDevice(t, r, "dev-watcher", "watcher", "")
 
 	// Put dev-stale online with stale heartbeat.
 	if err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22); err != nil {

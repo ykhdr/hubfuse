@@ -32,9 +32,9 @@ func newTestRegistry(t *testing.T) *Registry {
 }
 
 // joinDevice is a helper that calls Join and fatals on error.
-func joinDevice(t *testing.T, r *Registry, deviceID, nickname string) {
+func joinDevice(t *testing.T, r *Registry, deviceID, nickname, ip string) {
 	t.Helper()
-	if _, _, _, err := r.Join(context.Background(), deviceID, nickname); err != nil {
+	if _, _, _, err := r.Join(context.Background(), deviceID, nickname, ip); err != nil {
 		t.Fatalf("Join(%q, %q): %v", deviceID, nickname, err)
 	}
 }
@@ -55,7 +55,7 @@ func TestJoin_Success(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice")
+	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice", "1.2.3.4")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -77,8 +77,11 @@ func TestJoin_Success(t *testing.T) {
 	if d.Nickname != "alice" {
 		t.Errorf("Nickname = %q, want %q", d.Nickname, "alice")
 	}
-	if d.Status != store.StatusOffline {
-		t.Errorf("Status = %q, want %q", d.Status, store.StatusOffline)
+	if d.Status != store.StatusRegistered {
+		t.Errorf("Status = %q, want %q", d.Status, store.StatusRegistered)
+	}
+	if d.LastIP != "1.2.3.4" {
+		t.Errorf("LastIP = %q, want 1.2.3.4", d.LastIP)
 	}
 }
 
@@ -86,11 +89,11 @@ func TestJoin_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	if _, _, _, err := r.Join(ctx, "dev-1", "alice"); err != nil {
+	if _, _, _, err := r.Join(ctx, "dev-1", "alice", ""); err != nil {
 		t.Fatalf("first Join: %v", err)
 	}
 
-	_, _, _, err := r.Join(ctx, "dev-2", "alice")
+	_, _, _, err := r.Join(ctx, "dev-2", "alice", "")
 	if err == nil {
 		t.Fatal("expected error for duplicate nickname, got nil")
 	}
@@ -103,12 +106,12 @@ func TestJoin_DuplicateDeviceID(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	if _, _, _, err := r.Join(ctx, "dev-1", "alice"); err != nil {
+	if _, _, _, err := r.Join(ctx, "dev-1", "alice", ""); err != nil {
 		t.Fatalf("first Join: %v", err)
 	}
 
 	// Same device_id, different nickname — store should reject the duplicate.
-	_, _, _, err := r.Join(ctx, "dev-1", "bob")
+	_, _, _, err := r.Join(ctx, "dev-1", "bob", "")
 	if err == nil {
 		t.Fatal("expected error for duplicate device_id, got nil")
 	}
@@ -119,8 +122,8 @@ func TestJoin_DuplicateDeviceID(t *testing.T) {
 func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	r := newTestRegistry(t)
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	online := registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 	if len(online) != 1 {
@@ -137,11 +140,34 @@ func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	}
 }
 
+func TestRegister_SetsHeartbeat(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+
+	before := time.Now()
+	if _, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, nil, 1); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if d.LastHeartbeat.IsZero() || d.LastHeartbeat.Before(before) {
+		t.Errorf("LastHeartbeat not set on register, got %v", d.LastHeartbeat)
+	}
+	if d.Status != store.StatusOnline {
+		t.Errorf("Status = %q, want online", d.Status)
+	}
+}
+
 func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
 	r := newTestRegistry(t)
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	// Subscribe dev-2 before dev-1 registers.
 	ch, unsub := r.Subscribe("dev-2")
@@ -166,7 +192,7 @@ func TestRegister_WithShares(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	shares := []*pb.Share{
 		{Alias: "docs", Permissions: "ro", AllowedDevices: []string{"all"}},
@@ -194,7 +220,7 @@ func TestHeartbeat_UpdatesTimestamp(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	before := time.Now()
 	if err := r.Heartbeat(ctx, "dev-1"); err != nil {
@@ -301,8 +327,8 @@ func TestDeregister_MarksOfflineAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, unsub := r.Subscribe("dev-2")
@@ -339,7 +365,7 @@ func TestDeregister_RemovesSubscriber(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, _ := r.Subscribe("dev-1")
@@ -373,8 +399,8 @@ func TestUpdateShares_StoresAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
@@ -415,7 +441,7 @@ func TestRename_Success(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
+	joinDevice(t, r, "dev-1", "alice", "")
 
 	if err := r.Rename(ctx, "dev-1", "alice2"); err != nil {
 		t.Fatalf("Rename: %v", err)
@@ -434,8 +460,8 @@ func TestRename_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 
 	err := r.Rename(ctx, "dev-1", "bob")
 	if err == nil {
@@ -452,8 +478,8 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	joinDevice(t, r, "dev-1", "alice")
-	joinDevice(t, r, "dev-2", "bob")
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
 	ch, unsub := r.Subscribe("dev-2")
