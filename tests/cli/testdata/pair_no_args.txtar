@@ -1,0 +1,5 @@
+# Regression for issue #20: `hubfuse pair` with no arguments must show
+# both the arg-validation error and the usage block.
+! exec hubfuse pair
+stderr 'accepts 1 arg\(s\), received 0'
+stderr 'Usage:'

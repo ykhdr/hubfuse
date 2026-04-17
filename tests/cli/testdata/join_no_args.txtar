@@ -1,0 +1,6 @@
+# Regression for issue #20: `hubfuse join` with no arguments must show
+# both the Cobra arg-validation error and the usage block.
+! exec hubfuse join
+stderr 'accepts 1 arg\(s\), received 0'
+stderr 'Usage:'
+stderr 'hubfuse join'

@@ -1,0 +1,3 @@
+# No --version flag or version subcommand exists in hubfuse yet.
+# This test is skipped until a version command is added.
+skip 'no version flag or version subcommand in hubfuse CLI'

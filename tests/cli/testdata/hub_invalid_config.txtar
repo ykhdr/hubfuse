@@ -1,0 +1,10 @@
+# Malformed KDL config should produce a parse error, not a stack trace.
+env HOME=$WORK/home
+mkdir -p $WORK/home/.hubfuse-hub
+cp config.kdl $WORK/home/.hubfuse-hub/config.kdl
+! exec hubfuse-hub start --data-dir $WORK/home/.hubfuse-hub
+stderr 'parse|invalid|syntax'
+! stderr 'panic'
+
+-- config.kdl --
+this is { not valid kdl
