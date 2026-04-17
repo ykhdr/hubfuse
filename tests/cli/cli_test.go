@@ -23,7 +23,7 @@ func TestMain(m *testing.M) {
 
 	repo, err := repoRoot()
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		fmt.Fprintf(os.Stderr, "find repo root: %v\n", err)
 		os.Exit(1)
 	}
@@ -36,14 +36,14 @@ func TestMain(m *testing.M) {
 		cmd := exec.Command("go", "build", "-o", out, b.pkg)
 		cmd.Dir = repo
 		if combined, err := cmd.CombinedOutput(); err != nil {
-			os.RemoveAll(dir)
+			_ = os.RemoveAll(dir)
 			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", b.pkg, err, combined)
 			os.Exit(1)
 		}
 	}
 
 	code := m.Run()
-	os.RemoveAll(dir)
+	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
 
