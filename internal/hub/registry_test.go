@@ -140,6 +140,29 @@ func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	}
 }
 
+func TestRegister_SetsHeartbeat(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+
+	before := time.Now()
+	if _, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, nil, 1); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if d.LastHeartbeat.IsZero() || d.LastHeartbeat.Before(before) {
+		t.Errorf("LastHeartbeat not set on register, got %v", d.LastHeartbeat)
+	}
+	if d.Status != store.StatusOnline {
+		t.Errorf("Status = %q, want online", d.Status)
+	}
+}
+
 func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
 	r := newTestRegistry(t)
 

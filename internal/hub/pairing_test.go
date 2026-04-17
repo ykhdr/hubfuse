@@ -156,6 +156,26 @@ func TestRequestPairing_OfflineDevice(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for offline target device, got nil")
 	}
+	if err != common.ErrDeviceOffline {
+		t.Fatalf("error = %v, want ErrDeviceOffline", err)
+	}
+}
+
+func TestRequestPairing_RegisteredDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-a", "alice", "")
+	joinDevice(t, r, "dev-b", "bob", "")
+	registerDevice(t, r, "dev-a", "10.0.0.1", 22)
+
+	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
+	if err == nil {
+		t.Fatal("expected error for registered target device, got nil")
+	}
+	if err != common.ErrDeviceOffline {
+		t.Fatalf("error = %v, want ErrDeviceOffline", err)
+	}
 }
 
 // --- ConfirmPairing ---

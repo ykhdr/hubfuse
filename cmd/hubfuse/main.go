@@ -327,12 +327,12 @@ func devicesCmd() *cobra.Command {
 				return nil
 			}
 
-			fmt.Printf("%-40s  %-20s  %-8s  %s\n", "DEVICE ID", "NICKNAME", "STATUS", "IP")
-			fmt.Printf("%-40s  %-20s  %-8s  %s\n",
+			fmt.Printf("%-40s  %-20s  %-10s  %s\n", "DEVICE ID", "NICKNAME", "STATUS", "IP")
+			fmt.Printf("%-40s  %-20s  %-10s  %s\n",
 				strings.Repeat("-", 40), strings.Repeat("-", 20),
-				strings.Repeat("-", 8), strings.Repeat("-", 15))
+				strings.Repeat("-", 10), strings.Repeat("-", 15))
 			for _, d := range resp.Devices {
-				fmt.Printf("%-40s  %-20s  %-8s  %s\n", d.DeviceId, d.Nickname, d.Status, d.Ip)
+				fmt.Printf("%-40s  %-20s  %-10s  %s\n", d.DeviceId, d.Nickname, d.Status, d.Ip)
 			}
 			return nil
 		},

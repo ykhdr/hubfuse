@@ -8,7 +8,7 @@ type DeviceStatus string
 const (
 	StatusOnline     DeviceStatus = "online"
 	StatusOffline    DeviceStatus = "offline"
-	StatusRegistered DeviceStatus = "registered" // joined but not yet registered/connected
+	StatusRegistered DeviceStatus = "registered" // registered with the hub but not yet connected (not demoted by heartbeat monitor)
 )
 
 // Permission represents the access level for a share.

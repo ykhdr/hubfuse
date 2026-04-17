@@ -352,8 +352,8 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	if st.Code() != codes.Unavailable {
 		t.Errorf("expected Unavailable, got %v", st.Code())
 	}
-	if !strings.Contains(st.Message(), "not currently connected") {
-		t.Errorf("expected 'not currently connected' in message, got %q", st.Message())
+	if !strings.Contains(st.Message(), "device offline") {
+		t.Errorf("expected 'device offline' in message, got %q", st.Message())
 	}
 }
 

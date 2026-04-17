@@ -78,12 +78,13 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
 		return nil, err
 	}
-	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
-		return nil, err
-	}
 
 	storeShares := sharesFromProto(deviceID, shares)
 	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
+		return nil, err
+	}
+
+	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
 		return nil, err
 	}
 
