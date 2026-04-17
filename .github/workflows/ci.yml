@@ -94,6 +94,19 @@ jobs:
       - name: Run integration tests
         run: make test-integration
 
+  test-cli:
+    name: CLI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run CLI tests
+        run: make test-cli
+
   proto-check:
     name: Proto Staleness Check
     runs-on: ubuntu-latest
