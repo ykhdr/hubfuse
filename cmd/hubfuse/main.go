@@ -32,6 +32,15 @@ func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hubfuse",
 		Short: "HubFuse agent daemon",
+		// main prints errors itself via clierrors.Format, so silence Cobra's
+		// default "Error: ..." prefix. Usage is only suppressed once we've
+		// passed arg/flag validation (see PersistentPreRunE below) so that
+		// malformed-command errors still print the usage block.
+		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return nil
+		},
 	}
 
 	shareCmd := &cobra.Command{
@@ -57,7 +66,6 @@ func rootCmd() *cobra.Command {
 		shareCmd,
 		mountCmd,
 	)
-	silenceAll(cmd)
 	return cmd
 }
 
@@ -673,14 +681,6 @@ func mountListCmd() *cobra.Command {
 			}
 			return nil
 		},
-	}
-}
-
-func silenceAll(cmd *cobra.Command) {
-	cmd.SilenceUsage = true
-	cmd.SilenceErrors = true
-	for _, child := range cmd.Commands() {
-		silenceAll(child)
 	}
 }
 
