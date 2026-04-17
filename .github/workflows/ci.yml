@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [master]
   merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -111,7 +112,12 @@ jobs:
   test-scenarios:
     name: Scenario Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group' || github.event_name == 'push'
+    # Scenario tests are expensive (multi-process, ~20s) — run them only when
+    # relevant: at merge time (merge_group), post-merge on master (push), or
+    # on demand via the Actions UI (workflow_dispatch). Branch protection on
+    # master gates merges on this check, so a PR cannot be merged until this
+    # job has been run (e.g. via "Run workflow") and reported success.
+    if: github.event_name == 'merge_group' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
