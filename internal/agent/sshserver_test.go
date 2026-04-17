@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -20,29 +22,19 @@ import (
 func generateTestKeyPair(t *testing.T, dir string) (gossh.Signer, gossh.PublicKey) {
 	t.Helper()
 	_, err := GenerateSSHKeyPair(dir)
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	privBytes, err := os.ReadFile(filepath.Join(dir, "id_ed25519"))
-	if err != nil {
-		t.Fatalf("read private key: %v", err)
-	}
+	require.NoError(t, err, "read private key")
 
 	signer, err := gossh.ParsePrivateKey(privBytes)
-	if err != nil {
-		t.Fatalf("parse private key: %v", err)
-	}
+	require.NoError(t, err, "parse private key")
 
 	pubBytes, err := os.ReadFile(filepath.Join(dir, "id_ed25519.pub"))
-	if err != nil {
-		t.Fatalf("read public key: %v", err)
-	}
+	require.NoError(t, err, "read public key")
 
 	pub, _, _, _, err := gossh.ParseAuthorizedKey(pubBytes)
-	if err != nil {
-		t.Fatalf("parse public key: %v", err)
-	}
+	require.NoError(t, err, "parse public key")
 
 	return signer, pub
 }
@@ -53,15 +45,11 @@ func startTestServer(t *testing.T, hostKeyPath string) (*SSHServer, string, cont
 	t.Helper()
 
 	srv, err := NewSSHServer(0, hostKeyPath, discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	// Use port 0 to get a random port.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen(): %v", err)
-	}
+	require.NoError(t, err, "net.Listen()")
 	addr := ln.Addr().String()
 
 	// Override the listener with our pre-bound one.
@@ -110,57 +98,43 @@ func dialSSH(t *testing.T, addr string, signer gossh.Signer) (*gossh.Client, err
 
 func TestNewSSHServer_MissingHostKey(t *testing.T) {
 	_, err := NewSSHServer(2222, "/does/not/exist/id_ed25519", discardLogger())
-	if err == nil {
-		t.Fatal("NewSSHServer() expected error for missing host key, got nil")
-	}
+	assert.Error(t, err, "NewSSHServer() expected error for missing host key")
 }
 
 func TestNewSSHServer_InvalidHostKey(t *testing.T) {
 	dir := t.TempDir()
 	badKey := filepath.Join(dir, "bad_key")
-	if err := os.WriteFile(badKey, []byte("not a valid pem key"), 0600); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(badKey, []byte("not a valid pem key"), 0600), "WriteFile()")
 
 	_, err := NewSSHServer(2222, badKey, discardLogger())
-	if err == nil {
-		t.Fatal("NewSSHServer() expected error for invalid host key, got nil")
-	}
+	assert.Error(t, err, "NewSSHServer() expected error for invalid host key")
 }
 
 func TestNewSSHServer_ValidHostKey(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	hostKeyPath := filepath.Join(dir, "id_ed25519")
-	_, err := NewSSHServer(2222, hostKeyPath, discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	_, err = NewSSHServer(2222, hostKeyPath, discardLogger())
+	require.NoError(t, err, "NewSSHServer()")
 }
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
 
 func TestSSHServer_StartStop(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	hostKeyPath := filepath.Join(dir, "id_ed25519")
 	srv, err := NewSSHServer(0, hostKeyPath, discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen(): %v", err)
-	}
+	require.NoError(t, err, "net.Listen()")
 	addr := ln.Addr().String()
 
 	srv.mu.Lock()
@@ -191,20 +165,16 @@ func TestSSHServer_StartStop(t *testing.T) {
 
 	// Verify the server is reachable by connecting.
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial server: %v", err)
-	}
+	require.NoError(t, err, "dial server")
 	conn.Close()
 
 	cancel()
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Errorf("server exited with error: %v", err)
-		}
+		assert.NoError(t, err, "server exited with error")
 	case <-time.After(3 * time.Second):
-		t.Error("server did not stop within timeout")
+		t.Fatal("server did not stop within timeout")
 	}
 }
 
@@ -214,9 +184,8 @@ func TestSSHServer_AllowedKeyAuthentication(t *testing.T) {
 	hostDir := t.TempDir()
 	clientDir := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	clientSigner, clientPub := generateTestKeyPair(t, clientDir)
 
@@ -229,9 +198,7 @@ func TestSSHServer_AllowedKeyAuthentication(t *testing.T) {
 	})
 
 	client, err := dialSSH(t, addr, clientSigner)
-	if err != nil {
-		t.Fatalf("SSH dial with allowed key: %v", err)
-	}
+	require.NoError(t, err, "SSH dial with allowed key")
 	defer client.Close()
 }
 
@@ -240,9 +207,8 @@ func TestSSHServer_DeniedKeyAuthentication(t *testing.T) {
 	allowedDir := t.TempDir()
 	deniedDir := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	_, allowedPub := generateTestKeyPair(t, allowedDir)
 	deniedSigner, _ := generateTestKeyPair(t, deniedDir)
@@ -255,19 +221,16 @@ func TestSSHServer_DeniedKeyAuthentication(t *testing.T) {
 		"allowed-device": allowedPub,
 	})
 
-	_, err := dialSSH(t, addr, deniedSigner)
-	if err == nil {
-		t.Fatal("SSH dial with denied key succeeded, expected failure")
-	}
+	_, err = dialSSH(t, addr, deniedSigner)
+	assert.Error(t, err, "SSH dial with denied key succeeded, expected failure")
 }
 
 func TestSSHServer_NoAllowedKeys(t *testing.T) {
 	hostDir := t.TempDir()
 	clientDir := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	clientSigner, _ := generateTestKeyPair(t, clientDir)
 
@@ -277,31 +240,24 @@ func TestSSHServer_NoAllowedKeys(t *testing.T) {
 	// No keys allowed.
 	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{})
 
-	_, err := dialSSH(t, addr, clientSigner)
-	if err == nil {
-		t.Fatal("SSH dial with no allowed keys succeeded, expected failure")
-	}
+	_, err = dialSSH(t, addr, clientSigner)
+	assert.Error(t, err, "SSH dial with no allowed keys succeeded, expected failure")
 }
 
 // ─── UpdateShares / SFTP alias mapping ───────────────────────────────────────
 
 func TestSSHServer_UpdateShares_RebuildsSFTPRoot(t *testing.T) {
 	hostDir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	srv, err := NewSSHServer(0, filepath.Join(hostDir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	// Create a real directory to be shared.
 	sharedDir := t.TempDir()
 	testFile := filepath.Join(sharedDir, "hello.txt")
-	if err := os.WriteFile(testFile, []byte("hello"), 0644); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(testFile, []byte("hello"), 0644), "WriteFile()")
 
 	shares := map[string]string{"myalias": sharedDir}
 	srv.UpdateShares(shares)
@@ -309,33 +265,22 @@ func TestSSHServer_UpdateShares_RebuildsSFTPRoot(t *testing.T) {
 	// Verify symlink was created.
 	linkPath := filepath.Join(srv.sftpRoot, "myalias")
 	info, err := os.Lstat(linkPath)
-	if err != nil {
-		t.Fatalf("Lstat(%q): %v", linkPath, err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("%q is not a symlink", linkPath)
-	}
+	require.NoError(t, err, "Lstat(%q)", linkPath)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink, "%q is not a symlink", linkPath)
 
 	// Resolve and verify target.
 	target, err := os.Readlink(linkPath)
-	if err != nil {
-		t.Fatalf("Readlink(%q): %v", linkPath, err)
-	}
-	if target != sharedDir {
-		t.Errorf("symlink target = %q, want %q", target, sharedDir)
-	}
+	require.NoError(t, err, "Readlink(%q)", linkPath)
+	assert.Equal(t, sharedDir, target, "symlink target")
 }
 
 func TestSSHServer_UpdateShares_ReplacesOldSymlinks(t *testing.T) {
 	hostDir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	srv, err := NewSSHServer(0, filepath.Join(hostDir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	dir1 := t.TempDir()
 	dir2 := t.TempDir()
@@ -344,14 +289,12 @@ func TestSSHServer_UpdateShares_ReplacesOldSymlinks(t *testing.T) {
 	srv.UpdateShares(map[string]string{"alias-new": dir2})
 
 	// Old symlink should be gone.
-	if _, err := os.Lstat(filepath.Join(srv.sftpRoot, "alias-old")); err == nil {
-		t.Error("old symlink still exists after UpdateShares")
-	}
+	_, err = os.Lstat(filepath.Join(srv.sftpRoot, "alias-old"))
+	assert.Error(t, err, "old symlink still exists after UpdateShares")
 
 	// New symlink should exist.
-	if _, err := os.Lstat(filepath.Join(srv.sftpRoot, "alias-new")); err != nil {
-		t.Errorf("new symlink not found: %v", err)
-	}
+	_, err = os.Lstat(filepath.Join(srv.sftpRoot, "alias-new"))
+	assert.NoError(t, err, "new symlink not found")
 }
 
 // ─── SFTP file access ─────────────────────────────────────────────────────────
@@ -361,17 +304,14 @@ func TestSSHServer_SFTPFileAccess(t *testing.T) {
 	clientDir := t.TempDir()
 	sharedDir := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 	clientSigner, clientPub := generateTestKeyPair(t, clientDir)
 
 	// Write a test file into the shared directory.
 	want := "sftp-test-content"
 	testFile := filepath.Join(sharedDir, "test.txt")
-	if err := os.WriteFile(testFile, []byte(want), 0644); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(testFile, []byte(want), 0644), "WriteFile()")
 
 	srv, addr, cancel := startTestServer(t, filepath.Join(hostDir, "id_ed25519"))
 	defer cancel()
@@ -381,34 +321,24 @@ func TestSSHServer_SFTPFileAccess(t *testing.T) {
 
 	// Dial SSH.
 	sshClient, err := dialSSH(t, addr, clientSigner)
-	if err != nil {
-		t.Fatalf("SSH dial: %v", err)
-	}
+	require.NoError(t, err, "SSH dial")
 	defer sshClient.Close()
 
 	// Open SFTP session.
 	sftpClient, err := sftp.NewClient(sshClient)
-	if err != nil {
-		t.Fatalf("sftp.NewClient(): %v", err)
-	}
+	require.NoError(t, err, "sftp.NewClient()")
 	defer sftpClient.Close()
 
 	// Read a file through the alias symlink path.
 	aliasFilePath := filepath.Join(srv.sftpRoot, "myshare", "test.txt")
 	f, err := sftpClient.Open(aliasFilePath)
-	if err != nil {
-		t.Fatalf("sftp.Open(%q): %v", aliasFilePath, err)
-	}
+	require.NoError(t, err, "sftp.Open(%q)", aliasFilePath)
 	defer f.Close()
 
 	data, err := io.ReadAll(f)
-	if err != nil {
-		t.Fatalf("io.ReadAll(): %v", err)
-	}
+	require.NoError(t, err, "io.ReadAll()")
 
-	if string(data) != want {
-		t.Errorf("file contents = %q, want %q", string(data), want)
-	}
+	assert.Equal(t, want, string(data), "file contents")
 }
 
 // ─── UpdateAllowedKeys ────────────────────────────────────────────────────────
@@ -418,9 +348,8 @@ func TestSSHServer_UpdateAllowedKeys_ReplacesExisting(t *testing.T) {
 	clientDir1 := t.TempDir()
 	clientDir2 := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(host): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair(host)")
 
 	signer1, pub1 := generateTestKeyPair(t, clientDir1)
 	_, pub2 := generateTestKeyPair(t, clientDir2)
@@ -432,9 +361,7 @@ func TestSSHServer_UpdateAllowedKeys_ReplacesExisting(t *testing.T) {
 	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{"dev1": pub1})
 
 	client, err := dialSSH(t, addr, signer1)
-	if err != nil {
-		t.Fatalf("dial with key1 (should succeed): %v", err)
-	}
+	require.NoError(t, err, "dial with key1 (should succeed)")
 	client.Close()
 
 	// Now replace with only key2.
@@ -442,23 +369,18 @@ func TestSSHServer_UpdateAllowedKeys_ReplacesExisting(t *testing.T) {
 
 	// key1 should now be denied.
 	_, err = dialSSH(t, addr, signer1)
-	if err == nil {
-		t.Fatal("dial with revoked key1 succeeded, expected failure")
-	}
+	assert.Error(t, err, "dial with revoked key1 succeeded, expected failure")
 }
 
 // ─── publicKeyCallback ────────────────────────────────────────────────────────
 
 func TestSSHServer_PublicKeyCallback_Allowed(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	srv, err := NewSSHServer(0, filepath.Join(dir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	clientDir := t.TempDir()
 	_, pub := generateTestKeyPair(t, clientDir)
@@ -466,77 +388,57 @@ func TestSSHServer_PublicKeyCallback_Allowed(t *testing.T) {
 	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{"device-1": pub})
 
 	perms, err := srv.publicKeyCallback(nil, pub)
-	if err != nil {
-		t.Fatalf("publicKeyCallback() rejected allowed key: %v", err)
-	}
-	if perms == nil {
-		t.Error("publicKeyCallback() returned nil Permissions, want non-nil")
-	}
+	require.NoError(t, err, "publicKeyCallback() rejected allowed key")
+	assert.NotNil(t, perms, "publicKeyCallback() returned nil Permissions, want non-nil")
 }
 
 func TestSSHServer_PublicKeyCallback_Denied(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	srv, err := NewSSHServer(0, filepath.Join(dir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	// Generate a key but don't add it to allowed keys.
 	clientDir := t.TempDir()
 	_, pub := generateTestKeyPair(t, clientDir)
 
 	_, err = srv.publicKeyCallback(nil, pub)
-	if err == nil {
-		t.Fatal("publicKeyCallback() accepted unauthorized key, want error")
-	}
-	if !strings.Contains(err.Error(), "not authorized") {
-		t.Errorf("publicKeyCallback() error = %q, want to contain \"not authorized\"", err.Error())
-	}
+	require.Error(t, err, "publicKeyCallback() accepted unauthorized key, want error")
+	assert.True(t, strings.Contains(err.Error(), "not authorized"),
+		"publicKeyCallback() error = %q, want to contain \"not authorized\"", err.Error())
 }
 
 // ─── Stop ─────────────────────────────────────────────────────────────────────
 
 func TestSSHServer_Stop_NilListenerIsNoOp(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	srv, err := NewSSHServer(0, filepath.Join(dir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	// listener is nil, Stop should not panic or error.
-	if err := srv.Stop(); err != nil {
-		t.Errorf("Stop() on nil listener: %v", err)
-	}
+	assert.NoError(t, srv.Stop(), "Stop() on nil listener")
 }
 
 // ─── Integration: Start with port ─────────────────────────────────────────────
 
 func TestSSHServer_StartListensOnPort(t *testing.T) {
 	hostDir := t.TempDir()
-	if _, err := GenerateSSHKeyPair(hostDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(hostDir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	// Find a free port.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
+	require.NoError(t, err, "find free port")
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
 	srv, err := NewSSHServer(port, filepath.Join(hostDir, "id_ed25519"), discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer(): %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer()")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})

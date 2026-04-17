@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A tiny helper child that waits for SIGTERM and exits 0. The test
@@ -24,9 +27,7 @@ func TestSignalStop_SendsSIGTERM(t *testing.T) {
 		"HUBFUSE_TEST_ROLE=ready",
 		"HUBFUSE_TEST_PIDFILE="+pidPath,
 	)
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
+	require.NoError(t, cmd.Start(), "start helper")
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
 
 	// Wait for the child to write its pidfile.
@@ -38,9 +39,7 @@ func TestSignalStop_SendsSIGTERM(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if err := SignalStop(pidPath, "testproc"); err != nil {
-		t.Fatalf("SignalStop: %v", err)
-	}
+	require.NoError(t, SignalStop(pidPath, "testproc"))
 
 	// Wait for the child to exit.
 	waited := make(chan error, 1)
@@ -54,26 +53,18 @@ func TestSignalStop_SendsSIGTERM(t *testing.T) {
 
 func TestSignalStop_NoPIDFile(t *testing.T) {
 	err := SignalStop(filepath.Join(t.TempDir(), "nope.pid"), "x")
-	if err == nil {
-		t.Fatal("SignalStop with missing pidfile should error")
-	}
+	assert.Error(t, err, "SignalStop with missing pidfile should error")
 }
 
 func TestReportStatus_Running(t *testing.T) {
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "live.pid")
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
-		t.Fatalf("seed pidfile: %v", err)
-	}
-	if err := ReportStatus(pidPath, "self"); err != nil {
-		t.Fatalf("ReportStatus: %v", err)
-	}
+	require.NoError(t, os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644), "seed pidfile")
+	assert.NoError(t, ReportStatus(pidPath, "self"))
 }
 
 func TestReportStatus_NotRunning(t *testing.T) {
-	if err := ReportStatus(filepath.Join(t.TempDir(), "nope.pid"), "absent"); err != nil {
-		t.Fatalf("ReportStatus: %v", err)
-	}
+	assert.NoError(t, ReportStatus(filepath.Join(t.TempDir(), "nope.pid"), "absent"))
 }
 
 // TestReadPID_TrimsNewline: WritePIDFile writes "pid\n"; ReadPID
@@ -81,14 +72,8 @@ func TestReportStatus_NotRunning(t *testing.T) {
 func TestReadPID_TrimsNewline(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.pid")
-	if err := os.WriteFile(p, []byte("12345\n"), 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	require.NoError(t, os.WriteFile(p, []byte("12345\n"), 0o644), "seed")
 	pid, err := ReadPID(p)
-	if err != nil {
-		t.Fatalf("ReadPID: %v", err)
-	}
-	if pid != 12345 {
-		t.Fatalf("pid=%d; want 12345", pid)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 12345, pid)
 }

@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ─── NormalizePermissions ─────────────────────────────────────────────────────
@@ -23,9 +26,7 @@ func TestNormalizePermissions(t *testing.T) {
 
 	for _, tc := range tests {
 		got := NormalizePermissions(tc.input)
-		if got != tc.want {
-			t.Errorf("NormalizePermissions(%q) = %q, want %q", tc.input, got, tc.want)
-		}
+		assert.Equal(t, tc.want, got, "NormalizePermissions(%q)", tc.input)
 	}
 }
 
@@ -39,25 +40,19 @@ func TestExpandTilde_WithTilde(t *testing.T) {
 
 	got := ExpandTilde("~/foo/bar")
 	want := filepath.Join(home, "foo/bar")
-	if got != want {
-		t.Errorf("ExpandTilde(~/foo/bar) = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestExpandTilde_NoTilde(t *testing.T) {
 	path := "/absolute/path"
 	got := ExpandTilde(path)
-	if got != path {
-		t.Errorf("ExpandTilde(%q) = %q, want unchanged", path, got)
-	}
+	assert.Equal(t, path, got)
 }
 
 func TestExpandTilde_RelativePath(t *testing.T) {
 	path := "relative/path"
 	got := ExpandTilde(path)
-	if got != path {
-		t.Errorf("ExpandTilde(%q) = %q, want unchanged", path, got)
-	}
+	assert.Equal(t, path, got)
 }
 
 func TestExpandTilde_TildeOnly(t *testing.T) {
@@ -67,21 +62,15 @@ func TestExpandTilde_TildeOnly(t *testing.T) {
 	}
 
 	got := ExpandTilde("~")
-	if got != home {
-		t.Errorf("ExpandTilde(~) = %q, want %q", got, home)
-	}
+	assert.Equal(t, home, got)
 }
 
 // ─── DefaultConfig ────────────────────────────────────────────────────────────
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg == nil {
-		t.Fatal("DefaultConfig() returned nil")
-	}
-	if cfg.Agent.SSHPort != 2222 {
-		t.Errorf("default SSHPort = %d, want 2222", cfg.Agent.SSHPort)
-	}
+	require.NotNil(t, cfg)
+	assert.Equal(t, 2222, cfg.Agent.SSHPort)
 }
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
@@ -90,9 +79,8 @@ func writeTemp(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.kdl")
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("write temp config: %v", err)
-	}
+	err := os.WriteFile(path, []byte(content), 0644)
+	require.NoError(t, err, "write temp config")
 	return path
 }
 
@@ -103,12 +91,8 @@ device {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if cfg.Device.Nickname != "laptop" {
-		t.Errorf("Nickname = %q, want %q", cfg.Device.Nickname, "laptop")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "laptop", cfg.Device.Nickname)
 }
 
 func TestLoad_HubAddress(t *testing.T) {
@@ -118,12 +102,8 @@ hub {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if cfg.Hub.Address != "192.168.1.100:9090" {
-		t.Errorf("Address = %q, want %q", cfg.Hub.Address, "192.168.1.100:9090")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "192.168.1.100:9090", cfg.Hub.Address)
 }
 
 func TestLoad_AgentSSHPort(t *testing.T) {
@@ -133,12 +113,8 @@ agent {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if cfg.Agent.SSHPort != 2222 {
-		t.Errorf("SSHPort = %d, want 2222", cfg.Agent.SSHPort)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 2222, cfg.Agent.SSHPort)
 }
 
 func TestLoad_DefaultSSHPort(t *testing.T) {
@@ -149,12 +125,8 @@ device {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if cfg.Agent.SSHPort != 2222 {
-		t.Errorf("default SSHPort = %d, want 2222", cfg.Agent.SSHPort)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 2222, cfg.Agent.SSHPort)
 }
 
 func TestLoad_NormalizePermissions(t *testing.T) {
@@ -169,18 +141,10 @@ shares {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if len(cfg.Shares) != 2 {
-		t.Fatalf("len(Shares) = %d, want 2", len(cfg.Shares))
-	}
-	if cfg.Shares[0].Permissions != "ro" {
-		t.Errorf("Shares[0].Permissions = %q, want \"ro\"", cfg.Shares[0].Permissions)
-	}
-	if cfg.Shares[1].Permissions != "rw" {
-		t.Errorf("Shares[1].Permissions = %q, want \"rw\"", cfg.Shares[1].Permissions)
-	}
+	require.NoError(t, err)
+	require.Len(t, cfg.Shares, 2)
+	assert.Equal(t, "ro", cfg.Shares[0].Permissions)
+	assert.Equal(t, "rw", cfg.Shares[1].Permissions)
 }
 
 func TestLoad_TildeExpansion(t *testing.T) {
@@ -195,16 +159,10 @@ mounts {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if len(cfg.Mounts) != 1 {
-		t.Fatalf("len(Mounts) = %d, want 1", len(cfg.Mounts))
-	}
+	require.NoError(t, err)
+	require.Len(t, cfg.Mounts, 1)
 	want := filepath.Join(home, "remote/desktop")
-	if cfg.Mounts[0].To != want {
-		t.Errorf("Mounts[0].To = %q, want %q", cfg.Mounts[0].To, want)
-	}
+	assert.Equal(t, want, cfg.Mounts[0].To)
 }
 
 func TestLoad_Mounts(t *testing.T) {
@@ -215,25 +173,15 @@ mounts {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if len(cfg.Mounts) != 2 {
-		t.Fatalf("len(Mounts) = %d, want 2", len(cfg.Mounts))
-	}
-	if cfg.Mounts[0].Device != "desktop" {
-		t.Errorf("Mounts[0].Device = %q, want \"desktop\"", cfg.Mounts[0].Device)
-	}
-	if cfg.Mounts[1].Share != "media" {
-		t.Errorf("Mounts[1].Share = %q, want \"media\"", cfg.Mounts[1].Share)
-	}
+	require.NoError(t, err)
+	require.Len(t, cfg.Mounts, 2)
+	assert.Equal(t, "desktop", cfg.Mounts[0].Device)
+	assert.Equal(t, "media", cfg.Mounts[1].Share)
 }
 
 func TestLoad_NonExistentFile(t *testing.T) {
 	_, err := Load("/does/not/exist/config.kdl")
-	if err == nil {
-		t.Fatal("expected error for non-existent file, got nil")
-	}
+	assert.Error(t, err)
 }
 
 func TestLoad_FullConfig(t *testing.T) {
@@ -265,45 +213,21 @@ mounts {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
+	require.NoError(t, err)
 
-	if cfg.Device.Nickname != "laptop" {
-		t.Errorf("Nickname = %q, want \"laptop\"", cfg.Device.Nickname)
-	}
-	if cfg.Hub.Address != "192.168.1.100:9090" {
-		t.Errorf("Hub.Address = %q, want \"192.168.1.100:9090\"", cfg.Hub.Address)
-	}
-	if cfg.Agent.SSHPort != 2222 {
-		t.Errorf("Agent.SSHPort = %d, want 2222", cfg.Agent.SSHPort)
-	}
+	assert.Equal(t, "laptop", cfg.Device.Nickname)
+	assert.Equal(t, "192.168.1.100:9090", cfg.Hub.Address)
+	assert.Equal(t, 2222, cfg.Agent.SSHPort)
 
-	if len(cfg.Shares) != 2 {
-		t.Fatalf("len(Shares) = %d, want 2", len(cfg.Shares))
-	}
-	if cfg.Shares[0].Path != "/home/user/projects" {
-		t.Errorf("Shares[0].Path = %q, want \"/home/user/projects\"", cfg.Shares[0].Path)
-	}
-	if cfg.Shares[0].Alias != "projects" {
-		t.Errorf("Shares[0].Alias = %q, want \"projects\"", cfg.Shares[0].Alias)
-	}
-	if cfg.Shares[0].Permissions != "rw" {
-		t.Errorf("Shares[0].Permissions = %q, want \"rw\"", cfg.Shares[0].Permissions)
-	}
-	if len(cfg.Shares[0].AllowedDevices) != 2 {
-		t.Errorf("len(Shares[0].AllowedDevices) = %d, want 2", len(cfg.Shares[0].AllowedDevices))
-	}
+	require.Len(t, cfg.Shares, 2)
+	assert.Equal(t, "/home/user/projects", cfg.Shares[0].Path)
+	assert.Equal(t, "projects", cfg.Shares[0].Alias)
+	assert.Equal(t, "rw", cfg.Shares[0].Permissions)
+	assert.Len(t, cfg.Shares[0].AllowedDevices, 2)
 
-	if len(cfg.Mounts) != 2 {
-		t.Fatalf("len(Mounts) = %d, want 2", len(cfg.Mounts))
-	}
-	if cfg.Mounts[0].Device != "desktop" {
-		t.Errorf("Mounts[0].Device = %q, want \"desktop\"", cfg.Mounts[0].Device)
-	}
-	if cfg.Mounts[0].Share != "projects" {
-		t.Errorf("Mounts[0].Share = %q, want \"projects\"", cfg.Mounts[0].Share)
-	}
+	require.Len(t, cfg.Mounts, 2)
+	assert.Equal(t, "desktop", cfg.Mounts[0].Device)
+	assert.Equal(t, "projects", cfg.Mounts[0].Share)
 }
 
 func TestLoad_AllowedDevices(t *testing.T) {
@@ -315,29 +239,14 @@ shares {
 }
 `)
 	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load(): %v", err)
-	}
-	if len(cfg.Shares) != 1 {
-		t.Fatalf("len(Shares) = %d, want 1", len(cfg.Shares))
-	}
-	devices := cfg.Shares[0].AllowedDevices
-	if len(devices) != 3 {
-		t.Fatalf("len(AllowedDevices) = %d, want 3", len(devices))
-	}
-	want := []string{"device-a", "device-b", "device-c"}
-	for i, w := range want {
-		if devices[i] != w {
-			t.Errorf("AllowedDevices[%d] = %q, want %q", i, devices[i], w)
-		}
-	}
+	require.NoError(t, err)
+	require.Len(t, cfg.Shares, 1)
+	assert.Equal(t, []string{"device-a", "device-b", "device-c"}, cfg.Shares[0].AllowedDevices)
 }
 
 func TestLoad_InvalidKDL(t *testing.T) {
 	path := writeTemp(t, `this is not { valid kdl syntax !!!`)
 	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error for invalid KDL, got nil")
-	}
+	assert.Error(t, err)
 }
 

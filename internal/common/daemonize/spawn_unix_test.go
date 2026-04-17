@@ -10,6 +10,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestMain is the self-reexec trampoline. When the test binary is run
@@ -49,35 +52,23 @@ func TestSpawn_Success(t *testing.T) {
 	t.Setenv("HUBFUSE_TEST_PIDFILE", pidPath)
 
 	done := captureStdout(t, func() {
-		if err := Spawn(SpawnOpts{
+		require.NoError(t, Spawn(SpawnOpts{
 			LogPath:      logPath,
 			PIDFilePath:  pidPath,
 			ReadyTimeout: 3 * time.Second,
-		}); err != nil {
-			t.Fatalf("Spawn: %v", err)
-		}
+		}))
 	})
 
 	out := <-done
-	if !strings.Contains(out, "started (pid ") {
-		t.Fatalf("Spawn stdout = %q; expected started line", out)
-	}
+	assert.Contains(t, out, "started (pid ", "Spawn stdout expected started line")
 
 	pid, alive, err := CheckRunning(pidPath)
-	if err != nil {
-		t.Fatalf("CheckRunning: %v", err)
-	}
-	if !alive {
-		t.Fatal("child not alive after Spawn returned")
-	}
+	require.NoError(t, err)
+	require.True(t, alive, "child not alive after Spawn returned")
 
 	proc, err := os.FindProcess(pid)
-	if err != nil {
-		t.Fatalf("FindProcess: %v", err)
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("SIGTERM: %v", err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, proc.Signal(syscall.SIGTERM), "SIGTERM")
 	waitForDeath(t, pid, 5*time.Second)
 }
 
@@ -93,15 +84,9 @@ func TestSpawn_ChildDiesEarly(t *testing.T) {
 		PIDFilePath:  pidPath,
 		ReadyTimeout: 3 * time.Second,
 	})
-	if err == nil {
-		t.Fatal("Spawn: got nil error; want child-exited error")
-	}
-	if !strings.Contains(err.Error(), "exited") {
-		t.Fatalf("Spawn err = %q; want substring \"exited\"", err)
-	}
-	if !strings.Contains(err.Error(), "boom") {
-		t.Fatalf("Spawn err = %q; want substring \"boom\" from child stderr", err)
-	}
+	require.Error(t, err, "Spawn: got nil error; want child-exited error")
+	assert.Contains(t, err.Error(), "exited", `want substring "exited"`)
+	assert.Contains(t, err.Error(), "boom", `want substring "boom" from child stderr`)
 }
 
 func TestSpawn_Timeout(t *testing.T) {
@@ -116,12 +101,8 @@ func TestSpawn_Timeout(t *testing.T) {
 		PIDFilePath:  pidPath,
 		ReadyTimeout: 300 * time.Millisecond,
 	})
-	if err == nil {
-		t.Fatal("Spawn: got nil error; want timeout error")
-	}
-	if !strings.Contains(err.Error(), "did not become ready") {
-		t.Fatalf("Spawn err = %q; want substring \"did not become ready\"", err)
-	}
+	require.Error(t, err, "Spawn: got nil error; want timeout error")
+	assert.Contains(t, err.Error(), "did not become ready", `want substring "did not become ready"`)
 }
 
 func TestSpawn_RemovesDaemonFlag(t *testing.T) {
@@ -137,10 +118,8 @@ func TestSpawn_RemovesDaemonFlag(t *testing.T) {
 	for _, argv := range cases {
 		got := stripDaemonFlag(argv)
 		for _, a := range got {
-			if a == "--daemon" || a == "-d" ||
-				strings.HasPrefix(a, "--daemon=") {
-				t.Fatalf("stripDaemonFlag(%v) left %q in %v", argv, a, got)
-			}
+			isDaemonFlag := a == "--daemon" || a == "-d" || strings.HasPrefix(a, "--daemon=")
+			assert.False(t, isDaemonFlag, "stripDaemonFlag(%v) left %q in %v", argv, a, got)
 		}
 	}
 }
@@ -150,9 +129,7 @@ func TestSpawn_RemovesDaemonFlag(t *testing.T) {
 func captureStdout(t *testing.T, fn func()) <-chan string {
 	t.Helper()
 	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
+	require.NoError(t, err, "pipe")
 	orig := os.Stdout
 	os.Stdout = w
 

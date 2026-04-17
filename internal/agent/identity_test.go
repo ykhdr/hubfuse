@@ -6,33 +6,28 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ─── GenerateDeviceID ─────────────────────────────────────────────────────────
 
 func TestGenerateDeviceID_Format(t *testing.T) {
 	id := GenerateDeviceID()
-	if id == "" {
-		t.Fatal("GenerateDeviceID() returned empty string")
-	}
+	require.NotEmpty(t, id, "GenerateDeviceID() returned empty string")
 
 	// Must be parseable as a UUID v4.
 	parsed, err := uuid.Parse(id)
-	if err != nil {
-		t.Fatalf("GenerateDeviceID() = %q is not a valid UUID: %v", id, err)
-	}
-	if parsed.Version() != 4 {
-		t.Errorf("UUID version = %d, want 4", parsed.Version())
-	}
+	require.NoError(t, err, "GenerateDeviceID() = %q is not a valid UUID", id)
+	assert.Equal(t, uuid.Version(4), parsed.Version(), "UUID version")
 }
 
 func TestGenerateDeviceID_Unique(t *testing.T) {
 	ids := make(map[string]struct{})
 	for i := 0; i < 10; i++ {
 		id := GenerateDeviceID()
-		if _, seen := ids[id]; seen {
-			t.Fatalf("GenerateDeviceID() returned duplicate ID: %q", id)
-		}
+		_, seen := ids[id]
+		require.False(t, seen, "GenerateDeviceID() returned duplicate ID: %q", id)
 		ids[id] = struct{}{}
 	}
 }
@@ -48,21 +43,13 @@ func TestSaveLoadIdentity_RoundTrip(t *testing.T) {
 		Nickname: "my-laptop",
 	}
 
-	if err := SaveIdentity(path, original); err != nil {
-		t.Fatalf("SaveIdentity(): %v", err)
-	}
+	require.NoError(t, SaveIdentity(path, original), "SaveIdentity()")
 
 	loaded, err := LoadIdentity(path)
-	if err != nil {
-		t.Fatalf("LoadIdentity(): %v", err)
-	}
+	require.NoError(t, err, "LoadIdentity()")
 
-	if loaded.DeviceID != original.DeviceID {
-		t.Errorf("DeviceID = %q, want %q", loaded.DeviceID, original.DeviceID)
-	}
-	if loaded.Nickname != original.Nickname {
-		t.Errorf("Nickname = %q, want %q", loaded.Nickname, original.Nickname)
-	}
+	assert.Equal(t, original.DeviceID, loaded.DeviceID, "DeviceID")
+	assert.Equal(t, original.Nickname, loaded.Nickname, "Nickname")
 }
 
 func TestSaveIdentity_CreatesParentDirectories(t *testing.T) {
@@ -70,13 +57,10 @@ func TestSaveIdentity_CreatesParentDirectories(t *testing.T) {
 	path := filepath.Join(base, "subdir", "nested", "device.json")
 
 	id := &DeviceIdentity{DeviceID: "abc", Nickname: "test"}
-	if err := SaveIdentity(path, id); err != nil {
-		t.Fatalf("SaveIdentity() with nested path: %v", err)
-	}
+	require.NoError(t, SaveIdentity(path, id), "SaveIdentity() with nested path")
 
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("file not found after SaveIdentity: %v", err)
-	}
+	_, err := os.Stat(path)
+	require.NoError(t, err, "file not found after SaveIdentity")
 }
 
 func TestSaveIdentity_FilePermissions(t *testing.T) {
@@ -84,38 +68,26 @@ func TestSaveIdentity_FilePermissions(t *testing.T) {
 	path := filepath.Join(dir, "device.json")
 
 	id := &DeviceIdentity{DeviceID: "abc", Nickname: "test"}
-	if err := SaveIdentity(path, id); err != nil {
-		t.Fatalf("SaveIdentity(): %v", err)
-	}
+	require.NoError(t, SaveIdentity(path, id), "SaveIdentity()")
 
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat(): %v", err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("file permissions = %o, want 0600", info.Mode().Perm())
-	}
+	require.NoError(t, err, "Stat()")
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm(), "file permissions")
 }
 
 func TestLoadIdentity_NonExistentFile(t *testing.T) {
 	_, err := LoadIdentity("/does/not/exist/device.json")
-	if err == nil {
-		t.Fatal("expected error for non-existent file, got nil")
-	}
+	assert.Error(t, err, "expected error for non-existent file")
 }
 
 func TestLoadIdentity_InvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "device.json")
 
-	if err := os.WriteFile(path, []byte("not valid json"), 0600); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("not valid json"), 0600), "WriteFile()")
 
 	_, err := LoadIdentity(path)
-	if err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
-	}
+	assert.Error(t, err, "expected error for invalid JSON")
 }
 
 func TestSaveLoadIdentity_WithGeneratedID(t *testing.T) {
@@ -128,21 +100,14 @@ func TestSaveLoadIdentity_WithGeneratedID(t *testing.T) {
 		Nickname: "generated-device",
 	}
 
-	if err := SaveIdentity(path, original); err != nil {
-		t.Fatalf("SaveIdentity(): %v", err)
-	}
+	require.NoError(t, SaveIdentity(path, original), "SaveIdentity()")
 
 	loaded, err := LoadIdentity(path)
-	if err != nil {
-		t.Fatalf("LoadIdentity(): %v", err)
-	}
+	require.NoError(t, err, "LoadIdentity()")
 
-	if loaded.DeviceID != deviceID {
-		t.Errorf("DeviceID = %q, want %q", loaded.DeviceID, deviceID)
-	}
+	assert.Equal(t, deviceID, loaded.DeviceID, "DeviceID")
 
 	// Validate that the loaded ID is still a valid UUID.
-	if _, err := uuid.Parse(loaded.DeviceID); err != nil {
-		t.Errorf("loaded DeviceID %q is not a valid UUID: %v", loaded.DeviceID, err)
-	}
+	_, err = uuid.Parse(loaded.DeviceID)
+	assert.NoError(t, err, "loaded DeviceID %q is not a valid UUID", loaded.DeviceID)
 }

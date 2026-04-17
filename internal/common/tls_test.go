@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -21,74 +23,45 @@ import (
 
 func TestGenerateCA(t *testing.T) {
 	cert, key, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA() error: %v", err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, key, "GenerateCA() returned nil key")
 
-	if key == nil {
-		t.Fatal("GenerateCA() returned nil key")
-	}
-
-	if !cert.IsCA {
-		t.Error("CA certificate does not have IsCA=true")
-	}
-
-	if !cert.BasicConstraintsValid {
-		t.Error("CA certificate does not have BasicConstraintsValid=true")
-	}
+	assert.True(t, cert.IsCA, "CA certificate does not have IsCA=true")
+	assert.True(t, cert.BasicConstraintsValid, "CA certificate does not have BasicConstraintsValid=true")
 
 	// Self-signed: Issuer == Subject
-	if cert.Issuer.String() != cert.Subject.String() {
-		t.Errorf("CA is not self-signed: issuer=%q subject=%q", cert.Issuer, cert.Subject)
-	}
+	assert.Equal(t, cert.Subject.String(), cert.Issuer.String(), "CA is not self-signed")
 
-	if len(cert.Subject.Organization) == 0 || cert.Subject.Organization[0] != "HubFuse" {
-		t.Errorf("unexpected organization: %v", cert.Subject.Organization)
-	}
+	require.NotEmpty(t, cert.Subject.Organization, "unexpected organization: %v", cert.Subject.Organization)
+	assert.Equal(t, "HubFuse", cert.Subject.Organization[0])
 
 	// Verify the cert with itself as root.
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)
 	_, err = cert.Verify(x509.VerifyOptions{Roots: pool})
-	if err != nil {
-		t.Errorf("self-signed CA does not verify: %v", err)
-	}
+	assert.NoError(t, err, "self-signed CA does not verify")
 }
 
 // ─── SignClientCert ───────────────────────────────────────────────────────────
 
 func TestSignClientCert(t *testing.T) {
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	deviceID := "device-abc-123"
 	certPEM, keyPEM, err := SignClientCert(caCert, caKey, deviceID)
-	if err != nil {
-		t.Fatalf("SignClientCert(): %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(certPEM) == 0 {
-		t.Fatal("certPEM is empty")
-	}
-	if len(keyPEM) == 0 {
-		t.Fatal("keyPEM is empty")
-	}
+	require.NotEmpty(t, certPEM, "certPEM is empty")
+	require.NotEmpty(t, keyPEM, "keyPEM is empty")
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatalf("X509KeyPair(): %v", err)
-	}
+	require.NoError(t, err)
 
 	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
-		t.Fatalf("ParseCertificate(): %v", err)
-	}
+	require.NoError(t, err)
 
-	if leaf.Subject.CommonName != deviceID {
-		t.Errorf("CN = %q, want %q", leaf.Subject.CommonName, deviceID)
-	}
+	assert.Equal(t, deviceID, leaf.Subject.CommonName)
 
 	// Verify against CA.
 	pool := x509.NewCertPool()
@@ -97,34 +70,24 @@ func TestSignClientCert(t *testing.T) {
 		Roots:     pool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	})
-	if err != nil {
-		t.Errorf("client cert does not verify against CA: %v", err)
-	}
+	assert.NoError(t, err, "client cert does not verify against CA")
 }
 
 // ─── GenerateServerCert ───────────────────────────────────────────────────────
 
 func TestGenerateServerCert(t *testing.T) {
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	hosts := []string{"localhost", "127.0.0.1", "example.internal"}
 	certPEM, keyPEM, err := GenerateServerCert(caCert, caKey, hosts)
-	if err != nil {
-		t.Fatalf("GenerateServerCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatalf("X509KeyPair(): %v", err)
-	}
+	require.NoError(t, err)
 
 	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
-		t.Fatalf("ParseCertificate(): %v", err)
-	}
+	require.NoError(t, err)
 
 	// Check SANs.
 	dnsSet := make(map[string]bool)
@@ -136,15 +99,9 @@ func TestGenerateServerCert(t *testing.T) {
 		ipSet[ip.String()] = true
 	}
 
-	if !dnsSet["localhost"] {
-		t.Error("DNS SAN 'localhost' not found")
-	}
-	if !dnsSet["example.internal"] {
-		t.Error("DNS SAN 'example.internal' not found")
-	}
-	if !ipSet["127.0.0.1"] {
-		t.Errorf("IP SAN '127.0.0.1' not found; got %v", leaf.IPAddresses)
-	}
+	assert.True(t, dnsSet["localhost"], "DNS SAN 'localhost' not found")
+	assert.True(t, dnsSet["example.internal"], "DNS SAN 'example.internal' not found")
+	assert.True(t, ipSet["127.0.0.1"], "IP SAN '127.0.0.1' not found; got %v", leaf.IPAddresses)
 
 	// Verify against CA.
 	pool := x509.NewCertPool()
@@ -153,9 +110,7 @@ func TestGenerateServerCert(t *testing.T) {
 		Roots:     pool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
-	if err != nil {
-		t.Errorf("server cert does not verify against CA: %v", err)
-	}
+	assert.NoError(t, err, "server cert does not verify against CA")
 }
 
 // ─── ExtractDeviceID (real TLS handshake) ────────────────────────────────────
@@ -182,26 +137,18 @@ func (s *minimalHubFuseServer) Join(ctx context.Context, _ *pb.JoinRequest) (*pb
 func TestExtractDeviceID(t *testing.T) {
 	// Generate CA + server cert + client cert.
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	serverCertPEM, serverKeyPEM, err := GenerateServerCert(caCert, caKey, []string{"127.0.0.1"})
-	if err != nil {
-		t.Fatalf("GenerateServerCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	deviceID := "test-device-42"
 	clientCertPEM, clientKeyPEM, err := SignClientCert(caCert, caKey, deviceID)
-	if err != nil {
-		t.Fatalf("SignClientCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	// Build server TLS config.
 	serverTLSCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
-	if err != nil {
-		t.Fatalf("server X509KeyPair(): %v", err)
-	}
+	require.NoError(t, err, "server X509KeyPair()")
 	caPool := x509.NewCertPool()
 	caPool.AddCert(caCert)
 	serverTLSCfg := &tls.Config{
@@ -213,9 +160,7 @@ func TestExtractDeviceID(t *testing.T) {
 
 	// Build client TLS config.
 	clientTLSCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
-	if err != nil {
-		t.Fatalf("client X509KeyPair(): %v", err)
-	}
+	require.NoError(t, err, "client X509KeyPair()")
 	clientTLSCfg := &tls.Config{
 		Certificates: []tls.Certificate{clientTLSCert},
 		RootCAs:      caPool,
@@ -224,9 +169,7 @@ func TestExtractDeviceID(t *testing.T) {
 
 	// Start gRPC server on a random port.
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen(): %v", err)
-	}
+	require.NoError(t, err)
 
 	srv := &minimalHubFuseServer{capturedDeviceID: make(chan string, 1)}
 	grpcSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLSCfg)))
@@ -240,30 +183,22 @@ func TestExtractDeviceID(t *testing.T) {
 	// Connect with the client certificate.
 	addr := lis.Addr().String()
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(clientTLSCfg)))
-	if err != nil {
-		t.Fatalf("grpc.NewClient(): %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 
 	client := pb.NewHubFuseClient(conn)
 	_, err = client.Join(context.Background(), &pb.JoinRequest{DeviceId: deviceID})
-	if err != nil {
-		t.Fatalf("Join RPC failed: %v", err)
-	}
+	require.NoError(t, err, "Join RPC failed")
 
 	got := <-srv.capturedDeviceID
-	if got != deviceID {
-		t.Errorf("ExtractDeviceID = %q, want %q", got, deviceID)
-	}
+	assert.Equal(t, deviceID, got)
 }
 
 // ─── ExtractDeviceID — no peer ────────────────────────────────────────────────
 
 func TestExtractDeviceID_NoPeer(t *testing.T) {
 	_, err := ExtractDeviceID(context.Background())
-	if err == nil {
-		t.Fatal("expected error when no peer in context, got nil")
-	}
+	assert.Error(t, err, "expected error when no peer in context")
 }
 
 // TestExtractDeviceID_NoTLS tests that a non-TLS peer returns an error.
@@ -273,9 +208,7 @@ func TestExtractDeviceID_NoTLS(t *testing.T) {
 		AuthInfo: nil,
 	})
 	_, err := ExtractDeviceID(ctx)
-	if err == nil {
-		t.Fatal("expected error when AuthInfo is nil, got nil")
-	}
+	assert.Error(t, err, "expected error when AuthInfo is nil")
 }
 
 // ─── SavePEM / LoadPEM ────────────────────────────────────────────────────────
@@ -287,107 +220,72 @@ func TestSavePEM_LoadPEM_RoundTrip(t *testing.T) {
 
 	// Use a cert type (0644 perms).
 	path := filepath.Join(dir, "test.pem")
-	if err := SavePEM(path, pemTypeCert, original); err != nil {
-		t.Fatalf("SavePEM(): %v", err)
-	}
+	require.NoError(t, SavePEM(path, pemTypeCert, original))
 
 	// Check file permissions.
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat(): %v", err)
-	}
-	if info.Mode().Perm() != permCert {
-		t.Errorf("cert file perm = %o, want %o", info.Mode().Perm(), permCert)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, permCert, info.Mode().Perm(), "cert file perm mismatch")
 
 	loaded, err := LoadPEM(path)
-	if err != nil {
-		t.Fatalf("LoadPEM(): %v", err)
-	}
+	require.NoError(t, err)
 
-	if string(loaded) != string(original) {
-		t.Errorf("round-trip mismatch: got %q, want %q", loaded, original)
-	}
+	assert.Equal(t, string(original), string(loaded), "round-trip mismatch")
 }
 
 func TestSavePEM_KeyPermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "key.pem")
 
-	if err := SavePEM(path, pemTypeKey, []byte("key data")); err != nil {
-		t.Fatalf("SavePEM(): %v", err)
-	}
+	require.NoError(t, SavePEM(path, pemTypeKey, []byte("key data")))
 
 	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat(): %v", err)
-	}
-	if info.Mode().Perm() != permKey {
-		t.Errorf("key file perm = %o, want %o", info.Mode().Perm(), permKey)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, permKey, info.Mode().Perm(), "key file perm mismatch")
 }
 
 func TestLoadPEM_NoPEMBlock(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.pem")
-	if err := os.WriteFile(path, []byte("not pem"), 0644); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("not pem"), 0644))
 	_, err := LoadPEM(path)
-	if err == nil {
-		t.Fatal("expected error for file with no PEM block, got nil")
-	}
+	assert.Error(t, err, "expected error for file with no PEM block")
 }
 
 // ─── SaveCertAndKey ───────────────────────────────────────────────────────────
 
 func TestSaveCertAndKey(t *testing.T) {
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	certPEM, keyPEM, err := SignClientCert(caCert, caKey, "roundtrip-device")
-	if err != nil {
-		t.Fatalf("SignClientCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "client.crt")
 	keyPath := filepath.Join(dir, "client.key")
 
-	if err := SaveCertAndKey(certPath, keyPath, certPEM, keyPEM); err != nil {
-		t.Fatalf("SaveCertAndKey(): %v", err)
-	}
+	require.NoError(t, SaveCertAndKey(certPath, keyPath, certPEM, keyPEM))
 
 	// Verify we can load the pair again.
-	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
-		t.Errorf("LoadX509KeyPair() after SaveCertAndKey: %v", err)
-	}
+	_, err = tls.LoadX509KeyPair(certPath, keyPath)
+	assert.NoError(t, err, "LoadX509KeyPair() after SaveCertAndKey")
 
 	// Check permissions.
 	ci, _ := os.Stat(certPath)
 	ki, _ := os.Stat(keyPath)
-	if ci.Mode().Perm() != permCert {
-		t.Errorf("cert perm = %o, want %o", ci.Mode().Perm(), permCert)
-	}
-	if ki.Mode().Perm() != permKey {
-		t.Errorf("key perm = %o, want %o", ki.Mode().Perm(), permKey)
-	}
+	assert.Equal(t, permCert, ci.Mode().Perm(), "cert perm mismatch")
+	assert.Equal(t, permKey, ki.Mode().Perm(), "key perm mismatch")
 }
 
 // ─── LoadTLSServerConfig / LoadTLSClientConfig ────────────────────────────────
 
 func TestLoadTLSServerConfig(t *testing.T) {
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	serverCertPEM, serverKeyPEM, err := GenerateServerCert(caCert, caKey, []string{"localhost"})
-	if err != nil {
-		t.Fatalf("GenerateServerCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	dir := t.TempDir()
 	caPath := filepath.Join(dir, "ca.crt")
@@ -398,27 +296,17 @@ func TestLoadTLSServerConfig(t *testing.T) {
 	_ = SaveCertAndKey(certPath, keyPath, serverCertPEM, serverKeyPEM)
 
 	cfg, err := LoadTLSServerConfig(caPath, certPath, keyPath)
-	if err != nil {
-		t.Fatalf("LoadTLSServerConfig(): %v", err)
-	}
-	if cfg == nil {
-		t.Fatal("LoadTLSServerConfig() returned nil config")
-	}
-	if cfg.ClientAuth != tls.VerifyClientCertIfGiven {
-		t.Errorf("ClientAuth = %v, want VerifyClientCertIfGiven", cfg.ClientAuth)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, cfg, "LoadTLSServerConfig() returned nil config")
+	assert.Equal(t, tls.VerifyClientCertIfGiven, cfg.ClientAuth)
 }
 
 func TestLoadTLSClientConfig(t *testing.T) {
 	caCert, caKey, err := GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA(): %v", err)
-	}
+	require.NoError(t, err)
 
 	clientCertPEM, clientKeyPEM, err := SignClientCert(caCert, caKey, "test-device")
-	if err != nil {
-		t.Fatalf("SignClientCert(): %v", err)
-	}
+	require.NoError(t, err)
 
 	dir := t.TempDir()
 	caPath := filepath.Join(dir, "ca.crt")
@@ -429,15 +317,9 @@ func TestLoadTLSClientConfig(t *testing.T) {
 	_ = SaveCertAndKey(certPath, keyPath, clientCertPEM, clientKeyPEM)
 
 	cfg, err := LoadTLSClientConfig(caPath, certPath, keyPath)
-	if err != nil {
-		t.Fatalf("LoadTLSClientConfig(): %v", err)
-	}
-	if cfg == nil {
-		t.Fatal("LoadTLSClientConfig() returned nil config")
-	}
-	if len(cfg.Certificates) == 0 {
-		t.Error("LoadTLSClientConfig() returned config with no client certs")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, cfg, "LoadTLSClientConfig() returned nil config")
+	assert.NotEmpty(t, cfg.Certificates, "LoadTLSClientConfig() returned config with no client certs")
 }
 
 // encodeCertPEM is a test helper that PEM-encodes a parsed x509.Certificate.

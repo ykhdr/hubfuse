@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
@@ -23,16 +26,13 @@ func buildTestDaemon(t *testing.T) (*Daemon, string) {
 
 	// SSH keys
 	keysDir := filepath.Join(dir, "keys")
-	if _, err := GenerateSSHKeyPair(keysDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair: %v", err)
-	}
+	_, err := GenerateSSHKeyPair(keysDir)
+	require.NoError(t, err, "GenerateSSHKeyPair")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 
 	// Known-devices directory
 	knownDevicesDir := filepath.Join(dir, "known_devices")
-	if err := os.MkdirAll(knownDevicesDir, 0700); err != nil {
-		t.Fatalf("MkdirAll known_devices: %v", err)
-	}
+	require.NoError(t, os.MkdirAll(knownDevicesDir, 0700), "MkdirAll known_devices")
 
 	// Write a minimal config.kdl.
 	cfgPath := filepath.Join(dir, "config.kdl")
@@ -46,29 +46,21 @@ agent {
     ssh-port 2222
 }
 `
-	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0644), "write config")
 
 	cfg, err := agentconfig.Load(cfgPath)
-	if err != nil {
-		t.Fatalf("agentconfig.Load: %v", err)
-	}
+	require.NoError(t, err, "agentconfig.Load")
 
 	// Write device.json identity.
 	identityPath := filepath.Join(dir, "device.json")
 	identity := &DeviceIdentity{DeviceID: "test-device-id", Nickname: "test-device"}
-	if err := SaveIdentity(identityPath, identity); err != nil {
-		t.Fatalf("SaveIdentity: %v", err)
-	}
+	require.NoError(t, SaveIdentity(identityPath, identity), "SaveIdentity")
 
 	// Mounter with overrides so we never invoke sshfs or umount.
 	mounter := newTestMounter(t, knownDevicesDir, keyPath, nil, nil)
 
 	sshServer, err := NewSSHServer(0, keyPath, discardLogger())
-	if err != nil {
-		t.Fatalf("NewSSHServer: %v", err)
-	}
+	require.NoError(t, err, "NewSSHServer")
 
 	d := &Daemon{
 		config:        cfg,
@@ -98,9 +90,8 @@ func TestNewDaemon_CreatesSuccessfully(t *testing.T) {
 
 	// Write required files.
 	keysDir := filepath.Join(dir, "keys")
-	if _, err := GenerateSSHKeyPair(keysDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair: %v", err)
-	}
+	_, err := GenerateSSHKeyPair(keysDir)
+	require.NoError(t, err, "GenerateSSHKeyPair")
 
 	cfgPath := filepath.Join(dir, "config.kdl")
 	cfgContent := `device {
@@ -113,44 +104,26 @@ agent {
     ssh-port 2222
 }
 `
-	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0644), "write config")
 
 	identityPath := filepath.Join(dir, "device.json")
 	identity := &DeviceIdentity{DeviceID: "abc123", Nickname: "my-device"}
-	if err := SaveIdentity(identityPath, identity); err != nil {
-		t.Fatalf("SaveIdentity: %v", err)
-	}
+	require.NoError(t, SaveIdentity(identityPath, identity), "SaveIdentity")
 
 	tlsDir := filepath.Join(dir, "tls")
-	if err := os.MkdirAll(tlsDir, 0700); err != nil {
-		t.Fatalf("MkdirAll tls: %v", err)
-	}
+	require.NoError(t, os.MkdirAll(tlsDir, 0700), "MkdirAll tls")
 	// Write placeholder TLS files (content doesn't matter for NewDaemon).
 	for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
-		if err := os.WriteFile(filepath.Join(tlsDir, name), []byte("placeholder"), 0600); err != nil {
-			t.Fatalf("write %s: %v", name, err)
-		}
+		require.NoError(t, os.WriteFile(filepath.Join(tlsDir, name), []byte("placeholder"), 0600), "write %s", name)
 	}
 
 	daemon, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
-	if err != nil {
-		t.Fatalf("NewDaemon() error: %v", err)
-	}
+	require.NoError(t, err, "NewDaemon() error")
 
-	if daemon.identity.DeviceID != "abc123" {
-		t.Errorf("identity.DeviceID = %q, want %q", daemon.identity.DeviceID, "abc123")
-	}
-	if daemon.config.Agent.SSHPort != 2222 {
-		t.Errorf("config.Agent.SSHPort = %d, want 2222", daemon.config.Agent.SSHPort)
-	}
-	if daemon.mounter == nil {
-		t.Error("mounter is nil")
-	}
-	if daemon.sshServer == nil {
-		t.Error("sshServer is nil")
-	}
+	assert.Equal(t, "abc123", daemon.identity.DeviceID)
+	assert.Equal(t, 2222, daemon.config.Agent.SSHPort)
+	assert.NotNil(t, daemon.mounter)
+	assert.NotNil(t, daemon.sshServer)
 }
 
 func TestNewDaemon_MissingIdentityReturnsError(t *testing.T) {
@@ -158,20 +131,15 @@ func TestNewDaemon_MissingIdentityReturnsError(t *testing.T) {
 
 	// Write config but no identity.
 	cfgPath := filepath.Join(dir, "config.kdl")
-	if err := os.WriteFile(cfgPath, []byte(`hub { address "localhost:9090" }`+"\n"), 0644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(cfgPath, []byte(`hub { address "localhost:9090" }`+"\n"), 0644), "write config")
 
 	// Generate SSH key so the SSH server can start.
 	keysDir := filepath.Join(dir, "keys")
-	if _, err := GenerateSSHKeyPair(keysDir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair: %v", err)
-	}
+	_, err := GenerateSSHKeyPair(keysDir)
+	require.NoError(t, err, "GenerateSSHKeyPair")
 
-	_, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
-	if err == nil {
-		t.Fatal("NewDaemon() expected error for missing identity, got nil")
-	}
+	_, err = NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
+	assert.Error(t, err, "NewDaemon() expected error for missing identity")
 }
 
 // ─── handleDeviceOnline ────────────────────────────────────────────────────────
@@ -193,21 +161,11 @@ func TestHandleDeviceOnline_AddsToKnownDevices(t *testing.T) {
 	info, ok := d.onlineDevices["device-123"]
 	d.mu.RUnlock()
 
-	if !ok {
-		t.Fatal("knownDevices does not contain device-123 after handleDeviceOnline")
-	}
-	if info.Nickname != "laptop" {
-		t.Errorf("Nickname = %q, want %q", info.Nickname, "laptop")
-	}
-	if info.IP != "10.0.0.5" {
-		t.Errorf("IP = %q, want %q", info.IP, "10.0.0.5")
-	}
-	if info.SSHPort != 2222 {
-		t.Errorf("SSHPort = %d, want 2222", info.SSHPort)
-	}
-	if len(info.Shares) != 1 || info.Shares[0] != "docs" {
-		t.Errorf("Shares = %v, want [docs]", info.Shares)
-	}
+	require.True(t, ok, "knownDevices does not contain device-123 after handleDeviceOnline")
+	assert.Equal(t, "laptop", info.Nickname)
+	assert.Equal(t, "10.0.0.5", info.IP)
+	assert.Equal(t, 2222, info.SSHPort)
+	assert.Equal(t, []string{"docs"}, info.Shares)
 }
 
 func TestHandleDeviceOnline_AutoMountsWhenPairedAndConfigured(t *testing.T) {
@@ -231,9 +189,7 @@ func TestHandleDeviceOnline_AutoMountsWhenPairedAndConfigured(t *testing.T) {
 
 	d.handleDeviceOnline(evt)
 
-	if !d.mounter.IsActive("laptop", "docs") {
-		t.Error("share should be mounted after handleDeviceOnline for paired + configured device")
-	}
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "share should be mounted after handleDeviceOnline for paired + configured device")
 }
 
 func TestHandleDeviceOnline_NoMountWhenNotPaired(t *testing.T) {
@@ -253,9 +209,7 @@ func TestHandleDeviceOnline_NoMountWhenNotPaired(t *testing.T) {
 
 	d.handleDeviceOnline(evt)
 
-	if d.mounter.IsActive("laptop", "docs") {
-		t.Error("share should NOT be mounted for an unpaired device")
-	}
+	assert.False(t, d.mounter.IsActive("laptop", "docs"), "share should NOT be mounted for an unpaired device")
 }
 
 // ─── handleDeviceOffline ──────────────────────────────────────────────────────
@@ -279,18 +233,14 @@ func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
 	_, ok := d.onlineDevices["device-123"]
 	d.mu.RUnlock()
 
-	if ok {
-		t.Error("knownDevices still contains device-123 after handleDeviceOffline")
-	}
+	assert.False(t, ok, "knownDevices still contains device-123 after handleDeviceOffline")
 }
 
 func TestHandleDeviceOffline_UnmountsShares(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
 	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")}
-	if err := d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222); err != nil {
-		t.Fatalf("pre-mount: %v", err)
-	}
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222), "pre-mount")
 
 	d.mu.Lock()
 	d.onlineDevices["device-123"] = &OnlineDevice{
@@ -304,9 +254,7 @@ func TestHandleDeviceOffline_UnmountsShares(t *testing.T) {
 	evt := &pb.DeviceOfflineEvent{DeviceId: "device-123", Nickname: "laptop"}
 	d.handleDeviceOffline(evt)
 
-	if d.mounter.IsActive("laptop", "docs") {
-		t.Error("share should be unmounted after handleDeviceOffline")
-	}
+	assert.False(t, d.mounter.IsActive("laptop", "docs"), "share should be unmounted after handleDeviceOffline")
 }
 
 // ─── handlePairingCompleted ────────────────────────────────────────────────────
@@ -315,7 +263,7 @@ func TestHandlePairingCompleted_SavesPeerKey(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
 	evt := &pb.PairingCompletedEvent{
-		PeerDeviceId: "peer-device-999",
+		PeerDeviceId:  "peer-device-999",
 		PeerPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpeer test@host",
 	}
 
@@ -323,9 +271,8 @@ func TestHandlePairingCompleted_SavesPeerKey(t *testing.T) {
 
 	knownDevicesDir := filepath.Join(dir, "known_devices")
 	pubKeyPath := filepath.Join(knownDevicesDir, "peer-device-999.pub")
-	if _, err := os.Stat(pubKeyPath); err != nil {
-		t.Errorf("peer public key not saved: %v", err)
-	}
+	_, err := os.Stat(pubKeyPath)
+	assert.NoError(t, err, "peer public key not saved")
 }
 
 func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) {
@@ -353,9 +300,7 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 
 	d.handlePairingCompleted(evt)
 
-	if !d.mounter.IsActive("peer-laptop", "docs") {
-		t.Error("share should be mounted after pairing completed for an online + configured device")
-	}
+	assert.True(t, d.mounter.IsActive("peer-laptop", "docs"), "share should be mounted after pairing completed for an online + configured device")
 }
 
 func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
@@ -373,9 +318,7 @@ func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
 
 	d.handlePairingCompleted(evt)
 
-	if d.mounter.IsActive("peer-laptop", "docs") {
-		t.Error("share should NOT be mounted for an offline device")
-	}
+	assert.False(t, d.mounter.IsActive("peer-laptop", "docs"), "share should NOT be mounted for an offline device")
 }
 
 // ─── onConfigChange ────────────────────────────────────────────────────────────
@@ -417,41 +360,29 @@ func TestOnConfigChange_SharesChangedUpdatesShares(t *testing.T) {
 
 	// Test configSharesToProto.
 	protoShares := configSharesToProto(newCfg.Shares)
-	if len(protoShares) != 1 {
-		t.Fatalf("configSharesToProto len = %d, want 1", len(protoShares))
-	}
-	if protoShares[0].Alias != "new-share" {
-		t.Errorf("protoShares[0].Alias = %q, want %q", protoShares[0].Alias, "new-share")
-	}
-	if protoShares[0].Permissions != "rw" {
-		t.Errorf("protoShares[0].Permissions = %q, want %q", protoShares[0].Permissions, "rw")
-	}
+	require.Len(t, protoShares, 1, "configSharesToProto len")
+	assert.Equal(t, "new-share", protoShares[0].Alias)
+	assert.Equal(t, "rw", protoShares[0].Permissions)
 
 	// Test sharesToMap.
 	sharesMap := sharesToMap(newCfg.Shares)
-	if path, ok := sharesMap["new-share"]; !ok || path != "/new" {
-		t.Errorf("sharesToMap[new-share] = %q, want /new", path)
-	}
+	path, ok := sharesMap["new-share"]
+	assert.True(t, ok, "sharesToMap missing new-share")
+	assert.Equal(t, "/new", path)
 
 	// Test that SSH server is updated.
 	d.sshServer.UpdateShares(sharesMap)
 	d.sshServer.mu.RLock()
 	_, serverHasShare := d.sshServer.shares["new-share"]
 	d.sshServer.mu.RUnlock()
-	if !serverHasShare {
-		t.Error("sshServer.shares does not contain 'new-share' after UpdateShares")
-	}
+	assert.True(t, serverHasShare, "sshServer.shares does not contain 'new-share' after UpdateShares")
 
 	// Verify ComputeDiff detects the share change.
 	diff := agentconfig.ComputeDiff(oldCfg, newCfg)
-	if !diff.SharesChanged {
-		t.Error("ComputeDiff should report SharesChanged for different share lists")
-	}
+	assert.True(t, diff.SharesChanged, "ComputeDiff should report SharesChanged for different share lists")
 
 	shareUpdateCalled = true // placeholder assertion
-	if !shareUpdateCalled {
-		t.Error("unreachable")
-	}
+	assert.True(t, shareUpdateCalled)
 }
 
 func TestOnConfigChange_MountsAdded(t *testing.T) {
@@ -477,9 +408,7 @@ func TestOnConfigChange_MountsAdded(t *testing.T) {
 
 	d.tryMount(mc)
 
-	if !d.mounter.IsActive("remote", "photos") {
-		t.Error("tryMount should have mounted 'photos' for an online+paired device")
-	}
+	assert.True(t, d.mounter.IsActive("remote", "photos"), "tryMount should have mounted 'photos' for an online+paired device")
 }
 
 func TestOnConfigChange_MountsRemoved(t *testing.T) {
@@ -490,18 +419,12 @@ func TestOnConfigChange_MountsRemoved(t *testing.T) {
 		Share:  "music",
 		To:     filepath.Join(dir, "mnt", "music"),
 	}
-	if err := d.mounter.Mount(context.Background(), mc, "10.0.0.9", 2222); err != nil {
-		t.Fatalf("pre-mount: %v", err)
-	}
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "10.0.0.9", 2222), "pre-mount")
 
 	// Unmounting via the diff path.
-	if err := d.mounter.Unmount("remote", "music"); err != nil {
-		t.Fatalf("Unmount: %v", err)
-	}
+	require.NoError(t, d.mounter.Unmount("remote", "music"), "Unmount")
 
-	if d.mounter.IsActive("remote", "music") {
-		t.Error("share should be inactive after Unmount")
-	}
+	assert.False(t, d.mounter.IsActive("remote", "music"), "share should be inactive after Unmount")
 }
 
 // ─── isPaired ─────────────────────────────────────────────────────────────────
@@ -510,17 +433,13 @@ func TestIsPaired_TrueWhenKeyExists(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 	writePubKey(t, dir, "known-device")
 
-	if !d.isPaired("known-device") {
-		t.Error("isPaired() = false for a device with a key file, want true")
-	}
+	assert.True(t, d.isPaired("known-device"), "isPaired() = false for a device with a key file, want true")
 }
 
 func TestIsPaired_FalseWhenKeyMissing(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 
-	if d.isPaired("unknown-device") {
-		t.Error("isPaired() = true for a device with no key file, want false")
-	}
+	assert.False(t, d.isPaired("unknown-device"), "isPaired() = true for a device with no key file, want false")
 }
 
 // ─── shouldMount ──────────────────────────────────────────────────────────────
@@ -533,12 +452,8 @@ func TestShouldMount_TrueWhenConfigured(t *testing.T) {
 	}
 
 	mc, ok := d.shouldMount("laptop")
-	if !ok {
-		t.Fatal("shouldMount() = false, want true for configured device")
-	}
-	if mc.Share != "docs" {
-		t.Errorf("MountConfig.Share = %q, want %q", mc.Share, "docs")
-	}
+	require.True(t, ok, "shouldMount() = false, want true for configured device")
+	assert.Equal(t, "docs", mc.Share)
 }
 
 func TestShouldMount_FalseWhenNotConfigured(t *testing.T) {
@@ -546,9 +461,7 @@ func TestShouldMount_FalseWhenNotConfigured(t *testing.T) {
 	d.config.Mounts = nil
 
 	_, ok := d.shouldMount("unconfigured-device")
-	if ok {
-		t.Error("shouldMount() = true for unconfigured device, want false")
-	}
+	assert.False(t, ok, "shouldMount() = true for unconfigured device, want false")
 }
 
 // ─── processInitialDevices ────────────────────────────────────────────────────
@@ -566,13 +479,7 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if len(d.onlineDevices) != 2 {
-		t.Fatalf("knownDevices len = %d, want 2", len(d.onlineDevices))
-	}
-	if _, ok := d.onlineDevices["dev-1"]; !ok {
-		t.Error("knownDevices missing dev-1")
-	}
-	if _, ok := d.onlineDevices["dev-2"]; !ok {
-		t.Error("knownDevices missing dev-2")
-	}
+	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
+	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
+	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
 }

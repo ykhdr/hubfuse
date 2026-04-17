@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
 	pb "github.com/ykhdr/hubfuse/proto"
@@ -17,15 +19,11 @@ import (
 func newTestRegistry(t *testing.T) *Registry {
 	t.Helper()
 	s, err := store.NewSQLiteStore(":memory:")
-	if err != nil {
-		t.Fatalf("NewSQLiteStore: %v", err)
-	}
+	require.NoError(t, err, "NewSQLiteStore")
 	t.Cleanup(func() { s.Close() })
 
 	caCert, caKey, err := common.GenerateCA()
-	if err != nil {
-		t.Fatalf("GenerateCA: %v", err)
-	}
+	require.NoError(t, err, "GenerateCA")
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	return NewRegistry(s, caCert, caKey, logger)
@@ -34,18 +32,15 @@ func newTestRegistry(t *testing.T) *Registry {
 // joinDevice is a helper that calls Join and fatals on error.
 func joinDevice(t *testing.T, r *Registry, deviceID, nickname string) {
 	t.Helper()
-	if _, _, _, err := r.Join(context.Background(), deviceID, nickname); err != nil {
-		t.Fatalf("Join(%q, %q): %v", deviceID, nickname, err)
-	}
+	_, _, _, err := r.Join(context.Background(), deviceID, nickname)
+	require.NoError(t, err, "Join(%q, %q)", deviceID, nickname)
 }
 
 // registerDevice is a helper that calls Register (online) and fatals on error.
 func registerDevice(t *testing.T, r *Registry, deviceID, ip string, port int) []*store.Device {
 	t.Helper()
 	online, err := r.Register(context.Background(), deviceID, ip, port, nil, 1)
-	if err != nil {
-		t.Fatalf("Register(%q): %v", deviceID, err)
-	}
+	require.NoError(t, err, "Register(%q)", deviceID)
 	return online
 }
 
@@ -56,62 +51,40 @@ func TestJoin_Success(t *testing.T) {
 	ctx := context.Background()
 
 	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice")
-	if err != nil {
-		t.Fatalf("Join: %v", err)
-	}
-	if len(certPEM) == 0 {
-		t.Error("certPEM is empty")
-	}
-	if len(keyPEM) == 0 {
-		t.Error("keyPEM is empty")
-	}
-	if len(caCertPEM) == 0 {
-		t.Error("caCertPEM is empty")
-	}
+	require.NoError(t, err, "Join")
+	assert.NotEmpty(t, certPEM, "certPEM is empty")
+	assert.NotEmpty(t, keyPEM, "keyPEM is empty")
+	assert.NotEmpty(t, caCertPEM, "caCertPEM is empty")
 
 	// Verify the device was created in the store.
 	d, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.Nickname != "alice" {
-		t.Errorf("Nickname = %q, want %q", d.Nickname, "alice")
-	}
-	if d.Status != store.StatusOffline {
-		t.Errorf("Status = %q, want %q", d.Status, store.StatusOffline)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, "alice", d.Nickname)
+	assert.Equal(t, store.StatusOffline, d.Status)
 }
 
 func TestJoin_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	if _, _, _, err := r.Join(ctx, "dev-1", "alice"); err != nil {
-		t.Fatalf("first Join: %v", err)
-	}
+	_, _, _, err := r.Join(ctx, "dev-1", "alice")
+	require.NoError(t, err, "first Join")
 
-	_, _, _, err := r.Join(ctx, "dev-2", "alice")
-	if err == nil {
-		t.Fatal("expected error for duplicate nickname, got nil")
-	}
-	if err != common.ErrNicknameTaken {
-		t.Errorf("error = %v, want ErrNicknameTaken", err)
-	}
+	_, _, _, err = r.Join(ctx, "dev-2", "alice")
+	require.Error(t, err, "expected error for duplicate nickname")
+	assert.Equal(t, common.ErrNicknameTaken, err)
 }
 
 func TestJoin_DuplicateDeviceID(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	if _, _, _, err := r.Join(ctx, "dev-1", "alice"); err != nil {
-		t.Fatalf("first Join: %v", err)
-	}
+	_, _, _, err := r.Join(ctx, "dev-1", "alice")
+	require.NoError(t, err, "first Join")
 
 	// Same device_id, different nickname — store should reject the duplicate.
-	_, _, _, err := r.Join(ctx, "dev-1", "bob")
-	if err == nil {
-		t.Fatal("expected error for duplicate device_id, got nil")
-	}
+	_, _, _, err = r.Join(ctx, "dev-1", "bob")
+	require.Error(t, err, "expected error for duplicate device_id")
 }
 
 // --- Register ---
@@ -123,18 +96,12 @@ func TestRegister_ReturnsOnlineDevices(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob")
 
 	online := registerDevice(t, r, "dev-1", "10.0.0.1", 22)
-	if len(online) != 1 {
-		t.Fatalf("online count = %d, want 1", len(online))
-	}
-	if online[0].DeviceID != "dev-1" {
-		t.Errorf("DeviceID = %q, want dev-1", online[0].DeviceID)
-	}
+	require.Len(t, online, 1, "online count after first register")
+	assert.Equal(t, "dev-1", online[0].DeviceID)
 
 	// Register second device; both should now be in the online list.
 	online = registerDevice(t, r, "dev-2", "10.0.0.2", 22)
-	if len(online) != 2 {
-		t.Fatalf("online count = %d, want 2", len(online))
-	}
+	assert.Len(t, online, 2, "online count after second register")
 }
 
 func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
@@ -151,11 +118,9 @@ func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
 
 	select {
 	case event := <-ch:
-		if event.GetDeviceOnline() == nil {
-			t.Errorf("expected DeviceOnline event, got %T", event.GetPayload())
-		}
-		if event.GetDeviceOnline().DeviceId != "dev-1" {
-			t.Errorf("DeviceId = %q, want dev-1", event.GetDeviceOnline().DeviceId)
+		assert.NotNil(t, event.GetDeviceOnline(), "expected DeviceOnline event, got %T", event.GetPayload())
+		if event.GetDeviceOnline() != nil {
+			assert.Equal(t, "dev-1", event.GetDeviceOnline().DeviceId)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for DeviceOnline event")
@@ -172,20 +137,12 @@ func TestRegister_WithShares(t *testing.T) {
 		{Alias: "docs", Permissions: "ro", AllowedDevices: []string{"all"}},
 	}
 	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 22, shares, 1)
-	if err != nil {
-		t.Fatalf("Register with shares: %v", err)
-	}
+	require.NoError(t, err, "Register with shares")
 
 	stored, err := r.store.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(stored) != 1 {
-		t.Fatalf("stored shares = %d, want 1", len(stored))
-	}
-	if stored[0].Alias != "docs" {
-		t.Errorf("Alias = %q, want docs", stored[0].Alias)
-	}
+	require.NoError(t, err, "GetShares")
+	require.Len(t, stored, 1, "stored shares count")
+	assert.Equal(t, "docs", stored[0].Alias)
 }
 
 // --- Heartbeat ---
@@ -197,19 +154,14 @@ func TestHeartbeat_UpdatesTimestamp(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice")
 
 	before := time.Now()
-	if err := r.Heartbeat(ctx, "dev-1"); err != nil {
-		t.Fatalf("Heartbeat: %v", err)
-	}
+	err := r.Heartbeat(ctx, "dev-1")
+	require.NoError(t, err, "Heartbeat")
 	after := time.Now()
 
 	d, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.LastHeartbeat.Before(before) || d.LastHeartbeat.After(after) {
-		t.Errorf("LastHeartbeat %v not in expected range [%v, %v]",
-			d.LastHeartbeat, before, after)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.False(t, d.LastHeartbeat.Before(before) || d.LastHeartbeat.After(after),
+		"LastHeartbeat %v not in expected range [%v, %v]", d.LastHeartbeat, before, after)
 }
 
 // --- Subscribe + Broadcast ---
@@ -229,9 +181,7 @@ func TestSubscribe_ReceivesEvents(t *testing.T) {
 
 	select {
 	case got := <-ch:
-		if got.GetDeviceOnline().DeviceId != "dev-2" {
-			t.Errorf("DeviceId = %q, want dev-2", got.GetDeviceOnline().DeviceId)
-		}
+		assert.Equal(t, "dev-2", got.GetDeviceOnline().DeviceId)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event")
 	}
@@ -308,27 +258,20 @@ func TestDeregister_MarksOfflineAndBroadcasts(t *testing.T) {
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
 
-	if err := r.Deregister(ctx, "dev-1"); err != nil {
-		t.Fatalf("Deregister: %v", err)
-	}
+	err := r.Deregister(ctx, "dev-1")
+	require.NoError(t, err, "Deregister")
 
 	// dev-1 must be offline in the store.
 	d, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.Status != store.StatusOffline {
-		t.Errorf("Status = %q, want offline", d.Status)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status)
 
 	// dev-2 should receive a DeviceOffline event.
 	select {
 	case event := <-ch:
-		if event.GetDeviceOffline() == nil {
-			t.Errorf("expected DeviceOffline, got %T", event.GetPayload())
-		}
-		if event.GetDeviceOffline().DeviceId != "dev-1" {
-			t.Errorf("DeviceId = %q, want dev-1", event.GetDeviceOffline().DeviceId)
+		assert.NotNil(t, event.GetDeviceOffline(), "expected DeviceOffline, got %T", event.GetPayload())
+		if event.GetDeviceOffline() != nil {
+			assert.Equal(t, "dev-1", event.GetDeviceOffline().DeviceId)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for DeviceOffline event")
@@ -344,24 +287,19 @@ func TestDeregister_RemovesSubscriber(t *testing.T) {
 
 	ch, _ := r.Subscribe("dev-1")
 
-	if err := r.Deregister(ctx, "dev-1"); err != nil {
-		t.Fatalf("Deregister: %v", err)
-	}
+	err := r.Deregister(ctx, "dev-1")
+	require.NoError(t, err, "Deregister")
 
 	r.mu.RLock()
 	_, exists := r.subscribers["dev-1"]
 	r.mu.RUnlock()
 
-	if exists {
-		t.Error("subscriber still present after Deregister")
-	}
+	assert.False(t, exists, "subscriber still present after Deregister")
 
 	// Reading from a closed channel must return immediately with the zero value.
 	select {
 	case _, ok := <-ch:
-		if ok {
-			t.Error("channel is not closed after Deregister")
-		}
+		assert.False(t, ok, "channel is not closed after Deregister")
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for channel to be closed by Deregister")
 	}
@@ -382,27 +320,21 @@ func TestUpdateShares_StoresAndBroadcasts(t *testing.T) {
 	shares := []*pb.Share{
 		{Alias: "music", Permissions: "rw", AllowedDevices: []string{"dev-2"}},
 	}
-	if err := r.UpdateShares(ctx, "dev-1", shares); err != nil {
-		t.Fatalf("UpdateShares: %v", err)
-	}
+	err := r.UpdateShares(ctx, "dev-1", shares)
+	require.NoError(t, err, "UpdateShares")
 
 	// Verify stored.
 	stored, err := r.store.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(stored) != 1 || stored[0].Alias != "music" {
-		t.Errorf("unexpected stored shares: %v", stored)
-	}
+	require.NoError(t, err, "GetShares")
+	require.Len(t, stored, 1, "stored shares count")
+	assert.Equal(t, "music", stored[0].Alias)
 
 	// Verify broadcast.
 	select {
 	case event := <-ch:
-		if event.GetSharesUpdated() == nil {
-			t.Errorf("expected SharesUpdated, got %T", event.GetPayload())
-		}
-		if event.GetSharesUpdated().DeviceId != "dev-1" {
-			t.Errorf("DeviceId = %q, want dev-1", event.GetSharesUpdated().DeviceId)
+		assert.NotNil(t, event.GetSharesUpdated(), "expected SharesUpdated, got %T", event.GetPayload())
+		if event.GetSharesUpdated() != nil {
+			assert.Equal(t, "dev-1", event.GetSharesUpdated().DeviceId)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for SharesUpdated event")
@@ -417,17 +349,12 @@ func TestRename_Success(t *testing.T) {
 
 	joinDevice(t, r, "dev-1", "alice")
 
-	if err := r.Rename(ctx, "dev-1", "alice2"); err != nil {
-		t.Fatalf("Rename: %v", err)
-	}
+	err := r.Rename(ctx, "dev-1", "alice2")
+	require.NoError(t, err, "Rename")
 
 	d, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.Nickname != "alice2" {
-		t.Errorf("Nickname = %q, want alice2", d.Nickname)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, "alice2", d.Nickname)
 }
 
 func TestRename_DuplicateNickname(t *testing.T) {
@@ -438,12 +365,8 @@ func TestRename_DuplicateNickname(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob")
 
 	err := r.Rename(ctx, "dev-1", "bob")
-	if err == nil {
-		t.Fatal("expected error for duplicate nickname, got nil")
-	}
-	if err != common.ErrNicknameTaken {
-		t.Errorf("error = %v, want ErrNicknameTaken", err)
-	}
+	require.Error(t, err, "expected error for duplicate nickname")
+	assert.Equal(t, common.ErrNicknameTaken, err)
 }
 
 // --- MarkOffline ---
@@ -460,26 +383,17 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	defer unsub()
 
 	d1, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice before MarkOffline: %v", err)
-	}
-	if err := r.MarkOffline(ctx, d1); err != nil {
-		t.Fatalf("MarkOffline: %v", err)
-	}
+	require.NoError(t, err, "GetDevice before MarkOffline")
+	err = r.MarkOffline(ctx, d1)
+	require.NoError(t, err, "MarkOffline")
 
 	d, err := r.store.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.Status != store.StatusOffline {
-		t.Errorf("Status = %q, want offline", d.Status)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status)
 
 	select {
 	case event := <-ch:
-		if event.GetDeviceOffline() == nil {
-			t.Errorf("expected DeviceOffline, got %T", event.GetPayload())
-		}
+		assert.NotNil(t, event.GetDeviceOffline(), "expected DeviceOffline, got %T", event.GetPayload())
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for DeviceOffline event")
 	}

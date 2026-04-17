@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestStore opens an in-memory SQLite store and registers a cleanup that
@@ -11,9 +14,7 @@ import (
 func newTestStore(t *testing.T) Store {
 	t.Helper()
 	s, err := NewSQLiteStore(":memory:")
-	if err != nil {
-		t.Fatalf("NewSQLiteStore(:memory:): %v", err)
-	}
+	require.NoError(t, err, "NewSQLiteStore(:memory:)")
 	t.Cleanup(func() { s.Close() })
 	return s
 }
@@ -36,26 +37,14 @@ func TestCreateDevice(t *testing.T) {
 	ctx := context.Background()
 
 	d := makeDevice("dev-1", "alice")
-	if err := s.CreateDevice(ctx, d); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
 
 	got, err := s.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if got.DeviceID != d.DeviceID {
-		t.Errorf("DeviceID = %q, want %q", got.DeviceID, d.DeviceID)
-	}
-	if got.Nickname != d.Nickname {
-		t.Errorf("Nickname = %q, want %q", got.Nickname, d.Nickname)
-	}
-	if got.SSHPort != d.SSHPort {
-		t.Errorf("SSHPort = %d, want %d", got.SSHPort, d.SSHPort)
-	}
-	if got.Status != d.Status {
-		t.Errorf("Status = %q, want %q", got.Status, d.Status)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, d.DeviceID, got.DeviceID)
+	assert.Equal(t, d.Nickname, got.Nickname)
+	assert.Equal(t, d.SSHPort, got.SSHPort)
+	assert.Equal(t, d.Status, got.Status)
 }
 
 func TestGetDevice_NotFound(t *testing.T) {
@@ -63,36 +52,26 @@ func TestGetDevice_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.GetDevice(ctx, "nonexistent")
-	if err == nil {
-		t.Fatal("expected error for nonexistent device, got nil")
-	}
+	assert.Error(t, err)
 }
 
 func TestCreateDevice_DuplicateNickname(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice first: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice first")
 	// Second device with same nickname should fail.
 	err := s.CreateDevice(ctx, makeDevice("dev-2", "alice"))
-	if err == nil {
-		t.Fatal("expected error for duplicate nickname, got nil")
-	}
+	assert.Error(t, err, "expected error for duplicate nickname")
 }
 
 func TestCreateDevice_DuplicateID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice first: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice first")
 	err := s.CreateDevice(ctx, makeDevice("dev-1", "bob"))
-	if err == nil {
-		t.Fatal("expected error for duplicate device_id, got nil")
-	}
+	assert.Error(t, err, "expected error for duplicate device_id")
 }
 
 func TestGetDeviceByNickname(t *testing.T) {
@@ -100,17 +79,11 @@ func TestGetDeviceByNickname(t *testing.T) {
 	ctx := context.Background()
 
 	d := makeDevice("dev-1", "alice")
-	if err := s.CreateDevice(ctx, d); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
 
 	got, err := s.GetDeviceByNickname(ctx, "alice")
-	if err != nil {
-		t.Fatalf("GetDeviceByNickname: %v", err)
-	}
-	if got.DeviceID != "dev-1" {
-		t.Errorf("DeviceID = %q, want %q", got.DeviceID, "dev-1")
-	}
+	require.NoError(t, err, "GetDeviceByNickname")
+	assert.Equal(t, "dev-1", got.DeviceID)
 }
 
 func TestGetDeviceByNickname_NotFound(t *testing.T) {
@@ -118,9 +91,7 @@ func TestGetDeviceByNickname_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.GetDeviceByNickname(ctx, "nobody")
-	if err == nil {
-		t.Fatal("expected error for nonexistent nickname, got nil")
-	}
+	assert.Error(t, err, "expected error for nonexistent nickname")
 }
 
 func TestListOnlineDevices(t *testing.T) {
@@ -132,23 +103,13 @@ func TestListOnlineDevices(t *testing.T) {
 	offline := makeDevice("dev-2", "bob")
 	offline.Status = StatusOffline
 
-	if err := s.CreateDevice(ctx, online); err != nil {
-		t.Fatalf("CreateDevice online: %v", err)
-	}
-	if err := s.CreateDevice(ctx, offline); err != nil {
-		t.Fatalf("CreateDevice offline: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, online), "CreateDevice online")
+	require.NoError(t, s.CreateDevice(ctx, offline), "CreateDevice offline")
 
 	list, err := s.ListOnlineDevices(ctx)
-	if err != nil {
-		t.Fatalf("ListOnlineDevices: %v", err)
-	}
-	if len(list) != 1 {
-		t.Fatalf("len(list) = %d, want 1", len(list))
-	}
-	if list[0].DeviceID != "dev-1" {
-		t.Errorf("DeviceID = %q, want %q", list[0].DeviceID, "dev-1")
-	}
+	require.NoError(t, err, "ListOnlineDevices")
+	require.Len(t, list, 1)
+	assert.Equal(t, "dev-1", list[0].DeviceID)
 }
 
 func TestListOnlineDevices_Empty(t *testing.T) {
@@ -156,60 +117,34 @@ func TestListOnlineDevices_Empty(t *testing.T) {
 	ctx := context.Background()
 
 	list, err := s.ListOnlineDevices(ctx)
-	if err != nil {
-		t.Fatalf("ListOnlineDevices: %v", err)
-	}
-	if len(list) != 0 {
-		t.Errorf("expected empty list, got %d devices", len(list))
-	}
+	require.NoError(t, err, "ListOnlineDevices")
+	assert.Empty(t, list)
 }
 
 func TestUpdateDeviceStatus(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
-
-	if err := s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.5", 2222); err != nil {
-		t.Fatalf("UpdateDeviceStatus: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.5", 2222), "UpdateDeviceStatus")
 
 	got, err := s.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if got.Status != StatusOnline {
-		t.Errorf("Status = %q, want %q", got.Status, StatusOnline)
-	}
-	if got.LastIP != "10.0.0.5" {
-		t.Errorf("LastIP = %q, want %q", got.LastIP, "10.0.0.5")
-	}
-	if got.SSHPort != 2222 {
-		t.Errorf("SSHPort = %d, want 2222", got.SSHPort)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, StatusOnline, got.Status)
+	assert.Equal(t, "10.0.0.5", got.LastIP)
+	assert.Equal(t, 2222, got.SSHPort)
 }
 
 func TestUpdateDeviceNickname(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
-
-	if err := s.UpdateDeviceNickname(ctx, "dev-1", "alicia"); err != nil {
-		t.Fatalf("UpdateDeviceNickname: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateDeviceNickname(ctx, "dev-1", "alicia"), "UpdateDeviceNickname")
 
 	got, err := s.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if got.Nickname != "alicia" {
-		t.Errorf("Nickname = %q, want %q", got.Nickname, "alicia")
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, "alicia", got.Nickname)
 }
 
 func TestUpdateHeartbeat(t *testing.T) {
@@ -218,24 +153,16 @@ func TestUpdateHeartbeat(t *testing.T) {
 
 	d := makeDevice("dev-1", "alice")
 	d.LastHeartbeat = time.Now().UTC().Add(-1 * time.Hour)
-	if err := s.CreateDevice(ctx, d); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
 
 	before := time.Now().UTC()
-	if err := s.UpdateHeartbeat(ctx, "dev-1"); err != nil {
-		t.Fatalf("UpdateHeartbeat: %v", err)
-	}
+	require.NoError(t, s.UpdateHeartbeat(ctx, "dev-1"), "UpdateHeartbeat")
 	after := time.Now().UTC()
 
 	got, err := s.GetDevice(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if got.LastHeartbeat.Before(before) || got.LastHeartbeat.After(after) {
-		t.Errorf("LastHeartbeat %v not in expected range [%v, %v]",
-			got.LastHeartbeat, before, after)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.False(t, got.LastHeartbeat.Before(before) || got.LastHeartbeat.After(after),
+		"LastHeartbeat %v not in expected range [%v, %v]", got.LastHeartbeat, before, after)
 }
 
 func TestGetStaleDevices(t *testing.T) {
@@ -255,23 +182,15 @@ func TestGetStaleDevices(t *testing.T) {
 	offlineOld.LastHeartbeat = time.Now().UTC().Add(-10 * time.Minute)
 
 	for _, d := range []*Device{old, fresh, offlineOld} {
-		if err := s.CreateDevice(ctx, d); err != nil {
-			t.Fatalf("CreateDevice %q: %v", d.DeviceID, err)
-		}
+		require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice %q", d.DeviceID)
 	}
 
 	// Threshold is 5 minutes ago — only dev-old is stale online.
 	threshold := time.Now().UTC().Add(-5 * time.Minute)
 	stale, err := s.GetStaleDevices(ctx, threshold)
-	if err != nil {
-		t.Fatalf("GetStaleDevices: %v", err)
-	}
-	if len(stale) != 1 {
-		t.Fatalf("len(stale) = %d, want 1", len(stale))
-	}
-	if stale[0].DeviceID != "dev-old" {
-		t.Errorf("stale DeviceID = %q, want %q", stale[0].DeviceID, "dev-old")
-	}
+	require.NoError(t, err, "GetStaleDevices")
+	require.Len(t, stale, 1)
+	assert.Equal(t, "dev-old", stale[0].DeviceID)
 }
 
 func TestGetStaleDevices_NoneStale(t *testing.T) {
@@ -281,36 +200,23 @@ func TestGetStaleDevices_NoneStale(t *testing.T) {
 	d := makeDevice("dev-1", "alice")
 	d.Status = StatusOnline
 	d.LastHeartbeat = time.Now().UTC()
-	if err := s.CreateDevice(ctx, d); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
 
 	threshold := time.Now().UTC().Add(-5 * time.Minute)
 	stale, err := s.GetStaleDevices(ctx, threshold)
-	if err != nil {
-		t.Fatalf("GetStaleDevices: %v", err)
-	}
-	if len(stale) != 0 {
-		t.Errorf("expected 0 stale devices, got %d", len(stale))
-	}
+	require.NoError(t, err, "GetStaleDevices")
+	assert.Empty(t, stale)
 }
 
 func TestDeleteDevice(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
-
-	if err := s.DeleteDevice(ctx, "dev-1"); err != nil {
-		t.Fatalf("DeleteDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.DeleteDevice(ctx, "dev-1"), "DeleteDevice")
 
 	_, err := s.GetDevice(ctx, "dev-1")
-	if err == nil {
-		t.Fatal("expected error after deletion, got nil")
-	}
+	assert.Error(t, err, "expected error after deletion")
 }
 
 // --- Share tests ---
@@ -319,25 +225,17 @@ func TestSetShares_AndGet(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
 
 	shares := []*Share{
 		{DeviceID: "dev-1", Alias: "docs", Permissions: PermRO, AllowedDevices: []string{"dev-2", "dev-3"}},
 		{DeviceID: "dev-1", Alias: "music", Permissions: PermRW, AllowedDevices: []string{}},
 	}
-	if err := s.SetShares(ctx, "dev-1", shares); err != nil {
-		t.Fatalf("SetShares: %v", err)
-	}
+	require.NoError(t, s.SetShares(ctx, "dev-1", shares), "SetShares")
 
 	got, err := s.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("len(got) = %d, want 2", len(got))
-	}
+	require.NoError(t, err, "GetShares")
+	require.Len(t, got, 2)
 
 	// Build a map for order-independent comparison.
 	byAlias := make(map[string]*Share, len(got))
@@ -346,95 +244,58 @@ func TestSetShares_AndGet(t *testing.T) {
 	}
 
 	docs, ok := byAlias["docs"]
-	if !ok {
-		t.Fatal("share 'docs' not found")
-	}
-	if docs.Permissions != PermRO {
-		t.Errorf("docs.Permissions = %q, want %q", docs.Permissions, PermRO)
-	}
-	if len(docs.AllowedDevices) != 2 {
-		t.Errorf("docs.AllowedDevices len = %d, want 2", len(docs.AllowedDevices))
-	}
+	require.True(t, ok, "share 'docs' not found")
+	assert.Equal(t, PermRO, docs.Permissions)
+	assert.Len(t, docs.AllowedDevices, 2)
 
 	music, ok := byAlias["music"]
-	if !ok {
-		t.Fatal("share 'music' not found")
-	}
-	if music.Permissions != PermRW {
-		t.Errorf("music.Permissions = %q, want %q", music.Permissions, PermRW)
-	}
+	require.True(t, ok, "share 'music' not found")
+	assert.Equal(t, PermRW, music.Permissions)
 }
 
 func TestSetShares_ReplacesExisting(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
 
 	original := []*Share{
 		{DeviceID: "dev-1", Alias: "old-share", Permissions: PermRO, AllowedDevices: []string{}},
 	}
-	if err := s.SetShares(ctx, "dev-1", original); err != nil {
-		t.Fatalf("SetShares original: %v", err)
-	}
+	require.NoError(t, s.SetShares(ctx, "dev-1", original), "SetShares original")
 
 	replacement := []*Share{
 		{DeviceID: "dev-1", Alias: "new-share", Permissions: PermRW, AllowedDevices: []string{"dev-2"}},
 	}
-	if err := s.SetShares(ctx, "dev-1", replacement); err != nil {
-		t.Fatalf("SetShares replacement: %v", err)
-	}
+	require.NoError(t, s.SetShares(ctx, "dev-1", replacement), "SetShares replacement")
 
 	got, err := s.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("len(got) = %d, want 1", len(got))
-	}
-	if got[0].Alias != "new-share" {
-		t.Errorf("Alias = %q, want %q", got[0].Alias, "new-share")
-	}
+	require.NoError(t, err, "GetShares")
+	require.Len(t, got, 1)
+	assert.Equal(t, "new-share", got[0].Alias)
 }
 
 func TestSetShares_Empty(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
-
-	if err := s.SetShares(ctx, "dev-1", []*Share{}); err != nil {
-		t.Fatalf("SetShares empty: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.SetShares(ctx, "dev-1", []*Share{}), "SetShares empty")
 
 	got, err := s.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("expected 0 shares, got %d", len(got))
-	}
+	require.NoError(t, err, "GetShares")
+	assert.Empty(t, got)
 }
 
 func TestGetShares_NoShares(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
 
 	got, err := s.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("expected 0 shares, got %d", len(got))
-	}
+	require.NoError(t, err, "GetShares")
+	assert.Empty(t, got)
 }
 
 // --- Pairing tests ---
@@ -443,32 +304,20 @@ func TestCreatePairing(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreatePairing(ctx, "dev-a", "dev-b"); err != nil {
-		t.Fatalf("CreatePairing: %v", err)
-	}
+	require.NoError(t, s.CreatePairing(ctx, "dev-a", "dev-b"), "CreatePairing")
 }
 
 func TestGetPairing(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreatePairing(ctx, "dev-a", "dev-b"); err != nil {
-		t.Fatalf("CreatePairing: %v", err)
-	}
+	require.NoError(t, s.CreatePairing(ctx, "dev-a", "dev-b"), "CreatePairing")
 
 	p, err := s.GetPairing(ctx, "dev-a", "dev-b")
-	if err != nil {
-		t.Fatalf("GetPairing: %v", err)
-	}
-	if p.DeviceA != "dev-a" {
-		t.Errorf("DeviceA = %q, want %q", p.DeviceA, "dev-a")
-	}
-	if p.DeviceB != "dev-b" {
-		t.Errorf("DeviceB = %q, want %q", p.DeviceB, "dev-b")
-	}
-	if p.PairedAt.IsZero() {
-		t.Error("PairedAt is zero")
-	}
+	require.NoError(t, err, "GetPairing")
+	assert.Equal(t, "dev-a", p.DeviceA)
+	assert.Equal(t, "dev-b", p.DeviceB)
+	assert.False(t, p.PairedAt.IsZero(), "PairedAt is zero")
 }
 
 func TestGetPairing_NotFound(t *testing.T) {
@@ -476,9 +325,7 @@ func TestGetPairing_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.GetPairing(ctx, "dev-a", "dev-b")
-	if err == nil {
-		t.Fatal("expected error for nonexistent pairing, got nil")
-	}
+	assert.Error(t, err, "expected error for nonexistent pairing")
 }
 
 func TestGetPairing_ReverseOrderNotFound(t *testing.T) {
@@ -486,41 +333,27 @@ func TestGetPairing_ReverseOrderNotFound(t *testing.T) {
 	ctx := context.Background()
 
 	// Store (a, b) — lookup (b, a) should fail since GetPairing is order-sensitive.
-	if err := s.CreatePairing(ctx, "dev-a", "dev-b"); err != nil {
-		t.Fatalf("CreatePairing: %v", err)
-	}
+	require.NoError(t, s.CreatePairing(ctx, "dev-a", "dev-b"), "CreatePairing")
 
 	_, err := s.GetPairing(ctx, "dev-b", "dev-a")
-	if err == nil {
-		t.Fatal("expected error for reverse-order lookup, got nil")
-	}
+	assert.Error(t, err, "expected error for reverse-order lookup")
 }
 
 func TestIsPaired_BothOrderings(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreatePairing(ctx, "dev-a", "dev-b"); err != nil {
-		t.Fatalf("CreatePairing: %v", err)
-	}
+	require.NoError(t, s.CreatePairing(ctx, "dev-a", "dev-b"), "CreatePairing")
 
 	// Forward ordering.
 	ok, err := s.IsPaired(ctx, "dev-a", "dev-b")
-	if err != nil {
-		t.Fatalf("IsPaired (a,b): %v", err)
-	}
-	if !ok {
-		t.Error("IsPaired(a,b) = false, want true")
-	}
+	require.NoError(t, err, "IsPaired (a,b)")
+	assert.True(t, ok, "IsPaired(a,b) = false, want true")
 
 	// Reverse ordering.
 	ok, err = s.IsPaired(ctx, "dev-b", "dev-a")
-	if err != nil {
-		t.Fatalf("IsPaired (b,a): %v", err)
-	}
-	if !ok {
-		t.Error("IsPaired(b,a) = false, want true")
-	}
+	require.NoError(t, err, "IsPaired (b,a)")
+	assert.True(t, ok, "IsPaired(b,a) = false, want true")
 }
 
 func TestIsPaired_NotPaired(t *testing.T) {
@@ -528,12 +361,8 @@ func TestIsPaired_NotPaired(t *testing.T) {
 	ctx := context.Background()
 
 	ok, err := s.IsPaired(ctx, "dev-a", "dev-b")
-	if err != nil {
-		t.Fatalf("IsPaired: %v", err)
-	}
-	if ok {
-		t.Error("IsPaired = true for non-existent pairing, want false")
-	}
+	require.NoError(t, err, "IsPaired")
+	assert.False(t, ok, "IsPaired = true for non-existent pairing, want false")
 }
 
 // --- Invite tests ---
@@ -554,9 +383,7 @@ func TestCreateInvite(t *testing.T) {
 	ctx := context.Background()
 
 	inv := makeInvite("code-abc", 5*time.Minute)
-	if err := s.CreateInvite(ctx, inv); err != nil {
-		t.Fatalf("CreateInvite: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, inv), "CreateInvite")
 }
 
 func TestGetInvite(t *testing.T) {
@@ -564,29 +391,15 @@ func TestGetInvite(t *testing.T) {
 	ctx := context.Background()
 
 	inv := makeInvite("code-abc", 5*time.Minute)
-	if err := s.CreateInvite(ctx, inv); err != nil {
-		t.Fatalf("CreateInvite: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, inv), "CreateInvite")
 
 	got, err := s.GetInvite(ctx, "code-abc")
-	if err != nil {
-		t.Fatalf("GetInvite: %v", err)
-	}
-	if got.InviteCode != inv.InviteCode {
-		t.Errorf("InviteCode = %q, want %q", got.InviteCode, inv.InviteCode)
-	}
-	if got.FromDevice != inv.FromDevice {
-		t.Errorf("FromDevice = %q, want %q", got.FromDevice, inv.FromDevice)
-	}
-	if got.ToDevice != inv.ToDevice {
-		t.Errorf("ToDevice = %q, want %q", got.ToDevice, inv.ToDevice)
-	}
-	if got.FromPublicKey != inv.FromPublicKey {
-		t.Errorf("FromPublicKey = %q, want %q", got.FromPublicKey, inv.FromPublicKey)
-	}
-	if got.Attempts != 0 {
-		t.Errorf("Attempts = %d, want 0", got.Attempts)
-	}
+	require.NoError(t, err, "GetInvite")
+	assert.Equal(t, inv.InviteCode, got.InviteCode)
+	assert.Equal(t, inv.FromDevice, got.FromDevice)
+	assert.Equal(t, inv.ToDevice, got.ToDevice)
+	assert.Equal(t, inv.FromPublicKey, got.FromPublicKey)
+	assert.Equal(t, 0, got.Attempts)
 }
 
 func TestGetInvite_NotFound(t *testing.T) {
@@ -594,9 +407,7 @@ func TestGetInvite_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.GetInvite(ctx, "nonexistent")
-	if err == nil {
-		t.Fatal("expected error for nonexistent invite, got nil")
-	}
+	assert.Error(t, err, "expected error for nonexistent invite")
 }
 
 func TestIncrementInviteAttempts(t *testing.T) {
@@ -604,21 +415,13 @@ func TestIncrementInviteAttempts(t *testing.T) {
 	ctx := context.Background()
 
 	inv := makeInvite("code-abc", 5*time.Minute)
-	if err := s.CreateInvite(ctx, inv); err != nil {
-		t.Fatalf("CreateInvite: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, inv), "CreateInvite")
 
 	for i := 1; i <= 3; i++ {
-		if err := s.IncrementInviteAttempts(ctx, "code-abc"); err != nil {
-			t.Fatalf("IncrementInviteAttempts (iteration %d): %v", i, err)
-		}
+		require.NoError(t, s.IncrementInviteAttempts(ctx, "code-abc"), "IncrementInviteAttempts (iteration %d)", i)
 		got, err := s.GetInvite(ctx, "code-abc")
-		if err != nil {
-			t.Fatalf("GetInvite (iteration %d): %v", i, err)
-		}
-		if got.Attempts != i {
-			t.Errorf("Attempts = %d, want %d", got.Attempts, i)
-		}
+		require.NoError(t, err, "GetInvite (iteration %d)", i)
+		assert.Equal(t, i, got.Attempts)
 	}
 }
 
@@ -627,18 +430,11 @@ func TestDeleteInvite(t *testing.T) {
 	ctx := context.Background()
 
 	inv := makeInvite("code-abc", 5*time.Minute)
-	if err := s.CreateInvite(ctx, inv); err != nil {
-		t.Fatalf("CreateInvite: %v", err)
-	}
-
-	if err := s.DeleteInvite(ctx, "code-abc"); err != nil {
-		t.Fatalf("DeleteInvite: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, inv), "CreateInvite")
+	require.NoError(t, s.DeleteInvite(ctx, "code-abc"), "DeleteInvite")
 
 	_, err := s.GetInvite(ctx, "code-abc")
-	if err == nil {
-		t.Fatal("expected error after deletion, got nil")
-	}
+	assert.Error(t, err, "expected error after deletion")
 }
 
 func TestDeleteExpiredInvites(t *testing.T) {
@@ -648,31 +444,18 @@ func TestDeleteExpiredInvites(t *testing.T) {
 	expired := makeInvite("code-expired", -1*time.Minute) // already in the past
 	valid := makeInvite("code-valid", 10*time.Minute)
 
-	if err := s.CreateInvite(ctx, expired); err != nil {
-		t.Fatalf("CreateInvite expired: %v", err)
-	}
-	if err := s.CreateInvite(ctx, valid); err != nil {
-		t.Fatalf("CreateInvite valid: %v", err)
-	}
-
-	if err := s.DeleteExpiredInvites(ctx); err != nil {
-		t.Fatalf("DeleteExpiredInvites: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, expired), "CreateInvite expired")
+	require.NoError(t, s.CreateInvite(ctx, valid), "CreateInvite valid")
+	require.NoError(t, s.DeleteExpiredInvites(ctx), "DeleteExpiredInvites")
 
 	// Expired invite should be gone.
 	_, err := s.GetInvite(ctx, "code-expired")
-	if err == nil {
-		t.Fatal("expected error for expired invite after cleanup, got nil")
-	}
+	assert.Error(t, err, "expected error for expired invite after cleanup")
 
 	// Valid invite should still exist.
 	got, err := s.GetInvite(ctx, "code-valid")
-	if err != nil {
-		t.Fatalf("GetInvite valid: %v", err)
-	}
-	if got.InviteCode != "code-valid" {
-		t.Errorf("InviteCode = %q, want %q", got.InviteCode, "code-valid")
-	}
+	require.NoError(t, err, "GetInvite valid")
+	assert.Equal(t, "code-valid", got.InviteCode)
 }
 
 func TestInviteLifecycle(t *testing.T) {
@@ -680,35 +463,21 @@ func TestInviteLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	inv := makeInvite("lifecycle-code", 5*time.Minute)
-	if err := s.CreateInvite(ctx, inv); err != nil {
-		t.Fatalf("CreateInvite: %v", err)
-	}
+	require.NoError(t, s.CreateInvite(ctx, inv), "CreateInvite")
 
 	// Increment attempts twice.
-	if err := s.IncrementInviteAttempts(ctx, "lifecycle-code"); err != nil {
-		t.Fatalf("IncrementInviteAttempts: %v", err)
-	}
-	if err := s.IncrementInviteAttempts(ctx, "lifecycle-code"); err != nil {
-		t.Fatalf("IncrementInviteAttempts: %v", err)
-	}
+	require.NoError(t, s.IncrementInviteAttempts(ctx, "lifecycle-code"), "IncrementInviteAttempts")
+	require.NoError(t, s.IncrementInviteAttempts(ctx, "lifecycle-code"), "IncrementInviteAttempts")
 
 	got, err := s.GetInvite(ctx, "lifecycle-code")
-	if err != nil {
-		t.Fatalf("GetInvite: %v", err)
-	}
-	if got.Attempts != 2 {
-		t.Errorf("Attempts = %d, want 2", got.Attempts)
-	}
+	require.NoError(t, err, "GetInvite")
+	assert.Equal(t, 2, got.Attempts)
 
 	// Delete the invite.
-	if err := s.DeleteInvite(ctx, "lifecycle-code"); err != nil {
-		t.Fatalf("DeleteInvite: %v", err)
-	}
+	require.NoError(t, s.DeleteInvite(ctx, "lifecycle-code"), "DeleteInvite")
 
 	_, err = s.GetInvite(ctx, "lifecycle-code")
-	if err == nil {
-		t.Fatal("expected error after deletion, got nil")
-	}
+	assert.Error(t, err, "expected error after deletion")
 }
 
 // TestStoreErrors is a sanity check that the store wraps errors and does not
@@ -731,9 +500,7 @@ func TestStoreErrors(t *testing.T) {
 	for _, tc := range errCases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.fn()
-			if err == nil {
-				t.Fatalf("%s: expected error, got nil", tc.name)
-			}
+			assert.Error(t, err, "%s: expected error, got nil", tc.name)
 			// Errors must not be nil but need not be wrapped — just ensure
 			// they satisfy the error interface.
 			var _ = err
@@ -747,35 +514,21 @@ func TestListAllDevices(t *testing.T) {
 
 	d1 := makeDevice("dev-1", "alice")
 	d2 := makeDevice("dev-2", "bob")
-	if err := s.CreateDevice(ctx, d1); err != nil {
-		t.Fatalf("CreateDevice d1: %v", err)
-	}
-	if err := s.CreateDevice(ctx, d2); err != nil {
-		t.Fatalf("CreateDevice d2: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, d1), "CreateDevice d1")
+	require.NoError(t, s.CreateDevice(ctx, d2), "CreateDevice d2")
 	// Mark d1 online.
-	if err := s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("UpdateDeviceStatus: %v", err)
-	}
+	require.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222), "UpdateDeviceStatus")
 
 	devices, err := s.ListAllDevices(ctx)
-	if err != nil {
-		t.Fatalf("ListAllDevices: %v", err)
-	}
-	if len(devices) != 2 {
-		t.Fatalf("expected 2 devices, got %d", len(devices))
-	}
+	require.NoError(t, err, "ListAllDevices")
+	require.Len(t, devices, 2)
 
 	statusMap := map[string]DeviceStatus{}
 	for _, d := range devices {
 		statusMap[d.DeviceID] = d.Status
 	}
-	if statusMap["dev-1"] != StatusOnline {
-		t.Errorf("dev-1 status = %q, want %q", statusMap["dev-1"], StatusOnline)
-	}
-	if statusMap["dev-2"] != StatusOffline {
-		t.Errorf("dev-2 status = %q, want %q", statusMap["dev-2"], StatusOffline)
-	}
+	assert.Equal(t, StatusOnline, statusMap["dev-1"])
+	assert.Equal(t, StatusOffline, statusMap["dev-2"])
 }
 
 // TestUpdateHeartbeat_Idempotent verifies that calling UpdateHeartbeat multiple
@@ -784,14 +537,10 @@ func TestUpdateHeartbeat_Idempotent(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
 
 	for i := 0; i < 3; i++ {
-		if err := s.UpdateHeartbeat(ctx, "dev-1"); err != nil {
-			t.Fatalf("UpdateHeartbeat (round %d): %v", i, err)
-		}
+		require.NoError(t, s.UpdateHeartbeat(ctx, "dev-1"), "UpdateHeartbeat (round %d)", i)
 	}
 }
 
@@ -801,9 +550,7 @@ func TestDeleteExpiredInvites_NoExpired(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.DeleteExpiredInvites(ctx); err != nil {
-		t.Fatalf("DeleteExpiredInvites (empty): %v", err)
-	}
+	require.NoError(t, s.DeleteExpiredInvites(ctx), "DeleteExpiredInvites (empty)")
 }
 
 // TestSetShares_NilAllowedDevices verifies that a nil AllowedDevices slice
@@ -812,24 +559,16 @@ func TestSetShares_NilAllowedDevices(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreateDevice(ctx, makeDevice("dev-1", "alice")); err != nil {
-		t.Fatalf("CreateDevice: %v", err)
-	}
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
 
 	shares := []*Share{
 		{DeviceID: "dev-1", Alias: "data", Permissions: PermRO, AllowedDevices: nil},
 	}
-	if err := s.SetShares(ctx, "dev-1", shares); err != nil {
-		t.Fatalf("SetShares: %v", err)
-	}
+	require.NoError(t, s.SetShares(ctx, "dev-1", shares), "SetShares")
 
 	got, err := s.GetShares(ctx, "dev-1")
-	if err != nil {
-		t.Fatalf("GetShares: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("len(got) = %d, want 1", len(got))
-	}
+	require.NoError(t, err, "GetShares")
+	require.Len(t, got, 1)
 }
 
 // TestPairing_Duplicate verifies that inserting the same pairing twice returns
@@ -838,12 +577,7 @@ func TestPairing_Duplicate(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if err := s.CreatePairing(ctx, "dev-a", "dev-b"); err != nil {
-		t.Fatalf("CreatePairing first: %v", err)
-	}
+	require.NoError(t, s.CreatePairing(ctx, "dev-a", "dev-b"), "CreatePairing first")
 	err := s.CreatePairing(ctx, "dev-a", "dev-b")
-	if err == nil {
-		t.Fatal("expected error for duplicate pairing, got nil")
-	}
+	assert.Error(t, err, "expected error for duplicate pairing")
 }
-
