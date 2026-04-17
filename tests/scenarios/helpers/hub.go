@@ -68,6 +68,47 @@ func StartHub(t *testing.T) *Hub {
 	return h
 }
 
+// StartHubWithRetention launches a hub with the given device-retention duration.
+// Devices offline longer than retention will be pruned from the store entirely.
+// Use a short duration (e.g. 5s) in tests so pruning is observable within CI
+// timelines. Mirror of StartHub; all other options use hub defaults.
+func StartHubWithRetention(t *testing.T, retention time.Duration) *Hub {
+	t.Helper()
+	port := FreePort(t)
+	dataDir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, HubBinaryPath, "start",
+		"--listen", fmt.Sprintf("127.0.0.1:%d", port),
+		"--data-dir", dataDir,
+		"--device-retention", retention.String(),
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	logBuf := &LogBuffer{}
+	cmd.Stdout = logBuf
+	cmd.Stderr = logBuf
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start hub with retention: %v", err)
+	}
+
+	h := &Hub{
+		Address: fmt.Sprintf("127.0.0.1:%d", port),
+		DataDir: dataDir,
+		port:    port,
+		cmd:     cmd,
+		logBuf:  logBuf,
+		cancel:  cancel,
+	}
+	DumpOnFailure(t, "hub", logBuf)
+	t.Cleanup(func() { h.Stop(t) })
+
+	WaitForPort(t, port, 5*time.Second)
+	return h
+}
+
 // Stop signals the hub to exit and waits up to 5s for it to do so.
 func (h *Hub) Stop(t *testing.T) {
 	t.Helper()
@@ -87,16 +128,16 @@ func (h *Hub) Stop(t *testing.T) {
 	h.cmd = nil
 }
 
-// Restart stops and starts the hub on the same data dir. Address may change
-// if the OS reassigns the port.
+// Restart stops and starts the hub on the same data dir and the same port.
+// Reusing the port ensures that agents whose config.kdl still references the
+// original address can reconnect without any config change.
 func (h *Hub) Restart(t *testing.T) {
 	t.Helper()
 	h.Stop(t)
 
-	port := FreePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, HubBinaryPath, "start",
-		"--listen", fmt.Sprintf("127.0.0.1:%d", port),
+		"--listen", fmt.Sprintf("127.0.0.1:%d", h.port),
 		"--data-dir", h.DataDir,
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -108,7 +149,6 @@ func (h *Hub) Restart(t *testing.T) {
 	}
 	h.cmd = cmd
 	h.cancel = cancel
-	h.port = port
-	h.Address = fmt.Sprintf("127.0.0.1:%d", port)
-	WaitForPort(t, port, 5*time.Second)
+	// h.port and h.Address are unchanged — same endpoint as before.
+	WaitForPort(t, h.port, 5*time.Second)
 }

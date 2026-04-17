@@ -103,6 +103,21 @@ func (a *Agent) runWithStdin(t *testing.T, stdin []byte, args ...string) string 
 	return string(out)
 }
 
+// tryRun executes the hubfuse binary and returns (output, true) on zero-exit
+// or (output, false) on non-zero. It never fails the test; useful for polling
+// loops where a transient failure (e.g. hub restarting) is expected.
+func (a *Agent) tryRun(t *testing.T, args ...string) (string, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, AgentBinaryPath, args...)
+	cmd.Env = a.env()
+	out, err := cmd.CombinedOutput()
+	a.logBuf.Write([]byte("$ hubfuse " + strings.Join(args, " ") + "  (try)\n"))
+	a.logBuf.Write(out)
+	return string(out), err == nil
+}
+
 // runExpectFail executes `hubfuse <args...>` and returns combined output; it
 // does NOT fail the test on non-zero exit. Useful for asserting error paths.
 func (a *Agent) runExpectFail(t *testing.T, args ...string) string {
