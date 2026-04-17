@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ykhdr/hubfuse/internal/agent"
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -36,42 +38,37 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 		DeviceId: "watcher-dev",
 		Nickname: "watcher",
 	})
-	if err != nil || !joinWatcher.Success {
-		t.Fatalf("join watcher: err=%v success=%v", err, joinWatcher.GetSuccess())
-	}
+	require.NoError(t, err, "join watcher: err")
+	require.True(t, joinWatcher.GetSuccess(), "join watcher: success=false")
 	clientWatcher := dialWithClientCert(t, h, joinWatcher.ClientCert, joinWatcher.ClientKey)
 
 	_, err = clientWatcher.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil {
-		t.Fatalf("register watcher: %v", err)
-	}
+	require.NoError(t, err, "register watcher")
 
 	subCtx, cancelSub := context.WithCancel(context.Background())
 	t.Cleanup(cancelSub)
 	stream, err := clientWatcher.Subscribe(subCtx, &pb.SubscribeRequest{})
-	if err != nil {
-		t.Fatalf("subscribe watcher: %v", err)
-	}
-	if ev, err := stream.Recv(); err != nil || ev.GetSubscribeReady() == nil {
-		t.Fatalf("subscribe ready: %v payload=%T", err, ev.GetPayload())
-	}
+	require.NoError(t, err, "subscribe watcher")
+	ev, err := stream.Recv()
+	require.NoError(t, err, "subscribe ready: recv error")
+	require.NotNil(t, ev.GetSubscribeReady(), "subscribe ready: unexpected payload %T", ev.GetPayload())
 
 	// Join stale device; it stays offline and stale.
 	joinStale, err := unauth.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: "stale-dev",
 		Nickname: "stale",
 	})
-	if err != nil || !joinStale.Success {
-		t.Fatalf("join stale: err=%v success=%v", err, joinStale.GetSuccess())
-	}
+	require.NoError(t, err, "join stale: err")
+	require.True(t, joinStale.GetSuccess(), "join stale: success=false")
 	// Join now leaves devices in StatusRegistered; pruning only considers
 	// StatusOffline, so demote stale-dev explicitly.
-	if err := h.Store.UpdateDeviceStatus(context.Background(), "stale-dev", store.StatusOffline, "", 0); err != nil {
-		t.Fatalf("UpdateDeviceStatus stale-dev: %v", err)
-	}
+	require.NoError(t,
+		h.Store.UpdateDeviceStatus(context.Background(), "stale-dev", store.StatusOffline, "", 0),
+		"UpdateDeviceStatus stale-dev",
+	)
 
 	// Set up a stubbed mounter that records unmounts.
 	mtLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -87,9 +84,7 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 
 	mountPath := filepath.Join(t.TempDir(), "mnt")
 	mc := agentconfig.MountConfig{Device: "stale", Share: "docs", To: mountPath}
-	if err := mounter.Mount(context.Background(), mc, "127.0.0.1", 2222); err != nil {
-		t.Fatalf("pre-mount: %v", err)
-	}
+	require.NoError(t, mounter.Mount(context.Background(), mc, "127.0.0.1", 2222), "pre-mount")
 
 	done := make(chan struct{})
 	go func() {
@@ -119,11 +114,8 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 		t.Fatal("UnmountDevice not called after DeviceRemoved")
 	}
 
-	if mounter.IsActive("stale", "docs") {
-		t.Fatal("mount still active after DeviceRemoved")
-	}
+	assert.False(t, mounter.IsActive("stale", "docs"), "mount still active after DeviceRemoved")
 
-	if _, err := h.Store.GetDevice(context.Background(), "stale-dev"); err == nil {
-		t.Fatal("stale device still present after pruning")
-	}
+	_, err = h.Store.GetDevice(context.Background(), "stale-dev")
+	assert.Error(t, err, "stale device still present after pruning")
 }

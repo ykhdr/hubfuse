@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadOrGenerateCerts_AutoSANs(t *testing.T) {
@@ -16,26 +19,21 @@ func TestLoadOrGenerateCerts_AutoSANs(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	_, _, _, err := loadOrGenerateCerts(dataDir, nil, logger)
-	if err != nil {
-		t.Fatalf("loadOrGenerateCerts: %v", err)
-	}
+	require.NoError(t, err)
 
 	cert := parseServerCert(t, dataDir)
 
 	// Baseline: must contain localhost in DNSNames and 127.0.0.1 in IPAddresses.
-	if !containsString(cert.DNSNames, "localhost") {
-		t.Errorf("server cert DNSNames missing \"localhost\": %v", cert.DNSNames)
-	}
-	if !containsIP(cert.IPAddresses, net.ParseIP("127.0.0.1")) {
-		t.Errorf("server cert IPAddresses missing 127.0.0.1: %v", cert.IPAddresses)
-	}
+	assert.True(t, containsString(cert.DNSNames, "localhost"),
+		`server cert DNSNames missing "localhost": %v`, cert.DNSNames)
+	assert.True(t, containsIP(cert.IPAddresses, net.ParseIP("127.0.0.1")),
+		"server cert IPAddresses missing 127.0.0.1: %v", cert.IPAddresses)
 
 	// Hostname should be present (as DNS name if not an IP).
 	hostname, err := os.Hostname()
 	if err == nil && hostname != "" && net.ParseIP(hostname) == nil {
-		if !containsString(cert.DNSNames, hostname) {
-			t.Errorf("server cert DNSNames missing hostname %q: %v", hostname, cert.DNSNames)
-		}
+		assert.True(t, containsString(cert.DNSNames, hostname),
+			"server cert DNSNames missing hostname %q: %v", hostname, cert.DNSNames)
 	}
 }
 
@@ -45,18 +43,14 @@ func TestLoadOrGenerateCerts_ExtraSANs(t *testing.T) {
 
 	extra := []string{"10.99.99.1", "custom.example.com"}
 	_, _, _, err := loadOrGenerateCerts(dataDir, extra, logger)
-	if err != nil {
-		t.Fatalf("loadOrGenerateCerts: %v", err)
-	}
+	require.NoError(t, err)
 
 	cert := parseServerCert(t, dataDir)
 
-	if !containsIP(cert.IPAddresses, net.ParseIP("10.99.99.1")) {
-		t.Errorf("server cert IPAddresses missing 10.99.99.1: %v", cert.IPAddresses)
-	}
-	if !containsString(cert.DNSNames, "custom.example.com") {
-		t.Errorf("server cert DNSNames missing \"custom.example.com\": %v", cert.DNSNames)
-	}
+	assert.True(t, containsIP(cert.IPAddresses, net.ParseIP("10.99.99.1")),
+		"server cert IPAddresses missing 10.99.99.1: %v", cert.IPAddresses)
+	assert.True(t, containsString(cert.DNSNames, "custom.example.com"),
+		`server cert DNSNames missing "custom.example.com": %v`, cert.DNSNames)
 }
 
 func TestLoadOrGenerateCerts_ExistingCertsNotRegenerated(t *testing.T) {
@@ -65,23 +59,18 @@ func TestLoadOrGenerateCerts_ExistingCertsNotRegenerated(t *testing.T) {
 
 	// First generation.
 	_, _, _, err := loadOrGenerateCerts(dataDir, nil, logger)
-	if err != nil {
-		t.Fatalf("first loadOrGenerateCerts: %v", err)
-	}
+	require.NoError(t, err, "first loadOrGenerateCerts")
 
 	cert1 := parseServerCert(t, dataDir)
 
 	// Second call with different extra SANs — should load existing, not regenerate.
 	_, _, _, err = loadOrGenerateCerts(dataDir, []string{"10.0.0.1"}, logger)
-	if err != nil {
-		t.Fatalf("second loadOrGenerateCerts: %v", err)
-	}
+	require.NoError(t, err, "second loadOrGenerateCerts")
 
 	cert2 := parseServerCert(t, dataDir)
 
-	if cert1.SerialNumber.Cmp(cert2.SerialNumber) != 0 {
-		t.Errorf("server cert was regenerated: serial %v != %v", cert1.SerialNumber, cert2.SerialNumber)
-	}
+	assert.Zero(t, cert1.SerialNumber.Cmp(cert2.SerialNumber),
+		"server cert was regenerated: serial %v != %v", cert1.SerialNumber, cert2.SerialNumber)
 }
 
 func TestDedup(t *testing.T) {
@@ -100,17 +89,8 @@ func TestDedup(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := dedup(tc.in)
-			if len(got) != len(tc.want) {
-				t.Fatalf("dedup(%v) = %v, want %v", tc.in, got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("dedup(%v) = %v, want %v", tc.in, got, tc.want)
-				}
-			}
-			if !sort.StringsAreSorted(got) {
-				t.Errorf("dedup result not sorted: %v", got)
-			}
+			assert.Equal(t, tc.want, got, "dedup(%v)", tc.in)
+			assert.True(t, sort.StringsAreSorted(got), "dedup result not sorted: %v", got)
 		})
 	}
 }
@@ -119,17 +99,11 @@ func TestDedup(t *testing.T) {
 func parseServerCert(t *testing.T, dataDir string) *x509.Certificate {
 	t.Helper()
 	certPEM, err := os.ReadFile(filepath.Join(dataDir, "tls", "server.crt"))
-	if err != nil {
-		t.Fatalf("read server.crt: %v", err)
-	}
+	require.NoError(t, err, "read server.crt")
 	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		t.Fatal("no PEM block in server.crt")
-	}
+	require.NotNil(t, block, "no PEM block in server.crt")
 	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatalf("parse server.crt: %v", err)
-	}
+	require.NoError(t, err, "parse server.crt")
 	return cert
 }
 

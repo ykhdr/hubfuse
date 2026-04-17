@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ─── GenerateSSHKeyPair ───────────────────────────────────────────────────────
@@ -13,87 +16,63 @@ func TestGenerateSSHKeyPair_CreatesFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	pubKey, err := GenerateSSHKeyPair(dir)
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
-
-	if pubKey == "" {
-		t.Fatal("GenerateSSHKeyPair() returned empty public key")
-	}
+	require.NoError(t, err, "GenerateSSHKeyPair()")
+	require.NotEmpty(t, pubKey, "GenerateSSHKeyPair() returned empty public key")
 
 	privPath := filepath.Join(dir, "id_ed25519")
 	pubPath := filepath.Join(dir, "id_ed25519.pub")
 
-	if _, err := os.Stat(privPath); err != nil {
-		t.Errorf("private key file not found: %v", err)
-	}
-	if _, err := os.Stat(pubPath); err != nil {
-		t.Errorf("public key file not found: %v", err)
-	}
+	_, err = os.Stat(privPath)
+	assert.NoError(t, err, "private key file not found")
+	_, err = os.Stat(pubPath)
+	assert.NoError(t, err, "public key file not found")
 }
 
 func TestGenerateSSHKeyPair_PrivateKeyPermissions(t *testing.T) {
 	dir := t.TempDir()
 
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	privPath := filepath.Join(dir, "id_ed25519")
 	info, err := os.Stat(privPath)
-	if err != nil {
-		t.Fatalf("Stat(private key): %v", err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("private key permissions = %o, want 0600", info.Mode().Perm())
-	}
+	require.NoError(t, err, "Stat(private key)")
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm(), "private key permissions")
 }
 
 func TestGenerateSSHKeyPair_PublicKeyFormat(t *testing.T) {
 	dir := t.TempDir()
 
 	pubKey, err := GenerateSSHKeyPair(dir)
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	// OpenSSH ed25519 public keys start with "ssh-ed25519 ".
-	if !strings.HasPrefix(pubKey, "ssh-ed25519 ") {
-		t.Errorf("public key %q does not start with \"ssh-ed25519 \"", pubKey)
-	}
+	assert.True(t, strings.HasPrefix(pubKey, "ssh-ed25519 "), "public key %q does not start with \"ssh-ed25519 \"", pubKey)
 }
 
 func TestGenerateSSHKeyPair_PublicKeyMatchesFile(t *testing.T) {
 	dir := t.TempDir()
 
 	pubKey, err := GenerateSSHKeyPair(dir)
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	// LoadPublicKey should return the same string.
 	pubPath := filepath.Join(dir, "id_ed25519.pub")
 	loaded, err := LoadPublicKey(pubPath)
-	if err != nil {
-		t.Fatalf("LoadPublicKey(): %v", err)
-	}
+	require.NoError(t, err, "LoadPublicKey()")
 
-	if loaded != pubKey {
-		t.Errorf("loaded public key %q != generated public key %q", loaded, pubKey)
-	}
+	assert.Equal(t, pubKey, loaded, "loaded public key != generated public key")
 }
 
 func TestGenerateSSHKeyPair_CreatesDirectory(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "ssh")
 
-	if _, err := GenerateSSHKeyPair(dir); err != nil {
-		t.Fatalf("GenerateSSHKeyPair() with non-existent dir: %v", err)
-	}
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair() with non-existent dir")
 
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("directory not created: %v", err)
-	}
+	_, err = os.Stat(dir)
+	assert.NoError(t, err, "directory not created")
 }
 
 // ─── LoadPublicKey ────────────────────────────────────────────────────────────
@@ -103,24 +82,16 @@ func TestLoadPublicKey_Success(t *testing.T) {
 	path := filepath.Join(dir, "test.pub")
 
 	content := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test-key"
-	if err := os.WriteFile(path, []byte(content+"\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte(content+"\n"), 0644), "WriteFile()")
 
 	got, err := LoadPublicKey(path)
-	if err != nil {
-		t.Fatalf("LoadPublicKey(): %v", err)
-	}
-	if got != content {
-		t.Errorf("LoadPublicKey() = %q, want %q", got, content)
-	}
+	require.NoError(t, err, "LoadPublicKey()")
+	assert.Equal(t, content, got)
 }
 
 func TestLoadPublicKey_NonExistentFile(t *testing.T) {
 	_, err := LoadPublicKey("/does/not/exist/key.pub")
-	if err == nil {
-		t.Fatal("expected error for non-existent file, got nil")
-	}
+	assert.Error(t, err, "expected error for non-existent file")
 }
 
 // ─── SavePeerPublicKey / LoadPeerPublicKey ────────────────────────────────────
@@ -130,18 +101,12 @@ func TestSaveLoadPeerPublicKey_RoundTrip(t *testing.T) {
 	deviceID := "device-abc-123"
 	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test-key"
 
-	if err := SavePeerPublicKey(dir, deviceID, pubKey); err != nil {
-		t.Fatalf("SavePeerPublicKey(): %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(dir, deviceID, pubKey), "SavePeerPublicKey()")
 
 	loaded, err := LoadPeerPublicKey(dir, deviceID)
-	if err != nil {
-		t.Fatalf("LoadPeerPublicKey(): %v", err)
-	}
+	require.NoError(t, err, "LoadPeerPublicKey()")
 
-	if loaded != pubKey {
-		t.Errorf("loaded key %q != saved key %q", loaded, pubKey)
-	}
+	assert.Equal(t, pubKey, loaded)
 }
 
 func TestSaveLoadPeerPublicKey_FileNaming(t *testing.T) {
@@ -149,35 +114,27 @@ func TestSaveLoadPeerPublicKey_FileNaming(t *testing.T) {
 	deviceID := "my-device"
 	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest key"
 
-	if err := SavePeerPublicKey(dir, deviceID, pubKey); err != nil {
-		t.Fatalf("SavePeerPublicKey(): %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(dir, deviceID, pubKey), "SavePeerPublicKey()")
 
 	expectedPath := filepath.Join(dir, "my-device.pub")
-	if _, err := os.Stat(expectedPath); err != nil {
-		t.Errorf("expected file %q not found: %v", expectedPath, err)
-	}
+	_, err := os.Stat(expectedPath)
+	assert.NoError(t, err, "expected file %q not found", expectedPath)
 }
 
 func TestSaveLoadPeerPublicKey_CreatesDirectory(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "known_devices")
 
-	if err := SavePeerPublicKey(dir, "dev1", "ssh-ed25519 key"); err != nil {
-		t.Fatalf("SavePeerPublicKey() with non-existent dir: %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(dir, "dev1", "ssh-ed25519 key"), "SavePeerPublicKey() with non-existent dir")
 
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("directory not created: %v", err)
-	}
+	_, err := os.Stat(dir)
+	assert.NoError(t, err, "directory not created")
 }
 
 func TestLoadPeerPublicKey_NonExistentDevice(t *testing.T) {
 	dir := t.TempDir()
 	_, err := LoadPeerPublicKey(dir, "no-such-device")
-	if err == nil {
-		t.Fatal("expected error for non-existent device key, got nil")
-	}
+	assert.Error(t, err, "expected error for non-existent device key")
 }
 
 // ─── ListPairedDevices ────────────────────────────────────────────────────────
@@ -185,22 +142,14 @@ func TestLoadPeerPublicKey_NonExistentDevice(t *testing.T) {
 func TestListPairedDevices_Empty(t *testing.T) {
 	dir := t.TempDir()
 	devices, err := ListPairedDevices(dir)
-	if err != nil {
-		t.Fatalf("ListPairedDevices() on empty dir: %v", err)
-	}
-	if len(devices) != 0 {
-		t.Errorf("ListPairedDevices() = %v, want empty", devices)
-	}
+	require.NoError(t, err, "ListPairedDevices() on empty dir")
+	assert.Empty(t, devices)
 }
 
 func TestListPairedDevices_NonExistentDir(t *testing.T) {
 	devices, err := ListPairedDevices("/does/not/exist")
-	if err != nil {
-		t.Fatalf("ListPairedDevices() on non-existent dir: %v", err)
-	}
-	if len(devices) != 0 {
-		t.Errorf("ListPairedDevices() = %v, want empty", devices)
-	}
+	require.NoError(t, err, "ListPairedDevices() on non-existent dir")
+	assert.Empty(t, devices)
 }
 
 func TestListPairedDevices_Multiple(t *testing.T) {
@@ -208,54 +157,27 @@ func TestListPairedDevices_Multiple(t *testing.T) {
 	deviceIDs := []string{"device-a", "device-b", "device-c"}
 
 	for _, id := range deviceIDs {
-		if err := SavePeerPublicKey(dir, id, "ssh-ed25519 key"); err != nil {
-			t.Fatalf("SavePeerPublicKey(%q): %v", id, err)
-		}
+		require.NoError(t, SavePeerPublicKey(dir, id, "ssh-ed25519 key"), "SavePeerPublicKey(%q)", id)
 	}
 
 	got, err := ListPairedDevices(dir)
-	if err != nil {
-		t.Fatalf("ListPairedDevices(): %v", err)
-	}
+	require.NoError(t, err, "ListPairedDevices()")
 
-	if len(got) != len(deviceIDs) {
-		t.Fatalf("ListPairedDevices() returned %d devices, want %d", len(got), len(deviceIDs))
-	}
-
-	// Build a set for order-independent comparison.
-	gotSet := make(map[string]struct{}, len(got))
-	for _, id := range got {
-		gotSet[id] = struct{}{}
-	}
-	for _, want := range deviceIDs {
-		if _, ok := gotSet[want]; !ok {
-			t.Errorf("device %q not found in ListPairedDevices() result %v", want, got)
-		}
-	}
+	assert.ElementsMatch(t, deviceIDs, got)
 }
 
 func TestListPairedDevices_IgnoresNonPubFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	// Write a .pub file and a non-.pub file.
-	if err := SavePeerPublicKey(dir, "real-device", "ssh-ed25519 key"); err != nil {
-		t.Fatalf("SavePeerPublicKey(): %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "notakey.txt"), []byte("data"), 0644); err != nil {
-		t.Fatalf("WriteFile(): %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(dir, "real-device", "ssh-ed25519 key"), "SavePeerPublicKey()")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "notakey.txt"), []byte("data"), 0644), "WriteFile()")
 
 	got, err := ListPairedDevices(dir)
-	if err != nil {
-		t.Fatalf("ListPairedDevices(): %v", err)
-	}
+	require.NoError(t, err, "ListPairedDevices()")
 
-	if len(got) != 1 {
-		t.Fatalf("ListPairedDevices() = %v, want [real-device]", got)
-	}
-	if got[0] != "real-device" {
-		t.Errorf("ListPairedDevices()[0] = %q, want \"real-device\"", got[0])
-	}
+	assert.Len(t, got, 1)
+	assert.Equal(t, "real-device", got[0])
 }
 
 func TestListPairedDevices_IgnoresSubdirectories(t *testing.T) {
@@ -263,26 +185,16 @@ func TestListPairedDevices_IgnoresSubdirectories(t *testing.T) {
 
 	// Create a subdirectory with a .pub name.
 	subdir := filepath.Join(dir, "fake.pub")
-	if err := os.Mkdir(subdir, 0755); err != nil {
-		t.Fatalf("Mkdir(): %v", err)
-	}
+	require.NoError(t, os.Mkdir(subdir, 0755), "Mkdir()")
 
 	// Also create a real key.
-	if err := SavePeerPublicKey(dir, "real-device", "ssh-ed25519 key"); err != nil {
-		t.Fatalf("SavePeerPublicKey(): %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(dir, "real-device", "ssh-ed25519 key"), "SavePeerPublicKey()")
 
 	got, err := ListPairedDevices(dir)
-	if err != nil {
-		t.Fatalf("ListPairedDevices(): %v", err)
-	}
+	require.NoError(t, err, "ListPairedDevices()")
 
-	if len(got) != 1 {
-		t.Fatalf("ListPairedDevices() = %v, want only [real-device]", got)
-	}
-	if got[0] != "real-device" {
-		t.Errorf("ListPairedDevices()[0] = %q, want \"real-device\"", got[0])
-	}
+	assert.Len(t, got, 1)
+	assert.Equal(t, "real-device", got[0])
 }
 
 // ─── Integration: full SSH key flow ──────────────────────────────────────────
@@ -293,31 +205,20 @@ func TestSSHKeyFlow_GenerateAndPair(t *testing.T) {
 
 	// Generate key pair.
 	pubKey, err := GenerateSSHKeyPair(keyDir)
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair(): %v", err)
-	}
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
 	// Simulate a peer saving our key.
 	deviceID := "peer-device-42"
-	if err := SavePeerPublicKey(knownDir, deviceID, pubKey); err != nil {
-		t.Fatalf("SavePeerPublicKey(): %v", err)
-	}
+	require.NoError(t, SavePeerPublicKey(knownDir, deviceID, pubKey), "SavePeerPublicKey()")
 
 	// Load it back.
 	loaded, err := LoadPeerPublicKey(knownDir, deviceID)
-	if err != nil {
-		t.Fatalf("LoadPeerPublicKey(): %v", err)
-	}
-	if loaded != pubKey {
-		t.Errorf("loaded peer key %q != original %q", loaded, pubKey)
-	}
+	require.NoError(t, err, "LoadPeerPublicKey()")
+	assert.Equal(t, pubKey, loaded)
 
 	// Verify it appears in the list.
 	paired, err := ListPairedDevices(knownDir)
-	if err != nil {
-		t.Fatalf("ListPairedDevices(): %v", err)
-	}
-	if len(paired) != 1 || paired[0] != deviceID {
-		t.Errorf("ListPairedDevices() = %v, want [%s]", paired, deviceID)
-	}
+	require.NoError(t, err, "ListPairedDevices()")
+	assert.Len(t, paired, 1)
+	assert.Equal(t, deviceID, paired[0])
 }

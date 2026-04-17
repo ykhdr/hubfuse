@@ -9,6 +9,9 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 )
 
@@ -50,13 +53,9 @@ func newTestMounter(t *testing.T, _, keyPath string, capturedArgs *[]string, unm
 // writePubKeyFile writes a dummy .pub file for deviceID in dir, simulating a paired device.
 func writePubKeyFile(t *testing.T, dir, deviceID string) {
 	t.Helper()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatalf("MkdirAll(%q): %v", dir, err)
-	}
+	require.NoError(t, os.MkdirAll(dir, 0700), "MkdirAll(%q)", dir)
 	path := filepath.Join(dir, deviceID+".pub")
-	if err := os.WriteFile(path, []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(%q): %v", path, err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n"), 0644), "WriteFile(%q)", path)
 }
 
 // ─── Mount ────────────────────────────────────────────────────────────────────
@@ -78,9 +77,7 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		To:     mountTo,
 	}
 
-	if err := m.Mount(context.Background(), mc, "192.168.1.10", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "192.168.1.10", 2222), "Mount()")
 
 	// Expect: sshfs -p 2222 -o IdentityFile=<key> -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null hubfuse@192.168.1.10:documents <mountTo>
 	want := []string{
@@ -93,14 +90,7 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		mountTo,
 	}
 
-	if len(capturedArgs) != len(want) {
-		t.Fatalf("sshfs args = %v, want %v", capturedArgs, want)
-	}
-	for i, arg := range want {
-		if capturedArgs[i] != arg {
-			t.Errorf("sshfs arg[%d] = %q, want %q", i, capturedArgs[i], arg)
-		}
-	}
+	assert.Equal(t, want, capturedArgs, "sshfs args")
 }
 
 func TestMount_CreatesMountPointDirectory(t *testing.T) {
@@ -119,15 +109,11 @@ func TestMount_CreatesMountPointDirectory(t *testing.T) {
 		To:     mountTo,
 	}
 
-	if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
 
-	if _, err := os.Stat(mountTo); err != nil {
-		t.Errorf("mount point directory not created: %v", err)
-	}
+	_, err := os.Stat(mountTo)
+	assert.NoError(t, err, "mount point directory not created")
 }
-
 
 func TestMount_RejectsDuplicateMount(t *testing.T) {
 	dir := t.TempDir()
@@ -144,9 +130,7 @@ func TestMount_RejectsDuplicateMount(t *testing.T) {
 		To:     filepath.Join(dir, "mnt1"),
 	}
 
-	if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("first Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "first Mount()")
 
 	mc2 := agentconfig.MountConfig{
 		Device: "device-a",
@@ -155,9 +139,7 @@ func TestMount_RejectsDuplicateMount(t *testing.T) {
 	}
 
 	err := m.Mount(context.Background(), mc2, "10.0.0.1", 2222)
-	if err == nil {
-		t.Fatal("second Mount() expected error for duplicate, got nil")
-	}
+	assert.Error(t, err, "second Mount() expected error for duplicate")
 }
 
 func TestMount_RecordsActiveMount(t *testing.T) {
@@ -176,34 +158,18 @@ func TestMount_RecordsActiveMount(t *testing.T) {
 		To:     mountTo,
 	}
 
-	if err := m.Mount(context.Background(), mc, "192.168.1.5", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "192.168.1.5", 2222), "Mount()")
 
-	if !m.IsActive("device-a", "docs") {
-		t.Error("IsActive() = false, want true after Mount()")
-	}
+	assert.True(t, m.IsActive("device-a", "docs"), "IsActive() = false, want true after Mount()")
 
 	mounts := m.ActiveMounts()
-	if len(mounts) != 1 {
-		t.Fatalf("ActiveMounts() length = %d, want 1", len(mounts))
-	}
+	require.Len(t, mounts, 1)
 	mnt := mounts[0]
-	if mnt.Device != "device-a" {
-		t.Errorf("Mount.Device = %q, want \"device-a\"", mnt.Device)
-	}
-	if mnt.Share != "docs" {
-		t.Errorf("Mount.Share = %q, want \"docs\"", mnt.Share)
-	}
-	if mnt.IP != "192.168.1.5" {
-		t.Errorf("Mount.IP = %q, want \"192.168.1.5\"", mnt.IP)
-	}
-	if mnt.SSHPort != 2222 {
-		t.Errorf("Mount.SSHPort = %d, want 2222", mnt.SSHPort)
-	}
-	if mnt.LocalPath != mountTo {
-		t.Errorf("Mount.LocalPath = %q, want %q", mnt.LocalPath, mountTo)
-	}
+	assert.Equal(t, "device-a", mnt.Device)
+	assert.Equal(t, "docs", mnt.Share)
+	assert.Equal(t, "192.168.1.5", mnt.IP)
+	assert.Equal(t, 2222, mnt.SSHPort)
+	assert.Equal(t, mountTo, mnt.LocalPath)
 }
 
 // ─── Unmount ──────────────────────────────────────────────────────────────────
@@ -219,17 +185,10 @@ func TestUnmount_RemovesActiveMount(t *testing.T) {
 	m := newTestMounter(t, knownDir, keyPath, nil, nil)
 
 	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
-	if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
 
-	if err := m.Unmount("device-a", "docs"); err != nil {
-		t.Fatalf("Unmount(): %v", err)
-	}
-
-	if m.IsActive("device-a", "docs") {
-		t.Error("IsActive() = true after Unmount(), want false")
-	}
+	assert.False(t, m.IsActive("device-a", "docs"), "IsActive() = true after Unmount(), want false")
 }
 
 func TestUnmount_ErrorForNonExistentMount(t *testing.T) {
@@ -237,9 +196,7 @@ func TestUnmount_ErrorForNonExistentMount(t *testing.T) {
 	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
 
 	err := m.Unmount("no-device", "no-share")
-	if err == nil {
-		t.Fatal("Unmount() expected error for non-existent mount, got nil")
-	}
+	assert.Error(t, err, "Unmount() expected error for non-existent mount")
 }
 
 func TestUnmount_CallsUnmountFunction(t *testing.T) {
@@ -259,17 +216,10 @@ func TestUnmount_CallsUnmountFunction(t *testing.T) {
 	m := newTestMounter(t, knownDir, keyPath, nil, unmountFn)
 
 	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
-	if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
 
-	if err := m.Unmount("device-a", "docs"); err != nil {
-		t.Fatalf("Unmount(): %v", err)
-	}
-
-	if unmountedPath != mountTo {
-		t.Errorf("unmount called with path %q, want %q", unmountedPath, mountTo)
-	}
+	assert.Equal(t, mountTo, unmountedPath, "unmount called with wrong path")
 }
 
 // ─── UnmountAll ───────────────────────────────────────────────────────────────
@@ -291,31 +241,20 @@ func TestUnmountAll_UnmountsAllActive(t *testing.T) {
 	}
 
 	for _, mc := range mounts {
-		if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-			t.Fatalf("Mount(%q/%q): %v", mc.Device, mc.Share, err)
-		}
+		require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
 	}
 
-	if len(m.ActiveMounts()) != 3 {
-		t.Fatalf("expected 3 active mounts, got %d", len(m.ActiveMounts()))
-	}
+	require.Len(t, m.ActiveMounts(), 3, "expected 3 active mounts")
+	require.NoError(t, m.UnmountAll(), "UnmountAll()")
 
-	if err := m.UnmountAll(); err != nil {
-		t.Fatalf("UnmountAll(): %v", err)
-	}
-
-	if len(m.ActiveMounts()) != 0 {
-		t.Errorf("ActiveMounts() after UnmountAll = %d, want 0", len(m.ActiveMounts()))
-	}
+	assert.Empty(t, m.ActiveMounts(), "ActiveMounts() after UnmountAll should be empty")
 }
 
 func TestUnmountAll_EmptyIsNoOp(t *testing.T) {
 	dir := t.TempDir()
 	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
 
-	if err := m.UnmountAll(); err != nil {
-		t.Fatalf("UnmountAll() on empty mounter: %v", err)
-	}
+	assert.NoError(t, m.UnmountAll(), "UnmountAll() on empty mounter")
 }
 
 // ─── UnmountDevice ────────────────────────────────────────────────────────────
@@ -336,24 +275,14 @@ func TestUnmountDevice_UnmountsOnlyTargetDevice(t *testing.T) {
 		{Device: "device-b", Share: "music", To: filepath.Join(dir, "mnt3")},
 	}
 	for _, mc := range mounts {
-		if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-			t.Fatalf("Mount(%q/%q): %v", mc.Device, mc.Share, err)
-		}
+		require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
 	}
 
-	if err := m.UnmountDevice("device-a"); err != nil {
-		t.Fatalf("UnmountDevice(): %v", err)
-	}
+	require.NoError(t, m.UnmountDevice("device-a"), "UnmountDevice()")
 
-	if m.IsActive("device-a", "docs") {
-		t.Error("device-a/docs still active after UnmountDevice(device-a)")
-	}
-	if m.IsActive("device-a", "photos") {
-		t.Error("device-a/photos still active after UnmountDevice(device-a)")
-	}
-	if !m.IsActive("device-b", "music") {
-		t.Error("device-b/music should still be active")
-	}
+	assert.False(t, m.IsActive("device-a", "docs"), "device-a/docs still active after UnmountDevice(device-a)")
+	assert.False(t, m.IsActive("device-a", "photos"), "device-a/photos still active after UnmountDevice(device-a)")
+	assert.True(t, m.IsActive("device-b", "music"), "device-b/music should still be active")
 }
 
 // ─── IsActive ─────────────────────────────────────────────────────────────────
@@ -362,9 +291,7 @@ func TestIsActive_FalseWhenNotMounted(t *testing.T) {
 	dir := t.TempDir()
 	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
 
-	if m.IsActive("device-a", "docs") {
-		t.Error("IsActive() = true for unmounted share, want false")
-	}
+	assert.False(t, m.IsActive("device-a", "docs"), "IsActive() = true for unmounted share, want false")
 }
 
 // ─── Platform-specific unmount command ───────────────────────────────────────
@@ -378,9 +305,7 @@ func TestUnmountPath_MacOS(t *testing.T) {
 	// We can't easily test this without a real mount, so we verify the
 	// function returns an error for a non-existent path (not a mount point).
 	err := unmountPath("/tmp/not-a-real-mount-point-xyz")
-	if err == nil {
-		t.Error("unmountPath() expected error for non-mount path, got nil")
-	}
+	assert.Error(t, err, "unmountPath() expected error for non-mount path")
 }
 
 func TestUnmountPath_Linux(t *testing.T) {
@@ -391,9 +316,7 @@ func TestUnmountPath_Linux(t *testing.T) {
 	// On Linux, unmountPath calls "fusermount -u <path>".
 	// Verify it returns an error for a non-mount path.
 	err := unmountPath("/tmp/not-a-real-mount-point-xyz")
-	if err == nil {
-		t.Error("unmountPath() expected error for non-mount path, got nil")
-	}
+	assert.Error(t, err, "unmountPath() expected error for non-mount path")
 }
 
 // ─── ActiveMounts ─────────────────────────────────────────────────────────────
@@ -408,21 +331,15 @@ func TestActiveMounts_ReturnsSnapshot(t *testing.T) {
 	m := newTestMounter(t, knownDir, keyPath, nil, nil)
 
 	mounts := m.ActiveMounts()
-	if len(mounts) != 0 {
-		t.Fatalf("ActiveMounts() on empty mounter = %d, want 0", len(mounts))
-	}
+	assert.Empty(t, mounts, "ActiveMounts() on empty mounter")
 
 	mc := agentconfig.MountConfig{
 		Device: "device-a",
 		Share:  "docs",
 		To:     filepath.Join(dir, "mnt"),
 	}
-	if err := m.Mount(context.Background(), mc, "10.0.0.1", 2222); err != nil {
-		t.Fatalf("Mount(): %v", err)
-	}
+	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
 
 	mounts = m.ActiveMounts()
-	if len(mounts) != 1 {
-		t.Fatalf("ActiveMounts() = %d, want 1", len(mounts))
-	}
+	assert.Len(t, mounts, 1)
 }

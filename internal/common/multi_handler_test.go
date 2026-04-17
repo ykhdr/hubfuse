@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMultiHandler_WritesToAll(t *testing.T) {
@@ -18,12 +21,8 @@ func TestMultiHandler_WritesToAll(t *testing.T) {
 
 	logger.Info("hello", "key", "value")
 
-	if buf1.Len() == 0 {
-		t.Error("handler 1 received no output")
-	}
-	if buf2.Len() == 0 {
-		t.Error("handler 2 received no output")
-	}
+	assert.NotZero(t, buf1.Len(), "handler 1 received no output")
+	assert.NotZero(t, buf2.Len(), "handler 2 received no output")
 }
 
 func TestMultiHandler_EnabledAny(t *testing.T) {
@@ -33,9 +32,8 @@ func TestMultiHandler_EnabledAny(t *testing.T) {
 
 	multi := NewMultiHandler(h1, h2)
 
-	if !multi.Enabled(context.Background(), slog.LevelDebug) {
-		t.Error("expected Debug to be enabled (h2 accepts it)")
-	}
+	assert.True(t, multi.Enabled(context.Background(), slog.LevelDebug),
+		"expected Debug to be enabled (h2 accepts it)")
 }
 
 func TestMultiHandler_LevelFiltering(t *testing.T) {
@@ -48,12 +46,8 @@ func TestMultiHandler_LevelFiltering(t *testing.T) {
 
 	logger.Debug("debug msg")
 
-	if buf1.Len() != 0 {
-		t.Errorf("handler 1 (Error level) should have no output, got %q", buf1.String())
-	}
-	if buf2.Len() == 0 {
-		t.Error("handler 2 (Debug level) should have output")
-	}
+	assert.Zero(t, buf1.Len(), "handler 1 (Error level) should have no output, got %q", buf1.String())
+	assert.NotZero(t, buf2.Len(), "handler 2 (Debug level) should have output")
 }
 
 func TestMultiHandler_WithAttrs(t *testing.T) {
@@ -64,13 +58,9 @@ func TestMultiHandler_WithAttrs(t *testing.T) {
 	multi2 := multi.WithAttrs([]slog.Attr{slog.String("comp", "test")})
 
 	record := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
-	if err := multi2.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
+	require.NoError(t, multi2.Handle(context.Background(), record))
 
-	if !bytes.Contains(buf.Bytes(), []byte("comp=test")) {
-		t.Errorf("output %q missing attr", buf.String())
-	}
+	assert.Contains(t, buf.String(), "comp=test", "output missing attr")
 }
 
 func TestMultiHandler_WithGroup(t *testing.T) {
@@ -82,11 +72,7 @@ func TestMultiHandler_WithGroup(t *testing.T) {
 
 	record := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
 	record.AddAttrs(slog.String("key", "val"))
-	if err := multi2.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
+	require.NoError(t, multi2.Handle(context.Background(), record))
 
-	if !bytes.Contains(buf.Bytes(), []byte("grp.key=val")) {
-		t.Errorf("output %q missing grouped attr", buf.String())
-	}
+	assert.Contains(t, buf.String(), "grp.key=val", "output missing grouped attr")
 }

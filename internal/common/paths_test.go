@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestExpandHome_Tilde(t *testing.T) {
@@ -20,8 +22,6 @@ func TestExpandHome_Tilde(t *testing.T) {
 		"":          "",
 	}
 	for in, want := range cases {
-		if got := ExpandHome(in); got != want {
-			t.Errorf("ExpandHome(%q) = %q; want %q", in, got, want)
-		}
+		assert.Equal(t, want, ExpandHome(in), "ExpandHome(%q)", in)
 	}
 }

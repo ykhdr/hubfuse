@@ -4,11 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
 	pb "github.com/ykhdr/hubfuse/proto"
@@ -24,9 +25,7 @@ func dialNoClientCert(t *testing.T, addr string, caCertPEM []byte) pb.HubFuseCli
 	t.Helper()
 
 	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		t.Fatal("dialNoClientCert: failed to parse CA cert PEM")
-	}
+	require.True(t, caPool.AppendCertsFromPEM(caCertPEM), "dialNoClientCert: failed to parse CA cert PEM")
 
 	tlsCfg := &tls.Config{
 		RootCAs:    caPool,
@@ -34,9 +33,7 @@ func dialNoClientCert(t *testing.T, addr string, caCertPEM []byte) pb.HubFuseCli
 	}
 
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))) //nolint:staticcheck
-	if err != nil {
-		t.Fatalf("grpc.Dial (no cert): %v", err)
-	}
+	require.NoError(t, err, "grpc.Dial (no cert)")
 	t.Cleanup(func() { conn.Close() })
 
 	return pb.NewHubFuseClient(conn)
@@ -47,14 +44,10 @@ func dialWithClientCert(t *testing.T, addr string, certPEM, keyPEM, caCertPEM []
 	t.Helper()
 
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		t.Fatalf("dialWithClientCert: X509KeyPair: %v", err)
-	}
+	require.NoError(t, err, "dialWithClientCert: X509KeyPair")
 
 	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		t.Fatal("dialWithClientCert: failed to parse CA cert PEM")
-	}
+	require.True(t, caPool.AppendCertsFromPEM(caCertPEM), "dialWithClientCert: failed to parse CA cert PEM")
 
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -63,9 +56,7 @@ func dialWithClientCert(t *testing.T, addr string, certPEM, keyPEM, caCertPEM []
 	}
 
 	conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))) //nolint:staticcheck
-	if err != nil {
-		t.Fatalf("grpc.Dial (with cert): %v", err)
-	}
+	require.NoError(t, err, "grpc.Dial (with cert)")
 	t.Cleanup(func() { conn.Close() })
 
 	return pb.NewHubFuseClient(conn)
@@ -91,21 +82,11 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 		DeviceId: deviceID,
 		Nickname: "tester",
 	})
-	if err != nil {
-		t.Fatalf("Join RPC: %v", err)
-	}
-	if !joinResp.Success {
-		t.Fatalf("Join failed: %s", joinResp.Error)
-	}
-	if len(joinResp.ClientCert) == 0 {
-		t.Fatal("Join: ClientCert is empty")
-	}
-	if len(joinResp.ClientKey) == 0 {
-		t.Fatal("Join: ClientKey is empty")
-	}
-	if len(joinResp.CaCert) == 0 {
-		t.Fatal("Join: CaCert is empty")
-	}
+	require.NoError(t, err, "Join RPC")
+	require.True(t, joinResp.Success, "Join failed: %s", joinResp.Error)
+	require.NotEmpty(t, joinResp.ClientCert, "Join: ClientCert is empty")
+	require.NotEmpty(t, joinResp.ClientKey, "Join: ClientKey is empty")
+	require.NotEmpty(t, joinResp.CaCert, "Join: CaCert is empty")
 
 	// ── 2. Reconnect with mTLS using the received certificate ───────────────
 	authedClient := dialWithClientCert(t, h.Addr, joinResp.ClientCert, joinResp.ClientKey, joinResp.CaCert)
@@ -115,12 +96,8 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 		SshPort:         22,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil {
-		t.Fatalf("Register RPC: %v", err)
-	}
-	if !regResp.Success {
-		t.Fatalf("Register failed: %s", regResp.Error)
-	}
+	require.NoError(t, err, "Register RPC")
+	require.True(t, regResp.Success, "Register failed: %s", regResp.Error)
 
 	found := false
 	for _, d := range regResp.DevicesOnline {
@@ -129,9 +106,7 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 			break
 		}
 	}
-	if !found {
-		t.Errorf("Register: registered device %q not in DevicesOnline list", deviceID)
-	}
+	assert.True(t, found, "Register: registered device %q not in DevicesOnline list", deviceID)
 
 	// ── 4. Open Subscribe stream + verify DeviceOnline ───────────────────────
 	// Subscribe as device1 and register a second device — device1's stream
@@ -140,15 +115,11 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 	t.Cleanup(cancelSubscribe)
 
 	stream, err := authedClient.Subscribe(subscribeCtx, &pb.SubscribeRequest{})
-	if err != nil {
-		t.Fatalf("Subscribe RPC: %v", err)
-	}
+	require.NoError(t, err, "Subscribe RPC")
 	// Consume SubscribeReady sentinel before expecting real events.
-	if ev, err := stream.Recv(); err != nil {
-		t.Fatalf("Subscribe ready: %v", err)
-	} else if ev.GetSubscribeReady() == nil {
-		t.Fatalf("expected SubscribeReady, got %T", ev.GetPayload())
-	}
+	ev, err := stream.Recv()
+	require.NoError(t, err, "Subscribe ready")
+	require.NotNil(t, ev.GetSubscribeReady(), "expected SubscribeReady, got %T", ev.GetPayload())
 
 	// Join + register device2.
 	device2ID := "dev-" + uuid.New().String()
@@ -156,9 +127,8 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 		DeviceId: device2ID,
 		Nickname: "tester2",
 	})
-	if err != nil || !joinResp2.Success {
-		t.Fatalf("Join2: err=%v resp=%+v", err, joinResp2)
-	}
+	require.NoError(t, err, "Join2")
+	require.True(t, joinResp2.Success, "Join2 resp=%+v", joinResp2)
 
 	authedClient2 := dialWithClientCert(t, h.Addr, joinResp2.ClientCert, joinResp2.ClientKey, joinResp2.CaCert)
 
@@ -166,9 +136,8 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 		SshPort:         22,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil || !regResp2.Success {
-		t.Fatalf("Register2: err=%v resp=%+v", err, regResp2)
-	}
+	require.NoError(t, err, "Register2")
+	require.True(t, regResp2.Success, "Register2 resp=%+v", regResp2)
 
 	// Receive DeviceOnline event for device2 on device1's stream.
 	eventCh := make(chan *pb.Event, 1)
@@ -182,10 +151,8 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 
 	select {
 	case ev := <-eventCh:
-		if ev.GetDeviceOnline() == nil {
-			t.Errorf("expected DeviceOnline event, got %T", ev.GetPayload())
-		} else if ev.GetDeviceOnline().DeviceId != device2ID {
-			t.Errorf("DeviceOnline.DeviceId = %q, want %q", ev.GetDeviceOnline().DeviceId, device2ID)
+		if assert.NotNil(t, ev.GetDeviceOnline(), "expected DeviceOnline event, got %T", ev.GetPayload()) {
+			assert.Equal(t, device2ID, ev.GetDeviceOnline().DeviceId)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for DeviceOnline event on Subscribe stream")
@@ -193,12 +160,8 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 
 	// ── 5. Heartbeat ─────────────────────────────────────────────────────────
 	hbResp, err := authedClient.Heartbeat(context.Background(), &pb.HeartbeatRequest{})
-	if err != nil {
-		t.Fatalf("Heartbeat RPC: %v", err)
-	}
-	if !hbResp.Success {
-		t.Error("Heartbeat: success = false")
-	}
+	require.NoError(t, err, "Heartbeat RPC")
+	assert.True(t, hbResp.Success, "Heartbeat: success = false")
 
 	// ── 6. Deregister device2 → DeviceOffline on device1's stream ────────────
 	offlineCh := make(chan *pb.Event, 1)
@@ -211,19 +174,13 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 	}()
 
 	deregResp, err := authedClient2.Deregister(context.Background(), &pb.DeregisterRequest{})
-	if err != nil {
-		t.Fatalf("Deregister RPC: %v", err)
-	}
-	if !deregResp.Success {
-		t.Error("Deregister: success = false")
-	}
+	require.NoError(t, err, "Deregister RPC")
+	assert.True(t, deregResp.Success, "Deregister: success = false")
 
 	select {
 	case ev := <-offlineCh:
-		if ev.GetDeviceOffline() == nil {
-			t.Errorf("expected DeviceOffline event, got %T", ev.GetPayload())
-		} else if ev.GetDeviceOffline().DeviceId != device2ID {
-			t.Errorf("DeviceOffline.DeviceId = %q, want %q", ev.GetDeviceOffline().DeviceId, device2ID)
+		if assert.NotNil(t, ev.GetDeviceOffline(), "expected DeviceOffline event, got %T", ev.GetPayload()) {
+			assert.Equal(t, device2ID, ev.GetDeviceOffline().DeviceId)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for DeviceOffline event on Subscribe stream")
@@ -241,9 +198,7 @@ func TestIntegration_AuthenticatedRPCBlockedWithoutCert(t *testing.T) {
 		SshPort:         22,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err == nil {
-		t.Fatal("expected error calling Register without client cert, got nil")
-	}
+	assert.Error(t, err, "expected error calling Register without client cert")
 }
 
 // TestIntegration_JoinNicknameConflict verifies that a duplicate nickname
@@ -255,20 +210,13 @@ func TestIntegration_JoinNicknameConflict(t *testing.T) {
 	ctx := context.Background()
 
 	resp1, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d1", Nickname: "clash"})
-	if err != nil || !resp1.Success {
-		t.Fatalf("first Join: err=%v success=%v", err, resp1.GetSuccess())
-	}
+	require.NoError(t, err, "first Join")
+	require.True(t, resp1.GetSuccess(), "first Join success=false")
 
 	resp2, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d2", Nickname: "clash"})
-	if err != nil {
-		t.Fatalf("second Join RPC transport error: %v", err)
-	}
-	if resp2.Success {
-		t.Error("expected second Join to fail for duplicate nickname, got success=true")
-	}
-	if resp2.Error == "" {
-		t.Error("expected non-empty error message for duplicate nickname")
-	}
+	require.NoError(t, err, "second Join RPC transport error")
+	assert.False(t, resp2.Success, "expected second Join to fail for duplicate nickname")
+	assert.NotEmpty(t, resp2.Error, "expected non-empty error message for duplicate nickname")
 }
 
 func TestRequestPairing_DeviceNotFound(t *testing.T) {
@@ -279,34 +227,25 @@ func TestRequestPairing_DeviceNotFound(t *testing.T) {
 		DeviceId: "dev-pair-from",
 		Nickname: "pair-from",
 	})
-	if err != nil || !joinResp.Success {
-		t.Fatalf("Join: err=%v success=%v", err, joinResp.GetSuccess())
-	}
+	require.NoError(t, err, "Join")
+	require.True(t, joinResp.GetSuccess(), "Join success=false")
 
 	client := dialWithClientCert(t, h.Addr, joinResp.ClientCert, joinResp.ClientKey, h.CAPEM)
 	_, err = client.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	require.NoError(t, err, "Register")
 
 	// Pair with non-existent device.
 	_, err = client.RequestPairing(context.Background(), &pb.RequestPairingRequest{
 		ToDevice:  "nonexistent",
 		PublicKey: "ssh-ed25519 AAAA...",
 	})
-	if err == nil {
-		t.Fatal("expected error for non-existent device")
-	}
+	require.Error(t, err, "expected error for non-existent device")
 	st := status.Convert(err)
-	if st.Code() != codes.NotFound {
-		t.Errorf("expected NotFound, got %v", st.Code())
-	}
-	if !strings.Contains(st.Message(), "no device with nickname") {
-		t.Errorf("expected 'no device with nickname' in message, got %q", st.Message())
-	}
+	assert.Equal(t, codes.NotFound, st.Code())
+	assert.Contains(t, st.Message(), "no device with nickname")
 }
 
 func TestRequestPairing_DeviceOffline(t *testing.T) {
@@ -318,17 +257,15 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 		DeviceId: "dev-pair-1",
 		Nickname: "pair-alice",
 	})
-	if err != nil || !joinResp1.Success {
-		t.Fatalf("Join dev1: err=%v", err)
-	}
+	require.NoError(t, err, "Join dev1")
+	require.True(t, joinResp1.GetSuccess(), "Join dev1 success=false")
 
 	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: "dev-pair-2",
 		Nickname: "pair-bob",
 	})
-	if err != nil || !joinResp2.Success {
-		t.Fatalf("Join dev2: err=%v", err)
-	}
+	require.NoError(t, err, "Join dev2")
+	require.True(t, joinResp2.GetSuccess(), "Join dev2 success=false")
 
 	// Register only device 1.
 	client1 := dialWithClientCert(t, h.Addr, joinResp1.ClientCert, joinResp1.ClientKey, h.CAPEM)
@@ -336,25 +273,17 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	require.NoError(t, err, "Register")
 
 	// Pair with offline device 2.
 	_, err = client1.RequestPairing(context.Background(), &pb.RequestPairingRequest{
 		ToDevice:  "pair-bob",
 		PublicKey: "ssh-ed25519 AAAA...",
 	})
-	if err == nil {
-		t.Fatal("expected error for offline device")
-	}
+	require.Error(t, err, "expected error for offline device")
 	st := status.Convert(err)
-	if st.Code() != codes.Unavailable {
-		t.Errorf("expected Unavailable, got %v", st.Code())
-	}
-	if !strings.Contains(st.Message(), "device offline") {
-		t.Errorf("expected 'device offline' in message, got %q", st.Message())
-	}
+	assert.Equal(t, codes.Unavailable, st.Code())
+	assert.Contains(t, st.Message(), "device offline")
 }
 
 func TestListDevices(t *testing.T) {
@@ -367,46 +296,33 @@ func TestListDevices(t *testing.T) {
 		DeviceId: "dev-list-1",
 		Nickname: "list-alice",
 	})
-	if err != nil || !joinResp1.Success {
-		t.Fatalf("Join dev1: err=%v success=%v", err, joinResp1.GetSuccess())
-	}
+	require.NoError(t, err, "Join dev1")
+	require.True(t, joinResp1.GetSuccess(), "Join dev1 success=false")
 
 	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
 		DeviceId: "dev-list-2",
 		Nickname: "list-bob",
 	})
-	if err != nil || !joinResp2.Success {
-		t.Fatalf("Join dev2: err=%v success=%v", err, joinResp2.GetSuccess())
-	}
+	require.NoError(t, err, "Join dev2")
+	require.True(t, joinResp2.GetSuccess(), "Join dev2 success=false")
 
-	// Register only device 1 (device 2 stays offline).
+	// Register only device 1 (device 2 stays in registered state, not yet online).
 	client1 := dialWithClientCert(t, h.Addr, joinResp1.ClientCert, joinResp1.ClientKey, h.CAPEM)
 	_, err = client1.Register(context.Background(), &pb.RegisterRequest{
 		SshPort:         2222,
 		ProtocolVersion: int32(common.ProtocolVersion),
 	})
-	if err != nil {
-		t.Fatalf("Register dev1: %v", err)
-	}
+	require.NoError(t, err, "Register dev1")
 
 	// Call ListDevices as device 1.
 	resp, err := client1.ListDevices(context.Background(), &pb.ListDevicesRequest{})
-	if err != nil {
-		t.Fatalf("ListDevices: %v", err)
-	}
-
-	if len(resp.Devices) != 2 {
-		t.Fatalf("expected 2 devices, got %d", len(resp.Devices))
-	}
+	require.NoError(t, err, "ListDevices")
+	require.Len(t, resp.Devices, 2)
 
 	statusMap := map[string]string{}
 	for _, d := range resp.Devices {
 		statusMap[d.Nickname] = d.Status
 	}
-	if statusMap["list-alice"] != "online" {
-		t.Errorf("alice status = %q, want %q", statusMap["list-alice"], "online")
-	}
-	if statusMap["list-bob"] != "registered" {
-		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "registered")
-	}
+	assert.Equal(t, "online", statusMap["list-alice"])
+	assert.Equal(t, "registered", statusMap["list-bob"])
 }

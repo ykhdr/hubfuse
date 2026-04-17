@@ -5,17 +5,15 @@ import (
 	"os"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestLocalHosts_ContainsBaseline(t *testing.T) {
 	hosts := LocalHosts()
 	m := toSet(hosts)
-	if _, ok := m["localhost"]; !ok {
-		t.Error("LocalHosts() missing \"localhost\"")
-	}
-	if _, ok := m["127.0.0.1"]; !ok {
-		t.Error("LocalHosts() missing \"127.0.0.1\"")
-	}
+	assert.Contains(t, m, "localhost", `LocalHosts() missing "localhost"`)
+	assert.Contains(t, m, "127.0.0.1", `LocalHosts() missing "127.0.0.1"`)
 }
 
 func TestLocalHosts_ContainsHostname(t *testing.T) {
@@ -25,27 +23,22 @@ func TestLocalHosts_ContainsHostname(t *testing.T) {
 	}
 	hosts := LocalHosts()
 	m := toSet(hosts)
-	if _, ok := m[hostname]; !ok {
-		t.Errorf("LocalHosts() missing hostname %q", hostname)
-	}
+	assert.Contains(t, m, hostname, "LocalHosts() missing hostname %q", hostname)
 }
 
 func TestLocalHosts_NoDuplicates(t *testing.T) {
 	hosts := LocalHosts()
 	seen := make(map[string]struct{}, len(hosts))
 	for _, h := range hosts {
-		if _, ok := seen[h]; ok {
-			t.Errorf("duplicate entry: %q", h)
-		}
+		_, ok := seen[h]
+		assert.False(t, ok, "duplicate entry: %q", h)
 		seen[h] = struct{}{}
 	}
 }
 
 func TestLocalHosts_Sorted(t *testing.T) {
 	hosts := LocalHosts()
-	if !sort.StringsAreSorted(hosts) {
-		t.Errorf("LocalHosts() not sorted: %v", hosts)
-	}
+	assert.True(t, sort.StringsAreSorted(hosts), "LocalHosts() not sorted: %v", hosts)
 }
 
 func TestLocalHosts_ContainsNonLoopbackIP(t *testing.T) {
@@ -83,7 +76,7 @@ func TestLocalHosts_ContainsNonLoopbackIP(t *testing.T) {
 			return // found at least one
 		}
 	}
-	t.Error("LocalHosts() contains no non-loopback IP despite available interfaces")
+	assert.Fail(t, "LocalHosts() contains no non-loopback IP despite available interfaces")
 }
 
 func toSet(ss []string) map[string]struct{} {

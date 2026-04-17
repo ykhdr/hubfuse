@@ -6,34 +6,24 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSetupLogger_DefaultConsole(t *testing.T) {
 	logger, err := SetupLogger(LoggerOptions{})
-	if err != nil {
-		t.Fatalf("SetupLogger: %v", err)
-	}
-	if logger == nil {
-		t.Fatal("SetupLogger returned nil")
-	}
-	if !logger.Enabled(context.TODO(), slog.LevelInfo) {
-		t.Error("Info should be enabled by default")
-	}
-	if logger.Enabled(context.TODO(), slog.LevelDebug) {
-		t.Error("Debug should not be enabled by default")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, logger, "SetupLogger returned nil")
+	assert.True(t, logger.Enabled(context.TODO(), slog.LevelInfo), "Info should be enabled by default")
+	assert.False(t, logger.Enabled(context.TODO(), slog.LevelDebug), "Debug should not be enabled by default")
 }
 
 func TestSetupLogger_Verbose(t *testing.T) {
 	logger, err := SetupLogger(LoggerOptions{Verbose: true})
-	if err != nil {
-		t.Fatalf("SetupLogger: %v", err)
-	}
-	if !logger.Enabled(context.TODO(), slog.LevelDebug) {
-		t.Error("Debug should be enabled in verbose mode")
-	}
+	require.NoError(t, err)
+	assert.True(t, logger.Enabled(context.TODO(), slog.LevelDebug), "Debug should be enabled in verbose mode")
 }
 
 func TestSetupLogger_WithLogFile(t *testing.T) {
@@ -44,30 +34,18 @@ func TestSetupLogger_WithLogFile(t *testing.T) {
 		LogFile:   logPath,
 		FileLevel: slog.LevelDebug,
 	})
-	if err != nil {
-		t.Fatalf("SetupLogger: %v", err)
-	}
+	require.NoError(t, err)
 
 	logger.Info("test message", "key", "value")
 
 	raw, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if len(raw) == 0 {
-		t.Fatal("log file is empty")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, raw, "log file is empty")
 
 	var entry map[string]any
-	if err := json.Unmarshal(raw, &entry); err != nil {
-		t.Fatalf("not valid JSON: %v\nraw: %s", err, raw)
-	}
-	if entry["msg"] != "test message" {
-		t.Errorf("msg = %v, want %q", entry["msg"], "test message")
-	}
-	if entry["key"] != "value" {
-		t.Errorf("key = %v, want %q", entry["key"], "value")
-	}
+	require.NoError(t, json.Unmarshal(raw, &entry), "not valid JSON\nraw: %s", raw)
+	assert.Equal(t, "test message", entry["msg"])
+	assert.Equal(t, "value", entry["key"])
 }
 
 func TestSetupLogger_FileLevelFiltering(t *testing.T) {
@@ -78,39 +56,27 @@ func TestSetupLogger_FileLevelFiltering(t *testing.T) {
 		LogFile:   logPath,
 		FileLevel: slog.LevelWarn,
 	})
-	if err != nil {
-		t.Fatalf("SetupLogger: %v", err)
-	}
+	require.NoError(t, err)
 
 	logger.Info("should not appear in file")
 	logger.Warn("should appear in file")
 
 	raw, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
+	require.NoError(t, err)
 
 	content := string(raw)
-	if strings.Contains(content, "should not appear") {
-		t.Error("info message should not be in warn-level file")
-	}
+	assert.NotContains(t, content, "should not appear", "info message should not be in warn-level file")
 
 	var entry map[string]any
-	if err := json.Unmarshal(raw, &entry); err != nil {
-		t.Fatalf("not valid JSON: %v", err)
-	}
-	if entry["msg"] != "should appear in file" {
-		t.Errorf("unexpected msg: %v", entry["msg"])
-	}
+	require.NoError(t, json.Unmarshal(raw, &entry), "not valid JSON")
+	assert.Equal(t, "should appear in file", entry["msg"])
 }
 
 func TestSetupLogger_InvalidFilePath(t *testing.T) {
 	_, err := SetupLogger(LoggerOptions{
 		LogFile: "/nonexistent/dir/app.log",
 	})
-	if err == nil {
-		t.Fatal("expected error for unwritable path")
-	}
+	assert.Error(t, err, "expected error for unwritable path")
 }
 
 func TestSetupLogger_CreatesLogDir(t *testing.T) {
@@ -118,11 +84,7 @@ func TestSetupLogger_CreatesLogDir(t *testing.T) {
 	logPath := filepath.Join(dir, "subdir", "nested", "app.log")
 
 	_, err := SetupLogger(LoggerOptions{LogFile: logPath})
-	if err != nil {
-		t.Fatalf("SetupLogger: %v", err)
-	}
+	require.NoError(t, err)
 
-	if _, err := os.Stat(filepath.Dir(logPath)); os.IsNotExist(err) {
-		t.Error("expected log directory to be created")
-	}
+	require.DirExists(t, filepath.Dir(logPath), "expected log directory to be created")
 }

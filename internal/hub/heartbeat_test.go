@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/ykhdr/hubfuse/internal/hub/store"
 )
 
@@ -15,9 +17,8 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 	joinDevice(t, r, "dev-stale2", "stale-device2", "")
 
 	// Set the device online. Its last_heartbeat stays at zero (always stale).
-	if err := r.store.UpdateDeviceStatus(bg, "dev-stale2", store.StatusOnline, "10.0.0.1", 22); err != nil {
-		t.Fatalf("UpdateDeviceStatus: %v", err)
-	}
+	err := r.store.UpdateDeviceStatus(bg, "dev-stale2", store.StatusOnline, "10.0.0.1", 22)
+	require.NoError(t, err, "UpdateDeviceStatus")
 
 	timeout := 50 * time.Millisecond
 	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
@@ -30,15 +31,13 @@ func TestHeartbeatMonitor_MarksStaleDeviceOffline(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		d, err := r.store.GetDevice(bg, "dev-stale2")
-		if err != nil {
-			t.Fatalf("GetDevice: %v", err)
-		}
+		require.NoError(t, err, "GetDevice")
 		if d.Status == store.StatusOffline {
 			return // success
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Error("device was not marked offline within 2 seconds")
+	assert.Fail(t, "device was not marked offline within 2 seconds")
 }
 
 func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
@@ -50,9 +49,8 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	registerDevice(t, r, "dev-fresh", "10.0.0.1", 22)
 
 	// Update heartbeat to now so the device is fresh.
-	if err := r.Heartbeat(bg, "dev-fresh"); err != nil {
-		t.Fatalf("Heartbeat: %v", err)
-	}
+	err := r.Heartbeat(bg, "dev-fresh")
+	require.NoError(t, err, "Heartbeat")
 
 	timeout := 10 * time.Second // long timeout — device won't go stale
 	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
@@ -62,12 +60,8 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	cancel()
 
 	d, err := r.store.GetDevice(bg, "dev-fresh")
-	if err != nil {
-		t.Fatalf("GetDevice: %v", err)
-	}
-	if d.Status != store.StatusOnline {
-		t.Errorf("Status = %q, want online", d.Status)
-	}
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOnline, d.Status)
 }
 
 func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
@@ -79,9 +73,8 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	joinDevice(t, r, "dev-watcher", "watcher", "")
 
 	// Put dev-stale online with stale heartbeat.
-	if err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22); err != nil {
-		t.Fatalf("UpdateDeviceStatus: %v", err)
-	}
+	err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22)
+	require.NoError(t, err, "UpdateDeviceStatus")
 
 	ch, unsub := r.Subscribe("dev-watcher")
 	defer unsub()
@@ -93,11 +86,9 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	select {
 	case event := <-ch:
 		cancel()
-		if event.GetDeviceOffline() == nil {
-			t.Errorf("expected DeviceOffline event, got %T", event.GetPayload())
-		}
-		if event.GetDeviceOffline().DeviceId != "dev-stale" {
-			t.Errorf("DeviceId = %q, want dev-stale", event.GetDeviceOffline().DeviceId)
+		assert.NotNil(t, event.GetDeviceOffline(), "expected DeviceOffline event, got %T", event.GetPayload())
+		if event.GetDeviceOffline() != nil {
+			assert.Equal(t, "dev-stale", event.GetDeviceOffline().DeviceId)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for DeviceOffline event from heartbeat monitor")
@@ -214,7 +205,5 @@ func TestNewHeartbeatMonitor_DefaultCheckInterval(t *testing.T) {
 	monitor := NewHeartbeatMonitor(r, r.store, timeout, 0, r.logger)
 
 	expectedCheck := timeout / 3
-	if monitor.check != expectedCheck {
-		t.Errorf("check interval = %v, want %v", monitor.check, expectedCheck)
-	}
+	assert.Equal(t, expectedCheck, monitor.check)
 }

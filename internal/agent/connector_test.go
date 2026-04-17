@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestIsTLSCertError(t *testing.T) {
@@ -49,9 +51,7 @@ func TestIsTLSCertError(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := isTLSCertError(tc.err)
-			if got != tc.want {
-				t.Errorf("isTLSCertError(%v) = %v, want %v", tc.err, got, tc.want)
-			}
+			assert.Equal(t, tc.want, got, "isTLSCertError(%v)", tc.err)
 		})
 	}
 }

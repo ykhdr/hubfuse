@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -14,9 +15,7 @@ func TestFormat_AlreadyExistsWithContext(t *testing.T) {
 	got := Format(Wrap(err, &Context{Nickname: "alice"}), nil)
 	want := `error: nickname "alice" is already in use; choose a different one`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_AlreadyExistsPlainString(t *testing.T) {
@@ -25,9 +24,7 @@ func TestFormat_AlreadyExistsPlainString(t *testing.T) {
 	got := Format(Wrap(err, &Context{Nickname: "bob"}), nil)
 	want := `error: nickname "bob" is already in use; choose a different one`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_Unauthenticated(t *testing.T) {
@@ -36,9 +33,7 @@ func TestFormat_Unauthenticated(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: not joined to this hub; run "hubfuse join <hub-address>" first`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_DeviceNotFound(t *testing.T) {
@@ -47,9 +42,7 @@ func TestFormat_DeviceNotFound(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: device "bob" not found`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_InternalWithoutMessage(t *testing.T) {
@@ -58,9 +51,7 @@ func TestFormat_InternalWithoutMessage(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: internal"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestIsNicknameTaken(t *testing.T) {
@@ -68,15 +59,9 @@ func TestIsNicknameTaken(t *testing.T) {
 	stringErr := errors.New("rpc error: code = AlreadyExists desc = nickname already taken")
 	plainErr := errors.New("nickname already taken")
 
-	if !IsNicknameTaken(statusErr) {
-		t.Fatalf("IsNicknameTaken(statusErr) = false, want true")
-	}
-	if !IsNicknameTaken(stringErr) {
-		t.Fatalf("IsNicknameTaken(stringErr) = false, want true")
-	}
-	if !IsNicknameTaken(plainErr) {
-		t.Fatalf("IsNicknameTaken(plainErr) = false, want true")
-	}
+	assert.True(t, IsNicknameTaken(statusErr), "IsNicknameTaken(statusErr)")
+	assert.True(t, IsNicknameTaken(stringErr), "IsNicknameTaken(stringErr)")
+	assert.True(t, IsNicknameTaken(plainErr), "IsNicknameTaken(plainErr)")
 }
 
 func TestFormat_FallsBackToOriginal(t *testing.T) {
@@ -84,9 +69,7 @@ func TestFormat_FallsBackToOriginal(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: plain failure"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_Unavailable_WithHubAddress(t *testing.T) {
@@ -95,9 +78,7 @@ func TestFormat_Unavailable_WithHubAddress(t *testing.T) {
 	got := Format(Wrap(err, &Context{HubAddr: "localhost:9090"}), nil)
 	want := "error: cannot reach hub at localhost:9090: connection refused"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_DeadlineExceeded_Default(t *testing.T) {
@@ -106,9 +87,7 @@ func TestFormat_DeadlineExceeded_Default(t *testing.T) {
 	got := Format(Wrap(err, &Context{HubAddr: "10.0.0.1:9090"}), nil)
 	want := "error: hub at 10.0.0.1:9090 did not respond in time"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_PermissionDenied_PairRejected(t *testing.T) {
@@ -117,9 +96,7 @@ func TestFormat_PermissionDenied_PairRejected(t *testing.T) {
 	got := Format(Wrap(err, &Context{Nickname: "carol"}), nil)
 	want := `error: pairing rejected by "carol"`
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_FailedPrecondition_UnsupportedProtocol(t *testing.T) {
@@ -128,9 +105,7 @@ func TestFormat_FailedPrecondition_UnsupportedProtocol(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: this client is incompatible with the hub (protocol mismatch)"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
 
 func TestFormat_UnknownCodeWithMessage_DropsCodePrefix(t *testing.T) {
@@ -139,7 +114,5 @@ func TestFormat_UnknownCodeWithMessage_DropsCodePrefix(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: too many foos"
 
-	if got != want {
-		t.Fatalf("Format() = %q, want %q", got, want)
-	}
+	assert.Equal(t, want, got)
 }
