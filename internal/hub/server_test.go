@@ -352,8 +352,8 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	if st.Code() != codes.Unavailable {
 		t.Errorf("expected Unavailable, got %v", st.Code())
 	}
-	if !strings.Contains(st.Message(), "not currently connected") {
-		t.Errorf("expected 'not currently connected' in message, got %q", st.Message())
+	if !strings.Contains(st.Message(), "device offline") {
+		t.Errorf("expected 'device offline' in message, got %q", st.Message())
 	}
 }
 
@@ -406,7 +406,7 @@ func TestListDevices(t *testing.T) {
 	if statusMap["list-alice"] != "online" {
 		t.Errorf("alice status = %q, want %q", statusMap["list-alice"], "online")
 	}
-	if statusMap["list-bob"] != "offline" {
-		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "offline")
+	if statusMap["list-bob"] != "registered" {
+		t.Errorf("bob status = %q, want %q", statusMap["list-bob"], "registered")
 	}
 }

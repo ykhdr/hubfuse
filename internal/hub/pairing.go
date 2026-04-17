@@ -39,10 +39,10 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 	}
 
 	if from.Status != store.StatusOnline {
-		return "", common.ErrDeviceNotFound
+		return "", common.ErrDeviceOffline
 	}
 	if to.Status != store.StatusOnline {
-		return "", status.Errorf(codes.Unavailable, "%s is not currently connected", toDevice)
+		return "", common.ErrDeviceOffline
 	}
 
 	paired, err := r.store.IsPaired(ctx, fromDevice, to.DeviceID)

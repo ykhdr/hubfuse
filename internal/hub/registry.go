@@ -36,8 +36,9 @@ func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey,
 
 // Join creates a device record in the store and returns a signed client TLS
 // certificate, private key, and the CA certificate in PEM form. It returns
-// common.ErrNicknameTaken if the nickname is already in use.
-func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM, keyPEM, caCertPEM []byte, err error) {
+// common.ErrNicknameTaken if the nickname is already in use. ip is the
+// caller's apparent address (best effort; may be empty).
+func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip string) (certPEM, keyPEM, caCertPEM []byte, err error) {
 	existing, _ := r.store.GetDeviceByNickname(ctx, nickname)
 	if existing != nil {
 		return nil, nil, nil, common.ErrNicknameTaken
@@ -46,7 +47,8 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname string) (certPEM
 	d := &store.Device{
 		DeviceID: deviceID,
 		Nickname: nickname,
-		Status:   store.StatusOffline,
+		LastIP:   ip,
+		Status:   store.StatusRegistered,
 	}
 	if err := r.store.CreateDevice(ctx, d); err != nil {
 		return nil, nil, nil, err
@@ -73,12 +75,8 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
-		return nil, err
-	}
-
-	storeShares := sharesFromProto(deviceID, shares)
-	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
+	device, err := r.store.GetDevice(ctx, deviceID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -87,9 +85,36 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, err
 	}
 
-	device, err := r.store.GetDevice(ctx, deviceID)
-	if err != nil {
+	storeShares := sharesFromProto(deviceID, shares)
+	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
 		return nil, err
+	}
+
+	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
+		return nil, err
+	}
+
+	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
+		return nil, err
+	}
+
+	current := &store.Device{
+		DeviceID: device.DeviceID,
+		Nickname: device.Nickname,
+		LastIP:   ip,
+		SSHPort:  sshPort,
+		Status:   store.StatusOnline,
+	}
+	found := false
+	for i, d := range online {
+		if d.DeviceID == deviceID {
+			online[i] = current
+			found = true
+			break
+		}
+	}
+	if !found {
+		online = append(online, current)
 	}
 
 	event := &pb.Event{

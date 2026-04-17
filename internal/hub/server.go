@@ -31,7 +31,7 @@ func NewServer(registry *Registry, logger *slog.Logger) *Server {
 // authentication — the client will receive a signed cert it can use for
 // subsequent calls.
 func (s *Server) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
-	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname)
+	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname, peerIP(ctx))
 	if err != nil {
 		return &pb.JoinResponse{Success: false, Error: err.Error()}, nil
 	}
@@ -226,13 +226,14 @@ func (s *Server) ListDevices(ctx context.Context, req *pb.ListDevicesRequest) (*
 
 	devices := make([]*pb.DeviceInfo, 0, len(all))
 	for _, d := range all {
+		status, ip := displayStatus(d)
 		devices = append(devices, &pb.DeviceInfo{
 			DeviceId: d.DeviceID,
 			Nickname: d.Nickname,
-			Ip:       d.LastIP,
+			Ip:       ip,
 			SshPort:  int32(d.SSHPort),
 			Shares:   sharesToProto(sharesByDevice[d.DeviceID]),
-			Status:   string(d.Status),
+			Status:   status,
 		})
 	}
 
@@ -251,4 +252,22 @@ func peerIP(ctx context.Context) string {
 		return p.Addr.String()
 	}
 	return host
+}
+
+// displayStatus returns the status string to expose over the API along with the
+// IP to show for that state. It treats offline devices that have never sent a
+// heartbeat as "registered" for backward compatibility with pre-registered
+// rows, and hides the IP for devices that have not yet connected.
+func displayStatus(d *store.Device) (status string, ip string) {
+	switch d.Status {
+	case store.StatusRegistered:
+		return string(store.StatusRegistered), ""
+	case store.StatusOffline:
+		if d.LastHeartbeat.IsZero() {
+			return string(store.StatusRegistered), ""
+		}
+		return string(store.StatusOffline), d.LastIP
+	default:
+		return string(d.Status), d.LastIP
+	}
 }
