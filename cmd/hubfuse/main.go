@@ -30,10 +30,8 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "hubfuse",
-		Short:         "HubFuse agent daemon",
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Use:   "hubfuse",
+		Short: "HubFuse agent daemon",
 	}
 
 	shareCmd := &cobra.Command{
@@ -59,6 +57,7 @@ func rootCmd() *cobra.Command {
 		shareCmd,
 		mountCmd,
 	)
+	silenceAll(cmd)
 	return cmd
 }
 
@@ -72,12 +71,13 @@ func joinCmd() *cobra.Command {
 			hubAddr := args[0]
 
 			deviceID := agent.GenerateDeviceID()
+			ctx := &clierrors.Context{HubAddr: hubAddr}
 
 			// Dial hub insecurely (no client cert yet).
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, err := agent.DialInsecure(hubAddr, logger)
 			if err != nil {
-				return fmt.Errorf("dial hub: %w", err)
+				return clierrors.Wrap(fmt.Errorf("dial hub: %w", err), ctx)
 			}
 			defer hubClient.Close()
 
@@ -87,7 +87,8 @@ func joinCmd() *cobra.Command {
 				resp     *pb.JoinResponse
 			)
 			printNicknameTaken := func(err error) {
-				fmt.Fprintln(os.Stderr, clierrors.Format(err, &clierrors.Context{Nickname: nickname}))
+				ctx.Nickname = nickname
+				fmt.Fprintln(os.Stderr, clierrors.Format(err, ctx))
 			}
 
 			for {
@@ -96,6 +97,7 @@ func joinCmd() *cobra.Command {
 					return err
 				}
 				nickname = n
+				ctx.Nickname = nickname
 				if nickname == "" {
 					fmt.Fprintln(os.Stderr, "error: nickname cannot be empty")
 					continue
@@ -108,7 +110,7 @@ func joinCmd() *cobra.Command {
 						printNicknameTaken(err)
 						continue
 					}
-					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), &clierrors.Context{Nickname: nickname})
+					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), ctx)
 				}
 				if !resp.Success {
 					respErr := errors.New(resp.Error)
@@ -116,7 +118,7 @@ func joinCmd() *cobra.Command {
 						printNicknameTaken(respErr)
 						continue
 					}
-					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), nil)
+					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), ctx)
 				}
 
 				break
@@ -306,15 +308,16 @@ func pairCmd() *cobra.Command {
 			}
 
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			hubClient, _, err := dialHub(dataDir, logger)
+			hubClient, _, hubAddr, err := dialHub(dataDir, logger)
 			if err != nil {
-				return fmt.Errorf("connect to hub: %w", err)
+				return clierrors.Wrap(fmt.Errorf("connect to hub: %w", err), &clierrors.Context{HubAddr: hubAddr})
 			}
 			defer hubClient.Close()
 
+			ctx := &clierrors.Context{Nickname: toDevice, HubAddr: hubAddr}
 			inviteCode, err := hubClient.RequestPairing(context.Background(), toDevice, publicKey)
 			if err != nil {
-				return clierrors.Wrap(fmt.Errorf("request pairing: %w", err), &clierrors.Context{Nickname: toDevice})
+				return clierrors.Wrap(fmt.Errorf("request pairing: %w", err), ctx)
 			}
 
 			fmt.Printf("pairing invite code: %s\n", inviteCode)
@@ -333,15 +336,15 @@ func devicesCmd() *cobra.Command {
 			dataDir := common.ExpandHome(common.AgentDataDir)
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-			hubClient, _, err := dialHub(dataDir, logger)
+			hubClient, _, hubAddr, err := dialHub(dataDir, logger)
 			if err != nil {
-				return fmt.Errorf("connect to hub: %w", err)
+				return clierrors.Wrap(fmt.Errorf("connect to hub: %w", err), &clierrors.Context{HubAddr: hubAddr})
 			}
 			defer hubClient.Close()
 
 			resp, err := hubClient.ListDevices(context.Background())
 			if err != nil {
-				return fmt.Errorf("list devices: %w", err)
+				return clierrors.Wrap(fmt.Errorf("list devices: %w", err), &clierrors.Context{HubAddr: hubAddr})
 			}
 
 			if len(resp.Devices) == 0 {
@@ -373,18 +376,19 @@ func renameCmd() *cobra.Command {
 			dataDir := common.ExpandHome(common.AgentDataDir)
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-			hubClient, identity, err := dialHub(dataDir, logger)
+			hubClient, identity, hubAddr, err := dialHub(dataDir, logger)
 			if err != nil {
-				return fmt.Errorf("connect to hub: %w", err)
+				return clierrors.Wrap(fmt.Errorf("connect to hub: %w", err), &clierrors.Context{HubAddr: hubAddr})
 			}
 			defer hubClient.Close()
 
+			ctx := &clierrors.Context{Nickname: newNickname, HubAddr: hubAddr}
 			resp, err := hubClient.Rename(context.Background(), newNickname)
 			if err != nil {
-				return clierrors.Wrap(fmt.Errorf("rename: %w", err), &clierrors.Context{Nickname: newNickname})
+				return clierrors.Wrap(fmt.Errorf("rename: %w", err), ctx)
 			}
 			if !resp.Success {
-				return clierrors.Wrap(errors.New(resp.Error), &clierrors.Context{Nickname: newNickname})
+				return clierrors.Wrap(errors.New(resp.Error), ctx)
 			}
 
 			// Update local identity.
@@ -671,6 +675,14 @@ func mountListCmd() *cobra.Command {
 	}
 }
 
+func silenceAll(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	for _, child := range cmd.Commands() {
+		silenceAll(child)
+	}
+}
+
 func promptNickname(reader *bufio.Reader) (string, error) {
 	fmt.Print("Enter nickname for this device: ")
 	nickname, err := reader.ReadString('\n')
@@ -681,11 +693,11 @@ func promptNickname(reader *bufio.Reader) (string, error) {
 }
 
 // dialHub loads the device identity and connects to the hub with mTLS.
-func dialHub(dataDir string, logger *slog.Logger) (*agent.HubClient, *agent.DeviceIdentity, error) {
+func dialHub(dataDir string, logger *slog.Logger) (*agent.HubClient, *agent.DeviceIdentity, string, error) {
 	identityPath := filepath.Join(dataDir, common.IdentityFile)
 	identity, err := agent.LoadIdentity(identityPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load identity: %w", err)
+		return nil, nil, "", fmt.Errorf("load identity: %w", err)
 	}
 
 	tlsDirPath := filepath.Join(dataDir, common.TLSDir)
@@ -696,16 +708,17 @@ func dialHub(dataDir string, logger *slog.Logger) (*agent.HubClient, *agent.Devi
 	cfgPath := filepath.Join(dataDir, common.ConfigFile)
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, "", fmt.Errorf("load config: %w", err)
 	}
 
-	hubClient, err := agent.DialWithMTLS(cfg.Hub.Address, caCertPath, clientCertPath, clientKeyPath, logger)
+	hubAddr := cfg.Hub.Address
+	hubClient, err := agent.DialWithMTLS(hubAddr, caCertPath, clientCertPath, clientKeyPath, logger)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial hub: %w", err)
+		return nil, nil, hubAddr, fmt.Errorf("dial hub: %w", err)
 	}
 
 	_ = common.ProtocolVersion // suppress unused import warning
-	return hubClient, identity, nil
+	return hubClient, identity, hubAddr, nil
 }
 
 // loadConfig loads the config from path, returning a default config if the

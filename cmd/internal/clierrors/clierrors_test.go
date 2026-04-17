@@ -4,7 +4,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -15,7 +14,20 @@ func TestFormat_AlreadyExistsWithContext(t *testing.T) {
 	got := Format(Wrap(err, &Context{Nickname: "alice"}), nil)
 	want := `error: nickname "alice" is already in use; choose a different one`
 
-	require.Equal(t, want, got)
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
+
+func TestFormat_AlreadyExistsPlainString(t *testing.T) {
+	err := errors.New("nickname already taken")
+
+	got := Format(Wrap(err, &Context{Nickname: "bob"}), nil)
+	want := `error: nickname "bob" is already in use; choose a different one`
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
 }
 
 func TestFormat_Unauthenticated(t *testing.T) {
@@ -24,7 +36,9 @@ func TestFormat_Unauthenticated(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: not joined to this hub; run "hubfuse join <hub-address>" first`
 
-	require.Equal(t, want, got)
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
 }
 
 func TestFormat_DeviceNotFound(t *testing.T) {
@@ -33,7 +47,9 @@ func TestFormat_DeviceNotFound(t *testing.T) {
 	got := Format(err, nil)
 	want := `error: device "bob" not found`
 
-	require.Equal(t, want, got)
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
 }
 
 func TestFormat_InternalWithoutMessage(t *testing.T) {
@@ -42,15 +58,25 @@ func TestFormat_InternalWithoutMessage(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: internal"
 
-	require.Equal(t, want, got)
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
 }
 
 func TestIsNicknameTaken(t *testing.T) {
 	statusErr := grpcstatus.Error(codes.AlreadyExists, "nickname already taken")
 	stringErr := errors.New("rpc error: code = AlreadyExists desc = nickname already taken")
+	plainErr := errors.New("nickname already taken")
 
-	require.True(t, IsNicknameTaken(statusErr))
-	require.True(t, IsNicknameTaken(stringErr))
+	if !IsNicknameTaken(statusErr) {
+		t.Fatalf("IsNicknameTaken(statusErr) = false, want true")
+	}
+	if !IsNicknameTaken(stringErr) {
+		t.Fatalf("IsNicknameTaken(stringErr) = false, want true")
+	}
+	if !IsNicknameTaken(plainErr) {
+		t.Fatalf("IsNicknameTaken(plainErr) = false, want true")
+	}
 }
 
 func TestFormat_FallsBackToOriginal(t *testing.T) {
@@ -58,5 +84,51 @@ func TestFormat_FallsBackToOriginal(t *testing.T) {
 	got := Format(err, nil)
 	want := "error: plain failure"
 
-	require.Equal(t, want, got)
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
+
+func TestFormat_Unavailable_WithHubAddress(t *testing.T) {
+	err := grpcstatus.Error(codes.Unavailable, "connection refused")
+
+	got := Format(Wrap(err, &Context{HubAddr: "localhost:9090"}), nil)
+	want := "error: cannot reach hub at localhost:9090: connection refused"
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
+
+func TestFormat_DeadlineExceeded_Default(t *testing.T) {
+	err := grpcstatus.Error(codes.DeadlineExceeded, "context deadline exceeded")
+
+	got := Format(Wrap(err, &Context{HubAddr: "10.0.0.1:9090"}), nil)
+	want := "error: hub at 10.0.0.1:9090 did not respond in time"
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
+
+func TestFormat_PermissionDenied_PairRejected(t *testing.T) {
+	err := grpcstatus.Error(codes.PermissionDenied, "pairing rejected by remote device")
+
+	got := Format(Wrap(err, &Context{Nickname: "carol"}), nil)
+	want := `error: pairing rejected by "carol"`
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
+}
+
+func TestFormat_FailedPrecondition_UnsupportedProtocol(t *testing.T) {
+	err := grpcstatus.Error(codes.FailedPrecondition, "unsupported protocol version")
+
+	got := Format(err, nil)
+	want := "error: this client is incompatible with the hub (protocol mismatch)"
+
+	if got != want {
+		t.Fatalf("Format() = %q, want %q", got, want)
+	}
 }

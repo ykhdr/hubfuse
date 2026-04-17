@@ -24,12 +24,11 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:           "hubfuse-hub",
-		Short:         "HubFuse hub server",
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Use:   "hubfuse-hub",
+		Short: "HubFuse hub server",
 	}
 	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
+	silenceAll(cmd)
 	return cmd
 }
 
@@ -143,5 +142,13 @@ func statusCmd() *cobra.Command {
 			pidPath := common.ExpandHome(filepath.Join(common.HubDataDir, common.HubPIDFile))
 			return daemonize.ReportStatus(pidPath, "hub")
 		},
+	}
+}
+
+func silenceAll(cmd *cobra.Command) {
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	for _, child := range cmd.Commands() {
+		silenceAll(child)
 	}
 }

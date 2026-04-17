@@ -13,6 +13,7 @@ import (
 // Context carries optional metadata that helps render a more specific message.
 type Context struct {
 	Nickname string
+	HubAddr  string
 }
 
 // Error wraps an error with optional context for downstream formatting.
@@ -72,10 +73,12 @@ func IsNicknameTaken(err error) bool {
 	if !ok {
 		return false
 	}
-	return st.Code() == codes.AlreadyExists && strings.Contains(st.Message(), "nickname")
+	return st.Code() == codes.AlreadyExists && strings.Contains(strings.ToLower(st.Message()), "nickname")
 }
 
 var statusRe = regexp.MustCompile(`code = ([A-Za-z_]+) desc = (.+)`)
+var quotedDoubleRe = regexp.MustCompile(`"([^"]+)"`)
+var quotedSingleRe = regexp.MustCompile(`'([^']+)'`)
 
 func statusFromError(err error) (*grpcstatus.Status, bool) {
 	st, ok := grpcstatus.FromError(err)
@@ -83,7 +86,13 @@ func statusFromError(err error) (*grpcstatus.Status, bool) {
 		return st, true
 	}
 
-	m := statusRe.FindStringSubmatch(err.Error())
+	msg := err.Error()
+
+	if mapped, ok := statusFromMessage(msg); ok {
+		return mapped, true
+	}
+
+	m := statusRe.FindStringSubmatch(msg)
 	if len(m) != 3 {
 		return nil, false
 	}
@@ -135,6 +144,32 @@ func codeFromString(name string) (codes.Code, bool) {
 	}
 }
 
+func statusFromMessage(msg string) (*grpcstatus.Status, bool) {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "nickname already taken"):
+		return grpcstatus.New(codes.AlreadyExists, msg), true
+	case strings.Contains(lower, "device not found") || strings.Contains(lower, "no device with nickname"):
+		return grpcstatus.New(codes.NotFound, msg), true
+	case strings.Contains(lower, "device offline") || strings.Contains(lower, "not currently connected"):
+		return grpcstatus.New(codes.Unavailable, msg), true
+	case strings.Contains(lower, "unsupported protocol version"):
+		return grpcstatus.New(codes.FailedPrecondition, msg), true
+	case strings.Contains(lower, "invalid invite code"):
+		return grpcstatus.New(codes.PermissionDenied, msg), true
+	case strings.Contains(lower, "max pairing attempts exceeded"):
+		return grpcstatus.New(codes.ResourceExhausted, msg), true
+	case strings.Contains(lower, "invite code expired"):
+		return grpcstatus.New(codes.DeadlineExceeded, msg), true
+	case strings.Contains(lower, "client certificate required"):
+		return grpcstatus.New(codes.Unauthenticated, msg), true
+	case strings.Contains(lower, "devices already paired"):
+		return grpcstatus.New(codes.AlreadyExists, msg), true
+	default:
+		return nil, false
+	}
+}
+
 func translateStatus(err error, ctx Context) (string, bool) {
 	st, ok := statusFromError(err)
 	if !ok {
@@ -168,7 +203,16 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		if strings.Contains(msg, "device offline") {
 			return "device is offline", true
 		}
-		return "hub is unavailable: " + msg, true
+		if ctx.HubAddr != "" {
+			if msg == "" {
+				return fmt.Sprintf("cannot reach hub at %s", ctx.HubAddr), true
+			}
+			return fmt.Sprintf("cannot reach hub at %s: %s", ctx.HubAddr, msg), true
+		}
+		if msg != "" {
+			return "hub is unavailable: " + msg, true
+		}
+		return "hub is unavailable", true
 	case codes.FailedPrecondition:
 		if strings.Contains(msg, "unsupported protocol version") {
 			return "this client is incompatible with the hub (protocol mismatch)", true
@@ -177,6 +221,15 @@ func translateStatus(err error, ctx Context) (string, bool) {
 	case codes.PermissionDenied:
 		if strings.Contains(msg, "invalid invite code") {
 			return "invite code is invalid", true
+		}
+		if ctx.Nickname != "" {
+			return fmt.Sprintf("pairing rejected by %q", ctx.Nickname), true
+		}
+		if nick := extractNickname(msg); nick != "" {
+			return fmt.Sprintf("pairing rejected by %q", nick), true
+		}
+		if strings.Contains(strings.ToLower(msg), "pairing rejected") {
+			return "pairing request was rejected", true
 		}
 		return msg, true
 	case codes.ResourceExhausted:
@@ -188,7 +241,13 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		if strings.Contains(msg, "invite code expired") {
 			return "invite code has expired; request a new one", true
 		}
-		return msg, true
+		if ctx.HubAddr != "" {
+			return fmt.Sprintf("hub at %s did not respond in time", ctx.HubAddr), true
+		}
+		if msg != "" {
+			return "hub did not respond in time: " + msg, true
+		}
+		return "hub did not respond in time", true
 	default:
 		code := strings.ToLower(st.Code().String())
 		if msg == "" {
@@ -199,14 +258,38 @@ func translateStatus(err error, ctx Context) (string, bool) {
 }
 
 func extractNickname(msg string) string {
-	start := strings.Index(msg, "\"")
-	end := strings.LastIndex(msg, "\"")
-	if start >= 0 && end > start {
-		return msg[start+1 : end]
+	if m := quotedDoubleRe.FindStringSubmatch(msg); len(m) == 2 {
+		return m[1]
 	}
-	if fields := strings.Fields(msg); len(fields) > 0 {
-		last := fields[len(fields)-1]
-		return strings.Trim(last, "\"'")
+	if m := quotedSingleRe.FindStringSubmatch(msg); len(m) == 2 {
+		return m[1]
+	}
+
+	if nick := nextToken(msg, "nickname"); isLikelyNickname(nick) {
+		return nick
+	}
+	if nick := nextToken(msg, "device"); isLikelyNickname(nick) {
+		return nick
+	}
+
+	return ""
+}
+
+func nextToken(msg, keyword string) string {
+	fields := strings.Fields(msg)
+	for i, f := range fields {
+		if strings.EqualFold(strings.Trim(f, "\"'"), keyword) && i+1 < len(fields) {
+			return strings.Trim(fields[i+1], "\"'")
+		}
 	}
 	return ""
+}
+
+func isLikelyNickname(word string) bool {
+	switch strings.ToLower(word) {
+	case "", "already", "taken", "is", "not", "device", "nickname", "offline":
+		return false
+	default:
+		return true
+	}
 }
