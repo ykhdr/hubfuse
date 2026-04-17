@@ -1,6 +1,5 @@
-# REGRESSION for issue #20. Remove the `skip` line below once #20 is fixed.
-skip 'tracks issue #20: usage suppressed for arg-validation errors'
-
+# Regression for issue #20: extra positional args must show the
+# arg-validation error AND the usage block.
 ! exec hubfuse join hub:9090 extra
 stderr 'accepts 1 arg\(s\), received 2'
 stderr 'Usage:'
