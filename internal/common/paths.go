@@ -19,6 +19,7 @@ const (
 	TLSDir          = "tls"
 	KeysDir         = "keys"
 	KnownDevicesDir = "known_devices"
+	KnownHostsDir   = "known_hosts"
 )
 
 // Files inside a data dir.
