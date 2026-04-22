@@ -663,3 +663,74 @@ func TestPairing_Duplicate(t *testing.T) {
 	err := s.CreatePairing(ctx, "dev-a", "dev-b")
 	assert.Error(t, err, "expected error for duplicate pairing")
 }
+
+// --- Join Token tests ---
+
+func TestJoinTokenCRUD(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	jt := &JoinToken{
+		Token:     "HUB-ABC-123",
+		ExpiresAt: now.Add(10 * time.Minute),
+		CreatedAt: now,
+	}
+
+	// Create
+	require.NoError(t, s.CreateJoinToken(ctx, jt), "CreateJoinToken")
+
+	// Get returns same fields.
+	got, err := s.GetJoinToken(ctx, "HUB-ABC-123")
+	require.NoError(t, err, "GetJoinToken")
+	assert.Equal(t, jt.Token, got.Token)
+	assert.Equal(t, 0, got.Attempts)
+	require.WithinDuration(t, jt.ExpiresAt, got.ExpiresAt, time.Second)
+	require.WithinDuration(t, jt.CreatedAt, got.CreatedAt, time.Second)
+
+	// IncrementJoinTokenAttempts twice → Attempts == 2.
+	require.NoError(t, s.IncrementJoinTokenAttempts(ctx, "HUB-ABC-123"), "IncrementJoinTokenAttempts (1)")
+	require.NoError(t, s.IncrementJoinTokenAttempts(ctx, "HUB-ABC-123"), "IncrementJoinTokenAttempts (2)")
+
+	got, err = s.GetJoinToken(ctx, "HUB-ABC-123")
+	require.NoError(t, err, "GetJoinToken after increments")
+	assert.Equal(t, 2, got.Attempts)
+
+	// Delete → subsequent Get returns error.
+	require.NoError(t, s.DeleteJoinToken(ctx, "HUB-ABC-123"), "DeleteJoinToken")
+
+	_, err = s.GetJoinToken(ctx, "HUB-ABC-123")
+	assert.Error(t, err, "expected error after deletion")
+}
+
+func TestDeleteExpiredJoinTokens(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	expired := &JoinToken{
+		Token:     "HUB-EXP-001",
+		ExpiresAt: now.Add(-1 * time.Minute),
+		CreatedAt: now.Add(-2 * time.Minute),
+	}
+	live := &JoinToken{
+		Token:     "HUB-LIV-002",
+		ExpiresAt: now.Add(10 * time.Minute),
+		CreatedAt: now,
+	}
+
+	require.NoError(t, s.CreateJoinToken(ctx, expired), "CreateJoinToken expired")
+	require.NoError(t, s.CreateJoinToken(ctx, live), "CreateJoinToken live")
+
+	require.NoError(t, s.DeleteExpiredJoinTokens(ctx), "DeleteExpiredJoinTokens")
+
+	// Live token still gettable.
+	got, err := s.GetJoinToken(ctx, "HUB-LIV-002")
+	require.NoError(t, err, "GetJoinToken live after cleanup")
+	assert.Equal(t, "HUB-LIV-002", got.Token)
+
+	// Expired token gone.
+	_, err = s.GetJoinToken(ctx, "HUB-EXP-001")
+	assert.Error(t, err, "expected error for expired join token after cleanup")
+}

@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS pending_invites (
     expires_at     DATETIME,
     attempts       INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS pending_join_tokens (
+    token      TEXT PRIMARY KEY,
+    expires_at TIMESTAMP NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_join_tokens_expires_at
+    ON pending_join_tokens(expires_at);
 `
 
 var _ Store = (*sqliteStore)(nil)
@@ -480,6 +489,78 @@ func (s *sqliteStore) DeleteExpiredInvites(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, q, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("delete expired invites: %w", err)
+	}
+	return nil
+}
+
+// --- Join Tokens ---
+
+// CreateJoinToken stores a new join token.
+func (s *sqliteStore) CreateJoinToken(ctx context.Context, t *JoinToken) error {
+	const q = `
+		INSERT INTO pending_join_tokens (token, expires_at, attempts, created_at)
+		VALUES (?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, q,
+		t.Token, t.ExpiresAt.UTC(), t.Attempts, t.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("create join token %q: %w", t.Token, err)
+	}
+	return nil
+}
+
+// GetJoinToken retrieves a join token by its token string.
+func (s *sqliteStore) GetJoinToken(ctx context.Context, token string) (*JoinToken, error) {
+	const q = `
+		SELECT token, expires_at, attempts, created_at
+		FROM pending_join_tokens WHERE token = ?`
+	row := s.db.QueryRowContext(ctx, q, token)
+	var jt JoinToken
+	var expiresAt, createdAt string
+	if err := row.Scan(&jt.Token, &expiresAt, &jt.Attempts, &createdAt); err != nil {
+		return nil, fmt.Errorf("get join token %q: %w", token, err)
+	}
+	exp, err := parseDateTime(expiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse expires_at for join token %q: %w", token, err)
+	}
+	jt.ExpiresAt = exp
+	cre, err := parseDateTime(createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse created_at for join token %q: %w", token, err)
+	}
+	jt.CreatedAt = cre
+	return &jt, nil
+}
+
+// IncrementJoinTokenAttempts atomically increments the attempts counter for a
+// join token.
+func (s *sqliteStore) IncrementJoinTokenAttempts(ctx context.Context, token string) error {
+	const q = `UPDATE pending_join_tokens SET attempts = attempts + 1 WHERE token = ?`
+	_, err := s.db.ExecContext(ctx, q, token)
+	if err != nil {
+		return fmt.Errorf("increment join token attempts %q: %w", token, err)
+	}
+	return nil
+}
+
+// DeleteJoinToken removes a join token by its token string.
+func (s *sqliteStore) DeleteJoinToken(ctx context.Context, token string) error {
+	const q = `DELETE FROM pending_join_tokens WHERE token = ?`
+	_, err := s.db.ExecContext(ctx, q, token)
+	if err != nil {
+		return fmt.Errorf("delete join token %q: %w", token, err)
+	}
+	return nil
+}
+
+// DeleteExpiredJoinTokens removes all join tokens whose expires_at timestamp
+// is in the past.
+func (s *sqliteStore) DeleteExpiredJoinTokens(ctx context.Context) error {
+	const q = `DELETE FROM pending_join_tokens WHERE expires_at < ?`
+	_, err := s.db.ExecContext(ctx, q, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("delete expired join tokens: %w", err)
 	}
 	return nil
 }

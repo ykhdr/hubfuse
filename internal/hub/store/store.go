@@ -94,6 +94,25 @@ type Store interface {
 	// DeleteExpiredInvites removes all invites whose expires_at is in the past.
 	DeleteExpiredInvites(ctx context.Context) error
 
+	// Join Tokens
+
+	// CreateJoinToken stores a new join token.
+	CreateJoinToken(ctx context.Context, t *JoinToken) error
+
+	// GetJoinToken retrieves a join token by its token string.
+	GetJoinToken(ctx context.Context, token string) (*JoinToken, error)
+
+	// IncrementJoinTokenAttempts atomically increments the attempts counter for
+	// the join token identified by token.
+	IncrementJoinTokenAttempts(ctx context.Context, token string) error
+
+	// DeleteJoinToken removes a join token by its token string.
+	DeleteJoinToken(ctx context.Context, token string) error
+
+	// DeleteExpiredJoinTokens removes all join tokens whose expires_at is in
+	// the past.
+	DeleteExpiredJoinTokens(ctx context.Context) error
+
 	// Close releases the underlying database connection.
 	Close() error
 }
