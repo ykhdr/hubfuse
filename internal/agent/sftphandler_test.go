@@ -94,3 +94,34 @@ func TestACLHandlers_Filecmd_WriteClassAgainstRO(t *testing.T) {
 		assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied, "method %s on ro share", m)
 	}
 }
+
+func TestACLHandlers_Fileread_SymlinkEscapeDenied(t *testing.T) {
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("top secret"), 0o644))
+
+	shareDir := t.TempDir()
+	// Plant a symlink inside the share pointing to a file outside it.
+	require.NoError(t, os.Symlink(filepath.Join(outside, "secret.txt"),
+		filepath.Join(shareDir, "escape")))
+
+	acls := []ShareACL{{Alias: "docs", Path: shareDir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.Fileread(newRequest("Get", "/docs/escape"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied,
+		"reading through a symlink that escapes the share must be denied")
+}
+
+func TestACLHandlers_Filecmd_SymlinkAlwaysDenied(t *testing.T) {
+	dir := t.TempDir()
+	// Even a read-write share must refuse Symlink creation: letting a peer
+	// plant arbitrary symlinks would reopen the escape hole resolveReadReal
+	// exists to close.
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: false}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	req := newRequest("Symlink", "/docs/link")
+	req.Target = "/etc/passwd"
+	err := h.Filecmd(req)
+	assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
+}

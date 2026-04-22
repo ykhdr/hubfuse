@@ -108,11 +108,50 @@ func ResolveSharePath(shareRoot, virtualPath, expectedAlias string) (string, err
 	}
 
 	// Join with the real root using filepath (OS-specific separators) and
-	// verify the result is still under the root after cleaning.
+	// verify the result is still under the root. filepath.Rel correctly
+	// handles the edge case shareRoot=="/" (where a prefix check against
+	// root+sep would produce "//" and reject every legitimate child).
 	root := filepath.Clean(shareRoot)
 	joined := filepath.Clean(filepath.Join(root, rest))
-	if joined != root && !strings.HasPrefix(joined, root+string(filepath.Separator)) {
+	rel, err := filepath.Rel(root, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes share root", virtualPath)
 	}
 	return joined, nil
+}
+
+// containedReal canonicalises realPath via EvalSymlinks and verifies it still
+// lives under shareRoot (after the root's own symlinks are resolved). Returns
+// the canonical real path, or an error if the target escapes the share — the
+// usual defence against symlinks planted inside the share that point outside.
+func containedReal(shareRoot, realPath string) (string, error) {
+	rootCanon, err := filepath.EvalSymlinks(shareRoot)
+	if err != nil {
+		return "", err
+	}
+	pCanon, err := filepath.EvalSymlinks(realPath)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootCanon, pCanon)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes share root", realPath)
+	}
+	return pCanon, nil
+}
+
+// containedWritePath verifies the *parent* directory of realPath resolves
+// inside shareRoot, then returns the path built by joining the canonical
+// parent with the untouched base name. Used for operations that create or
+// replace a leaf (open-for-write, mkdir, remove, rename, link, setstat on a
+// non-existent target): EvalSymlinks requires the full path to exist, so we
+// check the parent instead and avoid following a symlink at the leaf.
+func containedWritePath(shareRoot, realPath string) (string, error) {
+	parent := filepath.Dir(realPath)
+	base := filepath.Base(realPath)
+	parentReal, err := containedReal(shareRoot, parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parentReal, base), nil
 }

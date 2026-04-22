@@ -102,3 +102,11 @@ func TestResolveSharePath_RejectsWrongAlias(t *testing.T) {
 	_, err := ResolveSharePath("/srv/docs", "/other/file", "docs")
 	assert.Error(t, err, "alias mismatch must error")
 }
+
+func TestResolveSharePath_RootShareRoot(t *testing.T) {
+	// shareRoot "/" used to fail the strings.HasPrefix(joined, "//") check
+	// for every legitimate child. It now behaves correctly via filepath.Rel.
+	got, err := ResolveSharePath("/", "/root/a.txt", "root")
+	assert.NoError(t, err)
+	assert.Equal(t, "/a.txt", got)
+}

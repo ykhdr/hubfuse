@@ -60,19 +60,110 @@ func splitVirtual(virtual string) (alias, rest string, ok bool) {
 
 func denied() error { return sftp.ErrSSHFxPermissionDenied }
 
-// Fileread — implements sftp.FileReader.
-func (h *aclHandlers) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	alias, _, ok := splitVirtual(r.Filepath)
+// resolveReadReal finds the share for virtualPath, confirms the peer is
+// allowed, returns the canonical (symlink-resolved) on-disk path contained
+// within the share root. Any escape attempt surfaces as a permission error —
+// including symlinks planted inside the share that point outside.
+func (h *aclHandlers) resolveReadReal(virtualPath string) (string, error) {
+	alias, _, ok := splitVirtual(virtualPath)
 	if !ok {
-		return nil, denied()
+		return "", denied()
 	}
 	acl, dec, found := h.findShare(alias)
 	if !found || !dec.Allow {
-		return nil, denied()
+		return "", denied()
 	}
-	real, err := ResolveSharePath(acl.Path, r.Filepath, alias)
+	lexical, err := ResolveSharePath(acl.Path, virtualPath, alias)
 	if err != nil {
-		return nil, denied()
+		return "", denied()
+	}
+	real, err := containedReal(acl.Path, lexical)
+	if err != nil {
+		return "", denied()
+	}
+	return real, nil
+}
+
+// resolveWriteReal is the write-side counterpart: performs ACL + read-only
+// checks, then verifies the *parent* directory stays inside the share root
+// (the leaf may not exist yet), returning the path built from the canonical
+// parent and the untouched base name.
+func (h *aclHandlers) resolveWriteReal(virtualPath string) (string, error) {
+	alias, _, ok := splitVirtual(virtualPath)
+	if !ok {
+		return "", denied()
+	}
+	acl, dec, found := h.findShare(alias)
+	if !found || !dec.Allow || dec.ReadOnly {
+		return "", denied()
+	}
+	lexical, err := ResolveSharePath(acl.Path, virtualPath, alias)
+	if err != nil {
+		return "", denied()
+	}
+	real, err := containedWritePath(acl.Path, lexical)
+	if err != nil {
+		return "", denied()
+	}
+	return real, nil
+}
+
+// openFlagsForRequest maps an SFTP open-request's pflags to os.OpenFile flags.
+// Falls back to the Put semantics (O_WRONLY|O_CREATE|O_TRUNC) when no flags
+// are set, which matches the simple "upload this file" contract most clients
+// use.
+func openFlagsForRequest(r *sftp.Request) int {
+	p := r.Pflags()
+	flags := 0
+	switch {
+	case p.Read && p.Write:
+		flags |= os.O_RDWR
+	case p.Write:
+		flags |= os.O_WRONLY
+	default:
+		// Reader wrote here? Default to write anyway — Filewrite is only
+		// invoked for write-class methods.
+		flags |= os.O_WRONLY
+	}
+	if p.Append {
+		flags |= os.O_APPEND
+	}
+	if p.Creat {
+		flags |= os.O_CREATE
+	}
+	if p.Trunc {
+		flags |= os.O_TRUNC
+	}
+	if p.Excl {
+		flags |= os.O_EXCL
+	}
+	// If the client sent none of the creation/trunc hints (bare Put semantics),
+	// fall back to create+truncate so the existing plain-upload path keeps
+	// working.
+	if !p.Creat && !p.Trunc && !p.Excl && !p.Append {
+		flags |= os.O_CREATE | os.O_TRUNC
+	}
+	return flags
+}
+
+// requestedMode returns the mode bits the client asked for on create, or
+// 0644 when none were specified.
+func requestedMode(r *sftp.Request) os.FileMode {
+	if r.AttrFlags().Permissions {
+		if attrs := r.Attributes(); attrs != nil {
+			if m := attrs.FileMode(); m != 0 {
+				return m & os.ModePerm
+			}
+		}
+	}
+	return 0o644
+}
+
+// Fileread — implements sftp.FileReader.
+func (h *aclHandlers) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	real, err := h.resolveReadReal(r.Filepath)
+	if err != nil {
+		return nil, err
 	}
 	f, err := os.Open(real)
 	if err != nil {
@@ -83,75 +174,88 @@ func (h *aclHandlers) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 // Filewrite — implements sftp.FileWriter.
 func (h *aclHandlers) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	alias, _, ok := splitVirtual(r.Filepath)
-	if !ok {
-		return nil, denied()
-	}
-	acl, dec, found := h.findShare(alias)
-	if !found || !dec.Allow || dec.ReadOnly {
-		return nil, denied()
-	}
-	real, err := ResolveSharePath(acl.Path, r.Filepath, alias)
+	real, err := h.resolveWriteReal(r.Filepath)
 	if err != nil {
-		return nil, denied()
+		return nil, err
 	}
-	f, err := os.OpenFile(real, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(real, openFlagsForRequest(r), requestedMode(r))
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-// Filecmd — implements sftp.FileCmder. Every method routed here is write-class.
+// Filecmd — implements sftp.FileCmder. Every method routed here is
+// write-class and therefore requires a writable share.
 func (h *aclHandlers) Filecmd(r *sftp.Request) error {
-	alias, _, ok := splitVirtual(r.Filepath)
-	if !ok {
+	// Symlink creation is unconditionally rejected: the target is untrusted
+	// peer-supplied data and a planted symlink combined with a later read
+	// would let the peer escape the share.
+	if r.Method == "Symlink" {
 		return denied()
 	}
-	acl, dec, found := h.findShare(alias)
-	if !found || !dec.Allow || dec.ReadOnly {
-		return denied()
-	}
-	real, err := ResolveSharePath(acl.Path, r.Filepath, alias)
+
+	real, err := h.resolveWriteReal(r.Filepath)
 	if err != nil {
-		return denied()
+		return err
 	}
+
 	switch r.Method {
 	case "Setstat":
-		if attrs := r.Attributes(); attrs != nil && attrs.FileMode() != 0 {
-			return os.Chmod(real, attrs.FileMode())
-		}
-		return nil
+		return h.applySetstat(r, real)
 	case "Rename":
-		targetAlias, _, tok := splitVirtual(r.Target)
-		if !tok || targetAlias != alias {
-			return denied()
-		}
-		targetReal, err := ResolveSharePath(acl.Path, r.Target, alias)
+		targetReal, err := h.resolveWriteReal(r.Target)
 		if err != nil {
-			return denied()
+			return err
 		}
 		return os.Rename(real, targetReal)
-	case "Rmdir":
-		return os.Remove(real)
-	case "Remove":
+	case "Rmdir", "Remove":
 		return os.Remove(real)
 	case "Mkdir":
 		return os.Mkdir(real, 0o755)
 	case "Link":
-		targetAlias, _, tok := splitVirtual(r.Target)
-		if !tok || targetAlias != alias {
-			return denied()
-		}
-		targetReal, err := ResolveSharePath(acl.Path, r.Target, alias)
+		targetReal, err := h.resolveWriteReal(r.Target)
 		if err != nil {
-			return denied()
+			return err
 		}
 		return os.Link(real, targetReal)
-	case "Symlink":
-		return os.Symlink(r.Target, real)
 	}
-	return denied()
+	return sftp.ErrSSHFxOpUnsupported
+}
+
+// applySetstat applies the attributes flagged in r to real. Mode, times and
+// truncate are supported; uid/gid changes are explicitly reported as
+// unsupported so clients do not silently assume the change took effect.
+func (h *aclHandlers) applySetstat(r *sftp.Request, real string) error {
+	flags := r.AttrFlags()
+	attrs := r.Attributes()
+	if attrs == nil {
+		return nil
+	}
+	if flags.Permissions {
+		if err := os.Chmod(real, attrs.FileMode()); err != nil {
+			return err
+		}
+	}
+	if flags.Acmodtime {
+		atime := time.Unix(int64(attrs.Atime), 0)
+		mtime := time.Unix(int64(attrs.Mtime), 0)
+		if err := os.Chtimes(real, atime, mtime); err != nil {
+			return err
+		}
+	}
+	if flags.Size {
+		if err := os.Truncate(real, int64(attrs.Size)); err != nil {
+			return err
+		}
+	}
+	if flags.UidGid {
+		// Deliberately refuse: changing ownership would cross the trust
+		// boundary between the peer and the host's Unix user, and silently
+		// dropping it (as the old implementation did) misleads clients.
+		return sftp.ErrSSHFxOpUnsupported
+	}
+	return nil
 }
 
 // Filelist — implements sftp.FileLister.
@@ -172,17 +276,9 @@ func (h *aclHandlers) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return listerAt(infos), nil
 	}
 
-	alias, _, ok := splitVirtual(r.Filepath)
-	if !ok {
-		return nil, denied()
-	}
-	acl, dec, found := h.findShare(alias)
-	if !found || !dec.Allow {
-		return nil, denied()
-	}
-	real, err := ResolveSharePath(acl.Path, r.Filepath, alias)
+	real, err := h.resolveReadReal(r.Filepath)
 	if err != nil {
-		return nil, denied()
+		return nil, err
 	}
 
 	switch r.Method {
@@ -216,7 +312,7 @@ func (h *aclHandlers) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		}
 		return listerAt([]os.FileInfo{renamedFileInfo{FileInfo: staticLink(target), name: target}}), nil
 	}
-	return nil, denied()
+	return nil, sftp.ErrSSHFxOpUnsupported
 }
 
 // listerAt is a trivial sftp.ListerAt over a slice.
