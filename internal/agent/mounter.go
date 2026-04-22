@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -32,10 +33,12 @@ type Mount struct {
 
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
-	keyPath      string // path to agent's SSH private key
-	logger       *slog.Logger
-	activeMounts map[mountKey]*Mount
-	mu           sync.Mutex
+	keyPath         string // path to agent's SSH private key
+	knownDevicesDir string // dir containing paired-peer public keys (<device_id>.pub)
+	knownHostsDir   string // dir where per-mount SSH known_hosts files are written
+	logger          *slog.Logger
+	activeMounts    map[mountKey]*Mount
+	mu              sync.Mutex
 
 	// execCommand is used to build commands; override in tests.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
@@ -44,22 +47,31 @@ type Mounter struct {
 }
 
 // NewMounter creates a new Mounter.
-func NewMounter(keyPath string, logger *slog.Logger) *Mounter {
+func NewMounter(keyPath, knownDevicesDir, knownHostsDir string, logger *slog.Logger) *Mounter {
 	return &Mounter{
-		keyPath:      keyPath,
-		logger:       logger,
-		activeMounts: make(map[mountKey]*Mount),
-		execCommand:  exec.CommandContext,
-		unmount:      unmountPath,
+		keyPath:         keyPath,
+		knownDevicesDir: knownDevicesDir,
+		knownHostsDir:   knownHostsDir,
+		logger:          logger,
+		activeMounts:    make(map[mountKey]*Mount),
+		execCommand:     exec.CommandContext,
+		unmount:         unmountPath,
 	}
 }
 
 // Mount mounts the remote share described by mc from deviceIP:sshPort using SSHFS.
-// Callers are responsible for ensuring the device is paired before calling Mount.
-func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceIP string, sshPort int) error {
+// Callers are responsible for ensuring the device is paired before calling Mount;
+// the peer's public key stored at <knownDevicesDir>/<deviceID>.pub is pinned as
+// the only accepted SSH host key for the connection.
+func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceID, deviceIP string, sshPort int) error {
 	// Create mount point directory if needed.
 	if err := os.MkdirAll(mc.To, 0755); err != nil {
 		return fmt.Errorf("create mount point %q: %w", mc.To, err)
+	}
+
+	knownHostsPath, err := m.writeKnownHostsFile(deviceID, deviceIP, sshPort)
+	if err != nil {
+		return err
 	}
 
 	key := mountKey{Device: mc.Device, Share: mc.Share}
@@ -75,8 +87,8 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	cmd := m.execCommand(ctx, "sshfs",
 		"-p", fmt.Sprintf("%d", sshPort),
 		"-o", fmt.Sprintf("IdentityFile=%s", m.keyPath),
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", fmt.Sprintf("UserKnownHostsFile=%s", knownHostsPath),
 		fmt.Sprintf("hubfuse@%s:%s", deviceIP, mc.Share),
 		mc.To,
 	)
@@ -103,6 +115,38 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	)
 
 	return nil
+}
+
+// writeKnownHostsFile materialises a per-device SSH known_hosts file pinning
+// the peer's public key (saved during pairing) to its current endpoint. The
+// returned path is passed to sshfs via UserKnownHostsFile, so the mount
+// connection aborts on host-key mismatch instead of trusting the network.
+func (m *Mounter) writeKnownHostsFile(deviceID, deviceIP string, sshPort int) (string, error) {
+	if m.knownDevicesDir == "" || m.knownHostsDir == "" {
+		return "", fmt.Errorf("mounter: known_devices/known_hosts directories not configured")
+	}
+
+	pubKey, err := LoadPeerPublicKey(m.knownDevicesDir, deviceID)
+	if err != nil {
+		return "", fmt.Errorf("load peer public key for device %q: %w", deviceID, err)
+	}
+
+	if err := os.MkdirAll(m.knownHostsDir, 0700); err != nil {
+		return "", fmt.Errorf("create known_hosts dir %q: %w", m.knownHostsDir, err)
+	}
+
+	hostPattern := deviceIP
+	if sshPort != 22 {
+		hostPattern = fmt.Sprintf("[%s]:%d", deviceIP, sshPort)
+	}
+	line := fmt.Sprintf("%s %s\n", hostPattern, strings.TrimRight(pubKey, "\n"))
+
+	path := filepath.Join(m.knownHostsDir, deviceID)
+	if err := os.WriteFile(path, []byte(line), 0600); err != nil {
+		return "", fmt.Errorf("write known_hosts %q: %w", path, err)
+	}
+
+	return path, nil
 }
 
 // Unmount unmounts the share identified by device and share name.

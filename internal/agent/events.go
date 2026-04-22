@@ -63,7 +63,7 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	if !d.isPaired(e.DeviceId) {
 		return
 	}
-	if err := d.mounter.Mount(context.Background(), mc, info.IP, info.SSHPort); err != nil {
+	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 		d.logger.Error("auto-mount on device-online failed",
 			"device", e.Nickname,
 			"share", mc.Share,
@@ -196,7 +196,7 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 		return
 	}
 
-	if err := d.mounter.Mount(context.Background(), mc, info.IP, info.SSHPort); err != nil {
+	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 		d.logger.Error("auto-mount after pairing failed",
 			"device", info.Nickname,
 			"share", mc.Share,

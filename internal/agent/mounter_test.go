@@ -21,11 +21,14 @@ func discardLogger() *slog.Logger {
 }
 
 // newTestMounter creates a Mounter with test overrides.
+// knownDevicesDir is where paired-peer *.pub files live; a sibling
+// "known_hosts" directory is used for the per-mount known_hosts files.
 // capturedArgs receives the args of the most recent sshfs invocation.
 // unmountFn is called when Unmount is invoked; if nil, a no-op is used.
-func newTestMounter(t *testing.T, _, keyPath string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
+func newTestMounter(t *testing.T, knownDevicesDir, keyPath string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
 	t.Helper()
-	m := NewMounter(keyPath, discardLogger())
+	knownHostsDir := filepath.Join(filepath.Dir(knownDevicesDir), "known_hosts")
+	m := NewMounter(keyPath, knownDevicesDir, knownHostsDir, discardLogger())
 
 	m.execCommand = func(_ context.Context, name string, args ...string) *exec.Cmd {
 		if capturedArgs != nil {
@@ -77,20 +80,73 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		To:     mountTo,
 	}
 
-	require.NoError(t, m.Mount(context.Background(), mc, "192.168.1.10", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "192.168.1.10", 2222), "Mount()")
 
-	// Expect: sshfs -p 2222 -o IdentityFile=<key> -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null hubfuse@192.168.1.10:documents <mountTo>
+	knownHostsPath := filepath.Join(dir, "known_hosts", "device-a")
 	want := []string{
 		"sshfs",
 		"-p", "2222",
 		"-o", "IdentityFile=" + keyPath,
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHostsPath,
 		"hubfuse@192.168.1.10:documents",
 		mountTo,
 	}
 
 	assert.Equal(t, want, capturedArgs, "sshfs args")
+
+	data, err := os.ReadFile(knownHostsPath)
+	require.NoError(t, err, "read known_hosts file")
+	assert.Equal(t,
+		"[192.168.1.10]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n",
+		string(data),
+		"known_hosts contents")
+}
+
+func TestMount_FailsWhenPeerPublicKeyMissing(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, "known_devices")
+	keyPath := filepath.Join(dir, "id_ed25519")
+
+	require.NoError(t, os.MkdirAll(knownDir, 0700), "MkdirAll(knownDir)")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	mc := agentconfig.MountConfig{
+		Device: "device-x",
+		Share:  "docs",
+		To:     filepath.Join(dir, "mnt"),
+	}
+
+	err := m.Mount(context.Background(), mc, "device-x", "10.0.0.1", 2222)
+	assert.Error(t, err, "Mount() expected error when peer pubkey missing")
+	assert.False(t, m.IsActive("device-x", "docs"), "must not record mount when pubkey missing")
+}
+
+func TestMount_KnownHostsUsesPlainHostForDefaultPort(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, "known_devices")
+	keyPath := filepath.Join(dir, "id_ed25519")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	mc := agentconfig.MountConfig{
+		Device: "device-a",
+		Share:  "docs",
+		To:     filepath.Join(dir, "mnt"),
+	}
+
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 22), "Mount()")
+
+	knownHostsPath := filepath.Join(dir, "known_hosts", "device-a")
+	data, err := os.ReadFile(knownHostsPath)
+	require.NoError(t, err, "read known_hosts file")
+	assert.Equal(t,
+		"10.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n",
+		string(data),
+		"known_hosts must use unbracketed host pattern for port 22")
 }
 
 func TestMount_CreatesMountPointDirectory(t *testing.T) {
@@ -109,7 +165,7 @@ func TestMount_CreatesMountPointDirectory(t *testing.T) {
 		To:     mountTo,
 	}
 
-	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount()")
 
 	_, err := os.Stat(mountTo)
 	assert.NoError(t, err, "mount point directory not created")
@@ -130,7 +186,7 @@ func TestMount_RejectsDuplicateMount(t *testing.T) {
 		To:     filepath.Join(dir, "mnt1"),
 	}
 
-	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "first Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
 
 	mc2 := agentconfig.MountConfig{
 		Device: "device-a",
@@ -138,7 +194,7 @@ func TestMount_RejectsDuplicateMount(t *testing.T) {
 		To:     filepath.Join(dir, "mnt2"),
 	}
 
-	err := m.Mount(context.Background(), mc2, "10.0.0.1", 2222)
+	err := m.Mount(context.Background(), mc2, "device-a", "10.0.0.1", 2222)
 	assert.Error(t, err, "second Mount() expected error for duplicate")
 }
 
@@ -158,7 +214,7 @@ func TestMount_RecordsActiveMount(t *testing.T) {
 		To:     mountTo,
 	}
 
-	require.NoError(t, m.Mount(context.Background(), mc, "192.168.1.5", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "192.168.1.5", 2222), "Mount()")
 
 	assert.True(t, m.IsActive("device-a", "docs"), "IsActive() = false, want true after Mount()")
 
@@ -185,7 +241,7 @@ func TestUnmount_RemovesActiveMount(t *testing.T) {
 	m := newTestMounter(t, knownDir, keyPath, nil, nil)
 
 	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
-	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount()")
 	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
 
 	assert.False(t, m.IsActive("device-a", "docs"), "IsActive() = true after Unmount(), want false")
@@ -216,7 +272,7 @@ func TestUnmount_CallsUnmountFunction(t *testing.T) {
 	m := newTestMounter(t, knownDir, keyPath, nil, unmountFn)
 
 	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
-	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount()")
 	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
 
 	assert.Equal(t, mountTo, unmountedPath, "unmount called with wrong path")
@@ -241,7 +297,7 @@ func TestUnmountAll_UnmountsAllActive(t *testing.T) {
 	}
 
 	for _, mc := range mounts {
-		require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
+		require.NoError(t, m.Mount(context.Background(), mc, mc.Device, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
 	}
 
 	require.Len(t, m.ActiveMounts(), 3, "expected 3 active mounts")
@@ -275,7 +331,7 @@ func TestUnmountDevice_UnmountsOnlyTargetDevice(t *testing.T) {
 		{Device: "device-b", Share: "music", To: filepath.Join(dir, "mnt3")},
 	}
 	for _, mc := range mounts {
-		require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
+		require.NoError(t, m.Mount(context.Background(), mc, mc.Device, "10.0.0.1", 2222), "Mount(%q/%q)", mc.Device, mc.Share)
 	}
 
 	require.NoError(t, m.UnmountDevice("device-a"), "UnmountDevice()")
@@ -338,7 +394,7 @@ func TestActiveMounts_ReturnsSnapshot(t *testing.T) {
 		Share:  "docs",
 		To:     filepath.Join(dir, "mnt"),
 	}
-	require.NoError(t, m.Mount(context.Background(), mc, "10.0.0.1", 2222), "Mount()")
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount()")
 
 	mounts = m.ActiveMounts()
 	assert.Len(t, mounts, 1)
