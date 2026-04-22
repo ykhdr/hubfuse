@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,19 +74,45 @@ func TestRegistry_Join_ExpiredToken(t *testing.T) {
 	assert.True(t, errors.Is(err, common.ErrJoinTokenExpired), "want ErrJoinTokenExpired, got %v", err)
 }
 
-func TestRegistry_Join_AttemptCap(t *testing.T) {
+// TestRegistry_Join_ConcurrentSameToken is the regression test for the race
+// Copilot flagged: multiple Joins holding the same token must produce exactly
+// one success — the atomic ClaimJoinToken is what makes that true.
+func TestRegistry_Join_ConcurrentSameToken(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
 	token, _, err := r.IssueJoinToken(ctx)
 	require.NoError(t, err, "IssueJoinToken")
 
-	// Exhaust the attempt cap by incrementing directly via the store.
-	for i := 0; i < maxJoinTokenAttempts; i++ {
-		require.NoError(t, r.store.IncrementJoinTokenAttempts(ctx, token), "IncrementJoinTokenAttempts %d", i)
+	const goroutines = 16
+	var (
+		wg       sync.WaitGroup
+		success  atomic.Int32
+		rejected atomic.Int32
+	)
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			deviceID := "race-dev-" + string(rune('A'+i))
+			nickname := "race-nick-" + string(rune('A'+i))
+			_, _, _, err := r.Join(ctx, deviceID, nickname, "", token)
+			switch {
+			case err == nil:
+				success.Add(1)
+			case errors.Is(err, common.ErrInvalidJoinToken):
+				rejected.Add(1)
+			default:
+				t.Errorf("unexpected error from concurrent Join: %v", err)
+			}
+		}()
 	}
+	close(start)
+	wg.Wait()
 
-	_, _, _, err = r.Join(ctx, "dev-1", "alice", "", token)
-	require.Error(t, err, "expected error when attempt cap exceeded")
-	assert.True(t, errors.Is(err, common.ErrMaxAttemptsExceeded), "want ErrMaxAttemptsExceeded, got %v", err)
+	assert.Equal(t, int32(1), success.Load(), "exactly one concurrent Join must succeed")
+	assert.Equal(t, int32(goroutines-1), rejected.Load(), "every other Join must be rejected as invalid")
 }

@@ -34,16 +34,16 @@ func joinDevice(t *testing.T, r *Registry, deviceID, nickname, ip string) {
 	t.Helper()
 	ctx := context.Background()
 	token, _, err := r.IssueJoinToken(ctx)
-	require.NoError(t, err, "IssueJoinToken for Join(%q, %q)", deviceID, nickname)
+	require.NoErrorf(t, err, "IssueJoinToken for Join(%q, %q)", deviceID, nickname)
 	_, _, _, err = r.Join(ctx, deviceID, nickname, ip, token)
-	require.NoError(t, err, "Join(%q, %q)", deviceID, nickname)
+	require.NoErrorf(t, err, "Join(%q, %q)", deviceID, nickname)
 }
 
 // registerDevice is a helper that calls Register (online) and fatals on error.
 func registerDevice(t *testing.T, r *Registry, deviceID, ip string, port int) []*store.Device {
 	t.Helper()
 	online, err := r.Register(context.Background(), deviceID, ip, port, nil, common.ProtocolVersion)
-	require.NoError(t, err, "Register(%q)", deviceID)
+	require.NoErrorf(t, err, "Register(%q)", deviceID)
 	return online
 }
 

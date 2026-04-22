@@ -533,25 +533,20 @@ func (s *sqliteStore) GetJoinToken(ctx context.Context, token string) (*JoinToke
 	return &jt, nil
 }
 
-// IncrementJoinTokenAttempts atomically increments the attempts counter for a
-// join token.
-func (s *sqliteStore) IncrementJoinTokenAttempts(ctx context.Context, token string) error {
-	const q = `UPDATE pending_join_tokens SET attempts = attempts + 1 WHERE token = ?`
-	_, err := s.db.ExecContext(ctx, q, token)
+// ClaimJoinToken atomically deletes the row if it exists and has not expired,
+// returning true iff a row was removed. Concurrent callers holding the same
+// token observe exactly one true return; all others get false.
+func (s *sqliteStore) ClaimJoinToken(ctx context.Context, token string, now time.Time) (bool, error) {
+	const q = `DELETE FROM pending_join_tokens WHERE token = ? AND expires_at > ?`
+	res, err := s.db.ExecContext(ctx, q, token, now.UTC())
 	if err != nil {
-		return fmt.Errorf("increment join token attempts %q: %w", token, err)
+		return false, fmt.Errorf("claim join token %q: %w", token, err)
 	}
-	return nil
-}
-
-// DeleteJoinToken removes a join token by its token string.
-func (s *sqliteStore) DeleteJoinToken(ctx context.Context, token string) error {
-	const q = `DELETE FROM pending_join_tokens WHERE token = ?`
-	_, err := s.db.ExecContext(ctx, q, token)
+	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("delete join token %q: %w", token, err)
+		return false, fmt.Errorf("claim join token %q: rows affected: %w", token, err)
 	}
-	return nil
+	return n == 1, nil
 }
 
 // DeleteExpiredJoinTokens removes all join tokens whose expires_at timestamp

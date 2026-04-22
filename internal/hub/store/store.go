@@ -99,15 +99,16 @@ type Store interface {
 	// CreateJoinToken stores a new join token.
 	CreateJoinToken(ctx context.Context, t *JoinToken) error
 
-	// GetJoinToken retrieves a join token by its token string.
+	// GetJoinToken retrieves a join token by its token string. It is intended
+	// for diagnostic use; token consumption must go through ClaimJoinToken to
+	// guarantee single-use semantics under concurrent callers.
 	GetJoinToken(ctx context.Context, token string) (*JoinToken, error)
 
-	// IncrementJoinTokenAttempts atomically increments the attempts counter for
-	// the join token identified by token.
-	IncrementJoinTokenAttempts(ctx context.Context, token string) error
-
-	// DeleteJoinToken removes a join token by its token string.
-	DeleteJoinToken(ctx context.Context, token string) error
+	// ClaimJoinToken atomically consumes a join token: a single SQL DELETE
+	// removes the row iff token matches and expires_at is strictly after now.
+	// Returns true iff a row was removed. Concurrent callers holding the same
+	// token observe exactly one true return; all others get false.
+	ClaimJoinToken(ctx context.Context, token string, now time.Time) (bool, error)
 
 	// DeleteExpiredJoinTokens removes all join tokens whose expires_at is in
 	// the past.

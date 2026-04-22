@@ -51,8 +51,13 @@ func issueJoinCmd() *cobra.Command {
 				return err
 			}
 
-			ttl := ttlOverride
-			if ttl <= 0 {
+			var ttl time.Duration
+			if cmd.Flags().Changed("ttl") {
+				if ttlOverride <= 0 {
+					return fmt.Errorf("--ttl must be positive, got %s", ttlOverride)
+				}
+				ttl = ttlOverride
+			} else {
 				cfgPath := configPath
 				if cfgPath == "" {
 					cfgPath = filepath.Join(dir, common.ConfigFile)

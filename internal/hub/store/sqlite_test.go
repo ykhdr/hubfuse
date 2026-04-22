@@ -502,7 +502,7 @@ func TestIncrementInviteAttempts(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		require.NoError(t, s.IncrementInviteAttempts(ctx, "code-abc"), "IncrementInviteAttempts (iteration %d)", i)
 		got, err := s.GetInvite(ctx, "code-abc")
-		require.NoError(t, err, "GetInvite (iteration %d)", i)
+		require.NoErrorf(t, err, "GetInvite (iteration %d)", i)
 		assert.Equal(t, i, got.Attempts)
 	}
 }
@@ -684,23 +684,41 @@ func TestJoinTokenCRUD(t *testing.T) {
 	got, err := s.GetJoinToken(ctx, "HUB-ABC-123")
 	require.NoError(t, err, "GetJoinToken")
 	assert.Equal(t, jt.Token, got.Token)
-	assert.Equal(t, 0, got.Attempts)
 	require.WithinDuration(t, jt.ExpiresAt, got.ExpiresAt, time.Second)
 	require.WithinDuration(t, jt.CreatedAt, got.CreatedAt, time.Second)
 
-	// IncrementJoinTokenAttempts twice → Attempts == 2.
-	require.NoError(t, s.IncrementJoinTokenAttempts(ctx, "HUB-ABC-123"), "IncrementJoinTokenAttempts (1)")
-	require.NoError(t, s.IncrementJoinTokenAttempts(ctx, "HUB-ABC-123"), "IncrementJoinTokenAttempts (2)")
+	// Claim removes the row and returns true exactly once.
+	claimed, err := s.ClaimJoinToken(ctx, "HUB-ABC-123", time.Now())
+	require.NoError(t, err, "ClaimJoinToken (1)")
+	assert.True(t, claimed, "first claim should succeed")
 
-	got, err = s.GetJoinToken(ctx, "HUB-ABC-123")
-	require.NoError(t, err, "GetJoinToken after increments")
-	assert.Equal(t, 2, got.Attempts)
-
-	// Delete → subsequent Get returns error.
-	require.NoError(t, s.DeleteJoinToken(ctx, "HUB-ABC-123"), "DeleteJoinToken")
+	claimed, err = s.ClaimJoinToken(ctx, "HUB-ABC-123", time.Now())
+	require.NoError(t, err, "ClaimJoinToken (2)")
+	assert.False(t, claimed, "second claim should fail (row already gone)")
 
 	_, err = s.GetJoinToken(ctx, "HUB-ABC-123")
-	assert.Error(t, err, "expected error after deletion")
+	assert.Error(t, err, "expected error after claim consumed the row")
+}
+
+func TestClaimJoinToken_RejectsExpired(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	require.NoError(t, s.CreateJoinToken(ctx, &JoinToken{
+		Token:     "HUB-EXP-777",
+		ExpiresAt: now.Add(-time.Minute),
+		CreatedAt: now.Add(-10 * time.Minute),
+	}))
+
+	claimed, err := s.ClaimJoinToken(ctx, "HUB-EXP-777", now)
+	require.NoError(t, err, "ClaimJoinToken expired")
+	assert.False(t, claimed, "expired token must not be claimable")
+
+	// Row is still there — only the sweeper removes expired rows.
+	got, err := s.GetJoinToken(ctx, "HUB-EXP-777")
+	require.NoError(t, err, "expired row should remain until sweep")
+	assert.Equal(t, "HUB-EXP-777", got.Token)
 }
 
 func TestDeleteExpiredJoinTokens(t *testing.T) {

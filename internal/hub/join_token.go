@@ -8,10 +8,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/hub/store"
 )
 
-const (
-	defaultJoinTokenTTL  = 10 * time.Minute
-	maxJoinTokenAttempts = 5
-)
+const defaultJoinTokenTTL = 10 * time.Minute
 
 // IssueJoinToken creates a single-use token authorising exactly one successful
 // Join. The returned code is in HUB-XXX-YYY format.
@@ -30,15 +27,25 @@ func (r *Registry) IssueJoinToken(ctx context.Context) (string, time.Time, error
 	return code, expiresAt, nil
 }
 
-// consumeJoinToken validates the token and increments its attempt counter. It
-// returns nil iff the token exists, is not expired, and has attempts < cap.
-// The token is NOT deleted here — callers delete on successful Join so that
-// partial failures (e.g. nickname collision) leave the token usable up to the
-// attempt cap.
+// consumeJoinToken atomically claims a token. Under concurrent Joins with the
+// same token, at most one caller observes a successful claim; every other
+// caller receives ErrInvalidJoinToken. On a failed claim we do a best-effort
+// diagnostic read to distinguish "expired" from "missing", but the claim
+// itself — not the read — is what grants access.
 func (r *Registry) consumeJoinToken(ctx context.Context, token string) error {
 	if token == "" {
 		return common.ErrInvalidJoinToken
 	}
+	claimed, err := r.store.ClaimJoinToken(ctx, token, time.Now())
+	if err != nil {
+		return err
+	}
+	if claimed {
+		return nil
+	}
+	// No row was deleted — either the token never existed, already expired,
+	// or was consumed by a concurrent Join. The diagnostic read is cosmetic:
+	// security does not rely on it.
 	t, err := r.store.GetJoinToken(ctx, token)
 	if err != nil {
 		return common.ErrInvalidJoinToken
@@ -46,11 +53,5 @@ func (r *Registry) consumeJoinToken(ctx context.Context, token string) error {
 	if time.Now().After(t.ExpiresAt) {
 		return common.ErrJoinTokenExpired
 	}
-	if t.Attempts >= maxJoinTokenAttempts {
-		return common.ErrMaxAttemptsExceeded
-	}
-	if err := r.store.IncrementJoinTokenAttempts(ctx, token); err != nil {
-		return err
-	}
-	return nil
+	return common.ErrInvalidJoinToken
 }

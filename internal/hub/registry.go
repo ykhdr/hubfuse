@@ -45,9 +45,11 @@ func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey,
 // Join creates a device record in the store and returns a signed client TLS
 // certificate, private key, and the CA certificate in PEM form. It validates
 // joinToken against the pending_join_tokens table and returns
-// common.ErrInvalidJoinToken / common.ErrJoinTokenExpired / common.ErrMaxAttemptsExceeded
-// on failure. It returns common.ErrNicknameTaken if the nickname is already in
-// use. ip is the caller's apparent address (best effort; may be empty).
+// common.ErrInvalidJoinToken or common.ErrJoinTokenExpired on failure. The
+// token is atomically consumed before any device state changes, so a token
+// is single-use even under concurrent Joins. It returns common.ErrNicknameTaken
+// if the nickname is already in use. ip is the caller's apparent address
+// (best effort; may be empty).
 func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip, joinToken string) (certPEM, keyPEM, caCertPEM []byte, err error) {
 	if err := r.consumeJoinToken(ctx, joinToken); err != nil {
 		return nil, nil, nil, err
@@ -78,10 +80,6 @@ func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip, joinToken s
 		Type:  "CERTIFICATE",
 		Bytes: r.caCert.Raw,
 	})
-
-	if err := r.store.DeleteJoinToken(ctx, joinToken); err != nil {
-		r.logger.Warn("delete consumed join token", slog.String("token", joinToken), slog.Any("error", err))
-	}
 
 	return certPEM, keyPEM, caCertPEM, nil
 }

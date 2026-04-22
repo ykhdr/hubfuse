@@ -50,3 +50,16 @@ func TestIssueJoinCmd_TokenStoredInDB(t *testing.T) {
 	require.NoError(t, err, "token should be queryable from store")
 	assert.Equal(t, token, jt.Token)
 }
+
+func TestIssueJoinCmd_RejectsNegativeTTL(t *testing.T) {
+	dir := t.TempDir()
+
+	cmd := issueJoinCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--data-dir", dir, "--ttl", "-5m"})
+
+	err := cmd.Execute()
+	require.Error(t, err, "negative --ttl must be rejected")
+	assert.Contains(t, err.Error(), "--ttl must be positive")
+}
