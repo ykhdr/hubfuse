@@ -1,9 +1,5 @@
 name: CI
 
-# Every job — including Scenario Tests — runs on push to master,
-# pull_request, merge_group, and manual workflow_dispatch. The
-# workflow_dispatch trigger also gives us the "Run workflow" button in
-# the Actions tab for ad-hoc re-runs.
 on:
   push:
     branches: [master]
