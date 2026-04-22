@@ -52,9 +52,14 @@ func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) 
 	// B joins first so it can subscribe before A registers.
 	unauthClient := dialNoClientCert(t, h)
 
+	lcTokB, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken B: %v", err)
+	}
 	joinRespB, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: devB,
-		Nickname: "lc-bob-" + uuid.New().String(),
+		DeviceId:  devB,
+		Nickname:  "lc-bob-" + uuid.New().String(),
+		JoinToken: lcTokB,
 	})
 	if err != nil || !joinRespB.Success {
 		t.Fatalf("Join B: err=%v success=%v", err, joinRespB.GetSuccess())
@@ -84,9 +89,14 @@ func TestIntegration_Lifecycle_DeviceOnlineOfflineAndSharesUpdate(t *testing.T) 
 	}
 
 	// A joins and registers with an initial share.
+	lcTokA, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken A: %v", err)
+	}
 	joinRespA, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: devA,
-		Nickname: "lc-alice-" + uuid.New().String(),
+		DeviceId:  devA,
+		Nickname:  "lc-alice-" + uuid.New().String(),
+		JoinToken: lcTokA,
 	})
 	if err != nil || !joinRespA.Success {
 		t.Fatalf("Join A: err=%v success=%v", err, joinRespA.GetSuccess())

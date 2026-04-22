@@ -23,9 +23,14 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 	deviceID := "reconnect-dev-" + uuid.New().String()
 
 	unauthClient1 := dialNoClientCert(t, h1)
+	rcTok1, _, err := h1.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken A: %v", err)
+	}
 	joinResp, err := unauthClient1.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: "reconnect-alice-" + uuid.New().String(),
+		DeviceId:  deviceID,
+		Nickname:  "reconnect-alice-" + uuid.New().String(),
+		JoinToken: rcTok1,
 	})
 	if err != nil || !joinResp.Success {
 		t.Fatalf("Join before restart: err=%v success=%v", err, joinResp.GetSuccess())
@@ -46,9 +51,14 @@ func TestIntegration_Reconnect_AgentSurvivesHubRestart(t *testing.T) {
 
 	devB := "reconnect-b-" + uuid.New().String()
 	nickB := "reconnect-bob-" + uuid.New().String()
+	rcTokB, _, err := h1.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken B: %v", err)
+	}
 	joinRespB, err := unauthClient1.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: devB,
-		Nickname: nickB,
+		DeviceId:  devB,
+		Nickname:  nickB,
+		JoinToken: rcTokB,
 	})
 	if err != nil || !joinRespB.Success {
 		t.Fatalf("Join B before restart: err=%v success=%v", err, joinRespB.GetSuccess())

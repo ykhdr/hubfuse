@@ -20,9 +20,14 @@ func joinAndRegister(t *testing.T, h *hubtest.Harness, deviceID, nickname string
 
 	unauthClient := dialNoClientCert(t, h)
 
+	tok, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("joinAndRegister: IssueJoinToken(%q): %v", nickname, err)
+	}
 	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: nickname,
+		DeviceId:  deviceID,
+		Nickname:  nickname,
+		JoinToken: tok,
 	})
 	if err != nil {
 		t.Fatalf("joinAndRegister: Join(%q): %v", nickname, err)
@@ -292,17 +297,27 @@ func TestPairing_OfflineDevice(t *testing.T) {
 	unauthClient := dialNoClientCert(t, h)
 
 	// Join two devices.
+	poTok1, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken dev1: %v", err)
+	}
 	join1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-po-1",
-		Nickname: "po-alice",
+		DeviceId:  "dev-po-1",
+		Nickname:  "po-alice",
+		JoinToken: poTok1,
 	})
 	if err != nil || !join1.Success {
 		t.Fatalf("Join dev1: err=%v", err)
 	}
 
+	poTok2, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken dev2: %v", err)
+	}
 	join2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-po-2",
-		Nickname: "po-bob",
+		DeviceId:  "dev-po-2",
+		Nickname:  "po-bob",
+		JoinToken: poTok2,
 	})
 	if err != nil || !join2.Success {
 		t.Fatalf("Join dev2: err=%v", err)
