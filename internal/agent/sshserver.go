@@ -17,14 +17,13 @@ import (
 // SSHServer is an embedded SSH/SFTP server that serves share aliases to
 // authenticated peer devices.
 type SSHServer struct {
-	config          *gossh.ServerConfig
-	shares          map[string]string // alias -> local path
-	allowedKeys     map[string]gossh.PublicKey
-	allowedKeyCache map[string]bool // marshaled key bytes -> authorized; rebuilt by UpdateAllowedKeys
-	port            int
-	listener        net.Listener
-	logger          *slog.Logger
-	mu              sync.RWMutex
+	config                *gossh.ServerConfig
+	shares                map[string]string // alias -> local path
+	deviceIDByFingerprint map[string]string // key.Marshal() -> device_id
+	port                  int
+	listener              net.Listener
+	logger                *slog.Logger
+	mu                    sync.RWMutex
 
 	// sftpRoot is the directory that contains symlinks alias -> real path.
 	sftpRoot string
@@ -47,12 +46,11 @@ func NewSSHServer(port int, hostKeyPath string, logger *slog.Logger) (*SSHServer
 	sftpRoot := filepath.Join(filepath.Dir(hostKeyPath), "sftp-root")
 
 	s := &SSHServer{
-		shares:          make(map[string]string),
-		allowedKeys:     make(map[string]gossh.PublicKey),
-		allowedKeyCache: make(map[string]bool),
-		port:            port,
-		logger:          logger,
-		sftpRoot:        sftpRoot,
+		shares:                make(map[string]string),
+		deviceIDByFingerprint: make(map[string]string),
+		port:                  port,
+		logger:                logger,
+		sftpRoot:              sftpRoot,
 	}
 
 	cfg := &gossh.ServerConfig{
@@ -65,15 +63,18 @@ func NewSSHServer(port int, hostKeyPath string, logger *slog.Logger) (*SSHServer
 }
 
 // publicKeyCallback is the SSH public key authentication callback.
-// It accepts a connection if the provided key is in the pre-built cache.
+// It accepts a connection when the presented key matches a paired device and
+// propagates the device_id to downstream handlers via Permissions.Extensions.
 func (s *SSHServer) publicKeyCallback(_ gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.allowedKeyCache[string(key.Marshal())] {
-		return &gossh.Permissions{}, nil
+	deviceID, ok := s.deviceIDByFingerprint[string(key.Marshal())]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("public key not authorized")
 	}
-	return nil, fmt.Errorf("public key not authorized")
+	return &gossh.Permissions{
+		Extensions: map[string]string{"hubfuse-device-id": deviceID},
+	}, nil
 }
 
 // UpdateShares replaces the current alias→path mapping and recreates symlinks
@@ -88,18 +89,17 @@ func (s *SSHServer) UpdateShares(shares map[string]string) {
 	}
 }
 
-// UpdateAllowedKeys replaces the set of keys that are permitted to connect
-// and rebuilds the cache used by publicKeyCallback.
+// UpdateAllowedKeys replaces the set of paired peers. The map is keyed by
+// device_id; the server rebuilds the fingerprint->device_id reverse index
+// used by publicKeyCallback.
 func (s *SSHServer) UpdateAllowedKeys(keys map[string]gossh.PublicKey) {
-	cache := make(map[string]bool, len(keys))
-	for _, k := range keys {
-		cache[string(k.Marshal())] = true
+	idx := make(map[string]string, len(keys))
+	for id, k := range keys {
+		idx[string(k.Marshal())] = id
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.allowedKeys = keys
-	s.allowedKeyCache = cache
+	s.deviceIDByFingerprint = idx
 }
 
 // rebuildSFTPRoot recreates sftpRoot with one symlink per alias pointing to

@@ -516,3 +516,24 @@ func TestSSHServer_StartListensOnPort(t *testing.T) {
 
 	cancel()
 }
+
+// ─── device_id propagation via Permissions.Extensions ────────────────────────
+
+func TestSSHServer_PublicKeyCallback_StampsDeviceID(t *testing.T) {
+	dir := t.TempDir()
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
+
+	srv, err := NewSSHServer(0, filepath.Join(dir, "id_ed25519"), discardLogger())
+	require.NoError(t, err, "NewSSHServer()")
+
+	clientDir := t.TempDir()
+	_, pub := generateTestKeyPair(t, clientDir)
+	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{"dev-bob": pub})
+
+	perms, err := srv.publicKeyCallback(nil, pub)
+	require.NoError(t, err, "publicKeyCallback()")
+	require.NotNil(t, perms, "nil Permissions")
+	assert.Equal(t, "dev-bob", perms.Extensions["hubfuse-device-id"],
+		"device_id from UpdateAllowedKeys must be propagated via ssh.Permissions.Extensions")
+}
