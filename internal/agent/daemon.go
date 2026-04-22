@@ -309,9 +309,13 @@ func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bo
 }
 
 // isPaired reports whether a device is paired by checking for a public key
-// file keyed on device_id in the known_devices directory.
+// file keyed on device_id in the known_devices directory. Returns false for
+// any deviceID that fails path-safety validation.
 func (d *Daemon) isPaired(deviceID string) bool {
-	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
+	if err := validateDeviceID(deviceID); err != nil {
+		return false
+	}
+	knownDevicesDir := filepath.Join(d.dataDir, common.KnownDevicesDir)
 	_, err := os.Stat(filepath.Join(knownDevicesDir, deviceID+".pub"))
 	return err == nil
 }

@@ -69,11 +69,6 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		return fmt.Errorf("create mount point %q: %w", mc.To, err)
 	}
 
-	knownHostsPath, err := m.writeKnownHostsFile(deviceID, deviceIP, sshPort)
-	if err != nil {
-		return err
-	}
-
 	key := mountKey{Device: mc.Device, Share: mc.Share}
 
 	m.mu.Lock()
@@ -81,6 +76,14 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 
 	if _, exists := m.activeMounts[key]; exists {
 		return fmt.Errorf("share %q from device %q is already mounted", mc.Share, mc.Device)
+	}
+
+	// Materialise known_hosts under the lock so concurrent Mounts for the same
+	// device cannot race-clobber each other, and so a duplicate-mount rejection
+	// above cannot leave a rewritten file on disk.
+	knownHostsPath, err := m.writeKnownHostsFile(deviceID, deviceIP, sshPort)
+	if err != nil {
+		return err
 	}
 
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
@@ -124,6 +127,10 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 func (m *Mounter) writeKnownHostsFile(deviceID, deviceIP string, sshPort int) (string, error) {
 	if m.knownDevicesDir == "" || m.knownHostsDir == "" {
 		return "", fmt.Errorf("mounter: known_devices/known_hosts directories not configured")
+	}
+
+	if err := validateDeviceID(deviceID); err != nil {
+		return "", err
 	}
 
 	pubKey, err := LoadPeerPublicKey(m.knownDevicesDir, deviceID)
