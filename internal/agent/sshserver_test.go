@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/sftp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gossh "golang.org/x/crypto/ssh"
@@ -244,101 +242,30 @@ func TestSSHServer_NoAllowedKeys(t *testing.T) {
 	assert.Error(t, err, "SSH dial with no allowed keys succeeded, expected failure")
 }
 
-// ─── UpdateShares / SFTP alias mapping ───────────────────────────────────────
+// ─── ACL snapshot ─────────────────────────────────────────────────────────────
 
-func TestSSHServer_UpdateShares_RebuildsSFTPRoot(t *testing.T) {
-	hostDir := t.TempDir()
-	_, err := GenerateSSHKeyPair(hostDir)
-	require.NoError(t, err, "GenerateSSHKeyPair(host)")
+func TestSSHServer_UpdateShares_StoresACLSnapshot(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := GenerateSSHKeyPair(tmp)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
 
-	srv, err := NewSSHServer(0, filepath.Join(hostDir, "id_ed25519"), discardLogger())
+	srv, err := NewSSHServer(0, filepath.Join(tmp, "id_ed25519"), discardLogger())
 	require.NoError(t, err, "NewSSHServer()")
 
-	// Create a real directory to be shared.
-	sharedDir := t.TempDir()
-	testFile := filepath.Join(sharedDir, "hello.txt")
-	require.NoError(t, os.WriteFile(testFile, []byte("hello"), 0644), "WriteFile()")
+	acls := []ShareACL{{Alias: "docs", Path: "/tmp/docs", ReadOnly: true, AllowAll: true}}
+	srv.UpdateShares(acls)
 
-	shares := map[string]string{"myalias": sharedDir}
-	srv.UpdateShares(shares)
+	snap := srv.aclSnapshot()
+	require.Len(t, snap, 1)
+	assert.Equal(t, "docs", snap[0].Alias)
+	assert.True(t, snap[0].ReadOnly)
+	assert.True(t, snap[0].AllowAll)
 
-	// Verify symlink was created.
-	linkPath := filepath.Join(srv.sftpRoot, "myalias")
-	info, err := os.Lstat(linkPath)
-	require.NoError(t, err, "Lstat(%q)", linkPath)
-	assert.NotZero(t, info.Mode()&os.ModeSymlink, "%q is not a symlink", linkPath)
-
-	// Resolve and verify target.
-	target, err := os.Readlink(linkPath)
-	require.NoError(t, err, "Readlink(%q)", linkPath)
-	assert.Equal(t, sharedDir, target, "symlink target")
-}
-
-func TestSSHServer_UpdateShares_ReplacesOldSymlinks(t *testing.T) {
-	hostDir := t.TempDir()
-	_, err := GenerateSSHKeyPair(hostDir)
-	require.NoError(t, err, "GenerateSSHKeyPair(host)")
-
-	srv, err := NewSSHServer(0, filepath.Join(hostDir, "id_ed25519"), discardLogger())
-	require.NoError(t, err, "NewSSHServer()")
-
-	dir1 := t.TempDir()
-	dir2 := t.TempDir()
-
-	srv.UpdateShares(map[string]string{"alias-old": dir1})
-	srv.UpdateShares(map[string]string{"alias-new": dir2})
-
-	// Old symlink should be gone.
-	_, err = os.Lstat(filepath.Join(srv.sftpRoot, "alias-old"))
-	assert.True(t, os.IsNotExist(err), "old symlink still exists after UpdateShares")
-
-	// New symlink should exist.
-	_, err = os.Lstat(filepath.Join(srv.sftpRoot, "alias-new"))
-	assert.NoError(t, err, "new symlink not found")
-}
-
-// ─── SFTP file access ─────────────────────────────────────────────────────────
-
-func TestSSHServer_SFTPFileAccess(t *testing.T) {
-	hostDir := t.TempDir()
-	clientDir := t.TempDir()
-	sharedDir := t.TempDir()
-
-	_, err := GenerateSSHKeyPair(hostDir)
-	require.NoError(t, err, "GenerateSSHKeyPair(host)")
-	clientSigner, clientPub := generateTestKeyPair(t, clientDir)
-
-	// Write a test file into the shared directory.
-	want := "sftp-test-content"
-	testFile := filepath.Join(sharedDir, "test.txt")
-	require.NoError(t, os.WriteFile(testFile, []byte(want), 0644), "WriteFile()")
-
-	srv, addr, cancel := startTestServer(t, filepath.Join(hostDir, "id_ed25519"))
-	defer cancel()
-
-	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{"client": clientPub})
-	srv.UpdateShares(map[string]string{"myshare": sharedDir})
-
-	// Dial SSH.
-	sshClient, err := dialSSH(t, addr, clientSigner)
-	require.NoError(t, err, "SSH dial")
-	defer sshClient.Close()
-
-	// Open SFTP session.
-	sftpClient, err := sftp.NewClient(sshClient)
-	require.NoError(t, err, "sftp.NewClient()")
-	defer sftpClient.Close()
-
-	// Read a file through the alias symlink path.
-	aliasFilePath := filepath.Join(srv.sftpRoot, "myshare", "test.txt")
-	f, err := sftpClient.Open(aliasFilePath)
-	require.NoError(t, err, "sftp.Open(%q)", aliasFilePath)
-	defer f.Close()
-
-	data, err := io.ReadAll(f)
-	require.NoError(t, err, "io.ReadAll()")
-
-	assert.Equal(t, want, string(data), "file contents")
+	// Second update replaces the snapshot atomically.
+	srv.UpdateShares([]ShareACL{{Alias: "photos", Path: "/tmp/photos", AllowAll: true}})
+	snap = srv.aclSnapshot()
+	require.Len(t, snap, 1)
+	assert.Equal(t, "photos", snap[0].Alias)
 }
 
 // ─── UpdateAllowedKeys ────────────────────────────────────────────────────────
@@ -515,4 +442,25 @@ func TestSSHServer_StartListensOnPort(t *testing.T) {
 	conn.Close()
 
 	cancel()
+}
+
+// ─── device_id propagation via Permissions.Extensions ────────────────────────
+
+func TestSSHServer_PublicKeyCallback_StampsDeviceID(t *testing.T) {
+	dir := t.TempDir()
+	_, err := GenerateSSHKeyPair(dir)
+	require.NoError(t, err, "GenerateSSHKeyPair()")
+
+	srv, err := NewSSHServer(0, filepath.Join(dir, "id_ed25519"), discardLogger())
+	require.NoError(t, err, "NewSSHServer()")
+
+	clientDir := t.TempDir()
+	_, pub := generateTestKeyPair(t, clientDir)
+	srv.UpdateAllowedKeys(map[string]gossh.PublicKey{"dev-bob": pub})
+
+	perms, err := srv.publicKeyCallback(nil, pub)
+	require.NoError(t, err, "publicKeyCallback()")
+	require.NotNil(t, perms, "nil Permissions")
+	assert.Equal(t, "dev-bob", perms.Extensions["hubfuse-device-id"],
+		"device_id from UpdateAllowedKeys must be propagated via ssh.Permissions.Extensions")
 }

@@ -379,25 +379,17 @@ func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
 func TestOnConfigChange_SharesChangedUpdatesShares(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 
-	// Capture UpdateShares calls via a counter flag written in the shares map.
-	shareUpdateCalled := false
-	origShares := d.sshServer.shares // initial (empty)
-	_ = origShares
-
 	// We can't easily stub hubClient without a real gRPC conn, so we test the
 	// SSH server path and the config update. The hubClient call will fail
 	// gracefully (nil pointer) and we verify the config was updated.
-
-	// Since we can't stub the hub client, test the parts we can: config update
-	// and SSH server share refresh.
 	oldCfg := &agentconfig.Config{
 		Shares: []agentconfig.ShareConfig{
-			{Alias: "old-share", Path: "/old", Permissions: "ro"},
+			{Alias: "old-share", Path: "/old", Permissions: "ro", AllowedDevices: []string{"all"}},
 		},
 	}
 	newCfg := &agentconfig.Config{
 		Shares: []agentconfig.ShareConfig{
-			{Alias: "new-share", Path: "/new", Permissions: "rw"},
+			{Alias: "new-share", Path: "/new", Permissions: "rw", AllowedDevices: []string{"all"}},
 		},
 	}
 
@@ -405,37 +397,34 @@ func TestOnConfigChange_SharesChangedUpdatesShares(t *testing.T) {
 	// the rest of the flow.
 	d.hubClient = nil
 
-	// onConfigChange must not panic even if hubClient is nil.
-	// We wrap the UpdateShares call in a guard.
-	//
-	// Instead of calling onConfigChange directly (which would panic on nil
-	// hubClient), verify the helper functions work correctly.
-
 	// Test configSharesToProto.
 	protoShares := configSharesToProto(newCfg.Shares)
 	require.Len(t, protoShares, 1, "configSharesToProto len")
 	assert.Equal(t, "new-share", protoShares[0].Alias)
 	assert.Equal(t, "rw", protoShares[0].Permissions)
 
-	// Test sharesToMap.
-	sharesMap := sharesToMap(newCfg.Shares)
-	path, ok := sharesMap["new-share"]
-	assert.True(t, ok, "sharesToMap missing new-share")
-	assert.Equal(t, "/new", path)
+	// Test sharesToACL.
+	acls := sharesToACL(newCfg.Shares)
+	require.Len(t, acls, 1)
+	assert.Equal(t, "new-share", acls[0].Alias)
+	assert.Equal(t, "/new", acls[0].Path)
+	assert.False(t, acls[0].ReadOnly, "permissions=rw must map to ReadOnly=false")
+	assert.True(t, acls[0].AllowAll, `allowed-devices "all" must lift into AllowAll`)
 
-	// Test that SSH server is updated.
-	d.sshServer.UpdateShares(sharesMap)
-	d.sshServer.mu.RLock()
-	_, serverHasShare := d.sshServer.shares["new-share"]
-	d.sshServer.mu.RUnlock()
-	assert.True(t, serverHasShare, "sshServer.shares does not contain 'new-share' after UpdateShares")
+	// Test that SSH server snapshot is updated.
+	d.sshServer.UpdateShares(acls)
+	snap := d.sshServer.aclSnapshot()
+	hasNew := false
+	for _, a := range snap {
+		if a.Alias == "new-share" {
+			hasNew = true
+		}
+	}
+	assert.True(t, hasNew, "sshServer snapshot missing 'new-share' after UpdateShares")
 
 	// Verify ComputeDiff detects the share change.
 	diff := agentconfig.ComputeDiff(oldCfg, newCfg)
 	assert.True(t, diff.SharesChanged, "ComputeDiff should report SharesChanged for different share lists")
-
-	shareUpdateCalled = true // placeholder assertion
-	assert.True(t, shareUpdateCalled)
 }
 
 func TestOnConfigChange_MountsAdded(t *testing.T) {

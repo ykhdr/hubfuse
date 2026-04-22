@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"log/slog"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	pb "github.com/ykhdr/hubfuse/proto"
@@ -19,8 +20,11 @@ func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 		if err := d.hubClient.UpdateShares(context.Background(), shares); err != nil {
 			d.logger.Error("failed to update shares on hub", "error", err)
 		}
-		// Rebuild the SSH server's alias->path mapping.
-		d.sshServer.UpdateShares(sharesToMap(new.Shares))
+		// Push ACL snapshot to the SSH server and surface any shares that
+		// the new secure defaults would make inaccessible.
+		acls := sharesToACL(new.Shares)
+		warnInaccessibleShares(d.logger, acls)
+		d.sshServer.UpdateShares(acls)
 	}
 
 	for _, mc := range diff.MountsAdded {
@@ -55,14 +59,30 @@ func configSharesToProto(shares []agentconfig.ShareConfig) []*pb.Share {
 	return result
 }
 
-// sharesToMap converts a slice of ShareConfig to an alias->path map for the
-// SSH server.
-func sharesToMap(shares []agentconfig.ShareConfig) map[string]string {
-	m := make(map[string]string, len(shares))
+// sharesToACL flattens a slice of ShareConfig into runtime ACLs, applying the
+// secure defaults described by ShareACLsFromConfig (missing permissions -> ro;
+// literal "all" -> wildcard; empty list -> deny).
+func sharesToACL(shares []agentconfig.ShareConfig) []ShareACL {
+	views := make([]shareConfigView, 0, len(shares))
 	for _, s := range shares {
-		m[s.Alias] = s.Path
+		views = append(views, shareConfigView{
+			Alias:          s.Alias,
+			Path:           s.Path,
+			Permissions:    s.Permissions,
+			AllowedDevices: s.AllowedDevices,
+		})
 	}
-	return m
+	return ShareACLsFromConfig(views)
+}
+
+// warnInaccessibleShares logs a warning for each share that is unreachable
+// under the new ACL semantics (no allowed_devices and no "all" wildcard).
+func warnInaccessibleShares(logger *slog.Logger, acls []ShareACL) {
+	for _, acl := range acls {
+		if !acl.AllowAll && len(acl.AllowedDevices) == 0 {
+			logger.Warn("share has no allowed-devices and is inaccessible", "alias", acl.Alias)
+		}
+	}
 }
 
 // tryMount attempts to mount the share described by mc if the target device is

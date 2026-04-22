@@ -17,11 +17,13 @@ import (
 	"github.com/ykhdr/hubfuse/internal/common"
 )
 
-// share records a directory export: the real filesystem path and the alias
-// clients use to reference it.
+// share records a directory export: real filesystem path, alias clients use,
+// and the ACL (--permissions and --allow) passed to `hubfuse share add`.
 type share struct {
-	path  string
-	alias string
+	path        string
+	alias       string
+	permissions string   // "" = use CLI default ("ro"); "rw" or "ro"
+	allow       []string // tokens for --allow (nicknames, "all", or device_ids)
 }
 
 // Agent wraps invocation of the `hubfuse` binary against a hub, with an
@@ -48,9 +50,27 @@ func WithEnv(kv ...string) AgentOption {
 
 // WithExport appends a directory export with the given alias to the agent.
 // The path is created during StartDaemon; alias is the name clients use.
+// Defaults to --allow all so scenarios that don't care about ACL behaviour
+// keep working under the secure-default semantics enforced by the SSH server.
 func WithExport(path, alias string) AgentOption {
 	return func(a *Agent) {
-		a.exports = append(a.exports, share{path: path, alias: alias})
+		a.exports = append(a.exports, share{path: path, alias: alias, allow: []string{"all"}})
+	}
+}
+
+// WithExportACL appends a directory export with explicit permissions and
+// allowed-devices. Use this in tests that exercise ACL behaviour.
+// permissions: "ro" | "rw" | "" (CLI default "ro").
+// allow: tokens for --allow; pass no tokens to omit --allow entirely (i.e. test
+// the default-deny path).
+func WithExportACL(path, alias, permissions string, allow ...string) AgentOption {
+	return func(a *Agent) {
+		a.exports = append(a.exports, share{
+			path:        path,
+			alias:       alias,
+			permissions: permissions,
+			allow:       append([]string(nil), allow...),
+		})
 	}
 }
 
@@ -214,7 +234,14 @@ func (a *Agent) StartDaemon(t *testing.T) {
 		if mkErr := os.MkdirAll(s.path, 0o755); mkErr != nil {
 			t.Fatalf("mkdir export %s: %v", s.path, mkErr)
 		}
-		a.run(t, "share", "add", s.path, "--alias", s.alias)
+		args := []string{"share", "add", s.path, "--alias", s.alias}
+		if s.permissions != "" {
+			args = append(args, "--permissions", s.permissions)
+		}
+		for _, dev := range s.allow {
+			args = append(args, "--allow", dev)
+		}
+		a.run(t, args...)
 	}
 }
 
@@ -392,16 +419,19 @@ func (a *Agent) HasPeer(t *testing.T, nickname string) bool {
 // mount.
 func (a *Agent) WaitForPairedWith(t *testing.T, timeout time.Duration) bool {
 	t.Helper()
+	return a.WaitForPairedCount(t, 1, timeout)
+}
+
+// WaitForPairedCount polls until this agent's known_devices directory has at
+// least n entries, then pauses briefly so the SSH server's allowed-key cache
+// can catch up with the on-disk state. Used by multi-peer scenarios.
+func (a *Agent) WaitForPairedCount(t *testing.T, n int, timeout time.Duration) bool {
+	t.Helper()
 	knownDir := filepath.Join(a.HomeDir, ".hubfuse", common.KnownDevicesDir)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		entries, err := os.ReadDir(knownDir)
-		if err == nil && len(entries) > 0 {
-			// Sleep briefly to allow reloadSSHAllowedKeys to finish loading the
-			// key into the SSH server's in-memory cache. The file write and the
-			// cache reload happen sequentially in the daemon's event goroutine,
-			// but the test goroutine can observe the file before the cache is
-			// updated.
+		if err == nil && len(entries) >= n {
 			time.Sleep(200 * time.Millisecond)
 			return true
 		}

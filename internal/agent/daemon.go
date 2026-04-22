@@ -95,7 +95,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		return nil, fmt.Errorf("create SSH server: %w", err)
 	}
 
-	return &Daemon{
+	d := &Daemon{
 		config:        cfg,
 		configPath:    cfgPath,
 		identity:      identity,
@@ -106,7 +106,29 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		onlineDevices: make(map[string]*OnlineDevice),
 		dataDir:       dir,
 		onReady:       opts.OnReady,
-	}, nil
+	}
+
+	// Install the initial ACL snapshot so pre-existing shares are enforced
+	// immediately — the config watcher only fires on later file-change events.
+	initialACLs := sharesToACL(cfg.Shares)
+	warnInaccessibleShares(logger, initialACLs)
+	sshServer.UpdateShares(initialACLs)
+
+	// Daemon satisfies DeviceResolver via its onlineDevices map.
+	sshServer.SetDeviceResolver(d)
+
+	return d, nil
+}
+
+// NicknameForDeviceID implements DeviceResolver. Used by the SFTP handler to
+// match ACL tokens that reference human-readable nicknames.
+func (d *Daemon) NicknameForDeviceID(id string) (string, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if dev, ok := d.onlineDevices[id]; ok && dev.Nickname != "" {
+		return dev.Nickname, true
+	}
+	return "", false
 }
 
 // Run is the main daemon loop. It connects to the hub, starts all subsystems,
