@@ -1,8 +1,6 @@
 package common
 
 import (
-	"errors"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -17,7 +15,6 @@ var (
 	ErrInviteExpired        = status.Error(codes.DeadlineExceeded, "invite code expired")
 	ErrNotAuthenticated     = status.Error(codes.Unauthenticated, "client certificate required")
 	ErrPairingAlreadyExists = status.Error(codes.AlreadyExists, "devices already paired")
+	ErrInvalidJoinToken     = status.Error(codes.PermissionDenied, "invalid join token")
+	ErrJoinTokenExpired     = status.Error(codes.DeadlineExceeded, "join token expired")
 )
-
-var ErrInvalidJoinToken = errors.New("invalid join token")
-var ErrJoinTokenExpired = errors.New("join token expired")
