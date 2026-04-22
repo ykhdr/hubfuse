@@ -141,3 +141,71 @@ func TestACL_AllowedDevicesFiltersListing(t *testing.T) {
 	_, err = carolClient.Open("/docs/secret.txt")
 	assert.Error(t, err, "direct access by carol must be denied")
 }
+
+// TestACL_WildcardAllowsEverybody — allowed-devices "all" means any paired peer.
+func TestACL_WildcardAllowsEverybody(t *testing.T) {
+	hub := helpers.StartHub(t)
+	exportDir := t.TempDir()
+	require.NoError(t, writeTestFile(exportDir, "pub.txt", "public"), "seed export")
+
+	alice := helpers.StartAgent(t, hub, "alice",
+		helpers.WithExportACL(exportDir, "pub", "ro", "all"))
+	alice.Join(t)
+	alice.StartDaemon(t)
+
+	bob := helpers.StartAgent(t, hub, "bob")
+	bob.Join(t)
+	bob.StartDaemon(t)
+
+	require.Eventually(t,
+		func() bool { return alice.HasPeer(t, "bob") },
+		5*time.Second, 200*time.Millisecond)
+
+	code := alice.RequestPairing(t, "bob")
+	bob.ConfirmPairing(t, code)
+	require.True(t, alice.WaitForPairedWith(t, 5*time.Second))
+
+	client := dialSFTPAs(t, bob, alice)
+	entries, err := client.ReadDir("/")
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.Contains(t, names, "pub", `"all" wildcard must show share to paired peer`)
+}
+
+// TestACL_DefaultDeny — a share with no allowed-devices is invisible and
+// inaccessible to every paired peer.
+func TestACL_DefaultDeny(t *testing.T) {
+	hub := helpers.StartHub(t)
+	exportDir := t.TempDir()
+	require.NoError(t, writeTestFile(exportDir, "private.txt", "nope"), "seed export")
+
+	// Export with no --allow at all: permissions default to ro, AllowedDevices empty.
+	alice := helpers.StartAgent(t, hub, "alice",
+		helpers.WithExportACL(exportDir, "private", "ro"))
+	alice.Join(t)
+	alice.StartDaemon(t)
+
+	bob := helpers.StartAgent(t, hub, "bob")
+	bob.Join(t)
+	bob.StartDaemon(t)
+
+	require.Eventually(t,
+		func() bool { return alice.HasPeer(t, "bob") },
+		5*time.Second, 200*time.Millisecond)
+
+	code := alice.RequestPairing(t, "bob")
+	bob.ConfirmPairing(t, code)
+	require.True(t, alice.WaitForPairedWith(t, 5*time.Second))
+
+	client := dialSFTPAs(t, bob, alice)
+	entries, err := client.ReadDir("/")
+	require.NoError(t, err, "root listing itself should succeed, just empty")
+	for _, e := range entries {
+		assert.NotEqual(t, "private", e.Name(), "default-deny share must not appear")
+	}
+	_, err = client.Open("/private/private.txt")
+	assert.Error(t, err, "direct access to default-deny share must be rejected")
+}
