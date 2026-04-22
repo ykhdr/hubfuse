@@ -29,10 +29,19 @@ make install
 # Start the hub (default :9090)
 hubfuse-hub start
 
-# On each device — join the hub and start the agent
-hubfuse join <hub-address>:9090
+# On the hub host — issue a single-use token for the joining device
+hubfuse-hub issue-join
+# -> HUB-AB2-9XY
+
+# On each device — join the hub with the token, then start the agent
+hubfuse join <hub-address>:9090 --token HUB-AB2-9XY
 hubfuse start
 ```
+
+Join tokens expire after 10 minutes and are consumed on first successful use,
+so running an unauthenticated hub on the network does not let arbitrary
+devices enroll themselves. Configure the TTL with `join-token-ttl "<duration>"`
+in `~/.hubfuse-hub/config.kdl`.
 
 ## Configuration
 
@@ -63,6 +72,7 @@ Changes to `config.kdl` are hot-reloaded — no restart needed.
 | `start [--listen :9090] [--device-retention 168h] [-d]` | Start the hub server (use `-d` to run in the background) |
 | `stop` | Stop the running hub |
 | `status` | Show hub status (running/stopped, pid) |
+| `issue-join [--ttl 10m]` | Issue a single-use join token; print it on stdout |
 
 Offline devices older than one week (`168h`) are pruned automatically. Customize the window with `--device-retention <duration>` or set `device-retention "<duration>"` in `~/.hubfuse-hub/config.kdl`. Use `0` to disable pruning.
 
@@ -70,7 +80,7 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 
 | Command | Description |
 |---|---|
-| `join <hub-address>` | Register this device with a hub; receives TLS certs |
+| `join <hub-address> --token HUB-XXX-YYY` | Register this device with a hub using a token issued via `hubfuse-hub issue-join`; receives TLS certs |
 | `start [-d]` | Start the agent daemon |
 | `stop` | Stop the running agent |
 | `status` | Show agent status |
