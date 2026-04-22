@@ -71,6 +71,7 @@ func TestIntegration_Join_CertHasDeviceIDInCN(t *testing.T) {
 	block, _ := pem.Decode(resp.ClientCert)
 	if block == nil {
 		t.Fatal("Join: cannot decode ClientCert PEM")
+		return
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {

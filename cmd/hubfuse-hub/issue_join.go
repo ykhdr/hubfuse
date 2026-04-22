@@ -80,10 +80,14 @@ func issueJoinCmd() *cobra.Command {
 				return fmt.Errorf("create join token: %w", err)
 			}
 
-			fmt.Fprintln(cmd.OutOrStdout(), tok.Token)
-			fmt.Fprintf(cmd.ErrOrStderr(),
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), tok.Token); err != nil {
+				return fmt.Errorf("write token: %w", err)
+			}
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(),
 				"Share this token with the joining device. Expires at %s.\n",
-				tok.ExpiresAt.UTC().Format(time.RFC3339))
+				tok.ExpiresAt.UTC().Format(time.RFC3339)); err != nil {
+				return fmt.Errorf("write expiry notice: %w", err)
+			}
 			return nil
 		},
 	}
