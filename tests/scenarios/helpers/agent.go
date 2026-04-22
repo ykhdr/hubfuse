@@ -17,11 +17,13 @@ import (
 	"github.com/ykhdr/hubfuse/internal/common"
 )
 
-// share records a directory export: the real filesystem path and the alias
-// clients use to reference it.
+// share records a directory export: real filesystem path, alias clients use,
+// and the ACL (--permissions and --allow) passed to `hubfuse share add`.
 type share struct {
-	path  string
-	alias string
+	path        string
+	alias       string
+	permissions string   // "" = use CLI default ("ro"); "rw" or "ro"
+	allow       []string // tokens for --allow (nicknames, "all", or device_ids)
 }
 
 // Agent wraps invocation of the `hubfuse` binary against a hub, with an
@@ -48,9 +50,27 @@ func WithEnv(kv ...string) AgentOption {
 
 // WithExport appends a directory export with the given alias to the agent.
 // The path is created during StartDaemon; alias is the name clients use.
+// Defaults to --allow all so scenarios that don't care about ACL behaviour
+// keep working under the secure-default semantics enforced by the SSH server.
 func WithExport(path, alias string) AgentOption {
 	return func(a *Agent) {
-		a.exports = append(a.exports, share{path: path, alias: alias})
+		a.exports = append(a.exports, share{path: path, alias: alias, allow: []string{"all"}})
+	}
+}
+
+// WithExportACL appends a directory export with explicit permissions and
+// allowed-devices. Use this in tests that exercise ACL behaviour.
+// permissions: "ro" | "rw" | "" (CLI default "ro").
+// allow: tokens for --allow; pass no tokens to omit --allow entirely (i.e. test
+// the default-deny path).
+func WithExportACL(path, alias, permissions string, allow ...string) AgentOption {
+	return func(a *Agent) {
+		a.exports = append(a.exports, share{
+			path:        path,
+			alias:       alias,
+			permissions: permissions,
+			allow:       append([]string(nil), allow...),
+		})
 	}
 }
 
@@ -204,7 +224,14 @@ func (a *Agent) StartDaemon(t *testing.T) {
 		if mkErr := os.MkdirAll(s.path, 0o755); mkErr != nil {
 			t.Fatalf("mkdir export %s: %v", s.path, mkErr)
 		}
-		a.run(t, "share", "add", s.path, "--alias", s.alias)
+		args := []string{"share", "add", s.path, "--alias", s.alias}
+		if s.permissions != "" {
+			args = append(args, "--permissions", s.permissions)
+		}
+		for _, dev := range s.allow {
+			args = append(args, "--allow", dev)
+		}
+		a.run(t, args...)
 	}
 }
 
