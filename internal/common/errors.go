@@ -1,6 +1,8 @@
 package common
 
 import (
+	"errors"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -16,3 +18,6 @@ var (
 	ErrNotAuthenticated     = status.Error(codes.Unauthenticated, "client certificate required")
 	ErrPairingAlreadyExists = status.Error(codes.AlreadyExists, "devices already paired")
 )
+
+var ErrInvalidJoinToken = errors.New("invalid join token")
+var ErrJoinTokenExpired = errors.New("join token expired")

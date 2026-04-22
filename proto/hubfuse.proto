@@ -5,7 +5,7 @@ package hubfuse;
 option go_package = "github.com/ykhdr/hubfuse/proto";
 
 service HubFuse {
-  // Unauthenticated — first-time device registration
+  // First-time device registration; requires a hub-issued join token.
   rpc Join(JoinRequest) returns (JoinResponse);
 
   rpc Register(RegisterRequest) returns (RegisterResponse);
@@ -45,6 +45,7 @@ message DeviceInfo {
 message JoinRequest {
   string device_id = 1;
   string nickname = 2;
+  string join_token = 3;
 }
 
 message JoinResponse {
