@@ -68,6 +68,10 @@ const pruneBatchLimit = 500
 // NewSQLiteStore opens (or creates) a SQLite database at dbPath, runs the
 // schema migrations, and returns a ready-to-use Store. Use ":memory:" for
 // an in-process, ephemeral database suitable for tests.
+//
+// On-disk databases are opened in WAL mode with a 5s busy_timeout so that a
+// second process (e.g. "hubfuse-hub issue-join" running while the hub daemon
+// holds the file) can write without spurious "database is locked" errors.
 func NewSQLiteStore(dbPath string) (Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -79,6 +83,19 @@ func NewSQLiteStore(dbPath string) (Store, error) {
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+
+	// Enable WAL + a generous busy_timeout for on-disk stores. The in-memory
+	// driver rejects journal_mode=WAL, so skip that PRAGMA for ":memory:".
+	if dbPath != ":memory:" {
+		if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("enable WAL: %w", err)
+		}
+		if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set busy_timeout: %w", err)
+		}
 	}
 
 	if _, err := db.Exec(schema); err != nil {

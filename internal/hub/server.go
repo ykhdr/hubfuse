@@ -27,9 +27,10 @@ func NewServer(registry *Registry, logger *slog.Logger) *Server {
 	}
 }
 
-// Join handles first-time device registration. It does not require
-// authentication — the client will receive a signed cert it can use for
-// subsequent calls.
+// Join handles first-time device registration. The caller must present a
+// hub-issued single-use token in req.JoinToken (see hubfuse-hub issue-join).
+// On success the client receives a signed cert it can use for subsequent
+// mTLS calls.
 func (s *Server) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
 	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname, peerIP(ctx), req.JoinToken)
 	if err != nil {

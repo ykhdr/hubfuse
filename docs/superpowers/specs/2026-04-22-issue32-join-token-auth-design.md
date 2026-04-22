@@ -29,12 +29,12 @@ rejected before any state mutation or cert signing.
 
 New SQLite table `pending_join_tokens`:
 
-| column        | type       | notes                                       |
-|---------------|------------|---------------------------------------------|
-| `token`       | TEXT PK    | `HUB-XXX-YYY` format (same as invite codes) |
-| `expires_at`  | TIMESTAMP  | UTC, TTL enforced on use                    |
-| `attempts`    | INTEGER    | default 0, capped at 5                      |
-| `created_at`  | TIMESTAMP  | for audit / expiry sweeping                 |
+| column        | type       | notes                                           |
+|---------------|------------|-------------------------------------------------|
+| `token`       | TEXT PK    | `HUB-XXX-YYY` format (same as invite codes)     |
+| `expires_at`  | TIMESTAMP  | UTC, enforced atomically in the claim statement |
+| `attempts`    | INTEGER    | retained for schema compatibility; unused       |
+| `created_at`  | TIMESTAMP  | for audit / expiry sweeping                     |
 
 Token format and alphabet reuse `GenerateInviteCode` from
 `internal/hub/pairing.go:149` — 6 random chars across A-Z0-9 with bias-free
@@ -47,29 +47,51 @@ pairing invites, configurable via hub config.
 
 ```go
 CreateJoinToken(ctx, *JoinToken) error
-GetJoinToken(ctx, token string) (*JoinToken, error)
-IncrementJoinTokenAttempts(ctx, token string) error
-DeleteJoinToken(ctx, token string) error
-DeleteExpiredJoinTokens(ctx) (int, error)  // called by heartbeat sweep
+GetJoinToken(ctx, token string) (*JoinToken, error)   // diagnostic only
+ClaimJoinToken(ctx, token string, now time.Time) (bool, error)
+DeleteExpiredJoinTokens(ctx) error                    // sweeper
 ```
 
 `JoinToken` model parallels `PendingInvite` in `store/models.go`.
 
+`ClaimJoinToken` is the sole authority for Join access. It runs a single
+atomic statement:
+
+```sql
+DELETE FROM pending_join_tokens WHERE token = ? AND expires_at > ?
+```
+
+and returns `(RowsAffected == 1, nil)`. Under concurrent Joins holding the
+same token the database guarantees exactly one `true` return. A separate
+attempt counter / retry cap is intentionally **not** implemented — single
+use by first claim is simpler and more secure (see "Why first-attempt claim"
+below).
+
 ### Registry / RPC changes
 
-- `Registry.IssueJoinToken(ctx) (string, error)` — generates token, stores it,
-  returns the raw code.
+- `Registry.IssueJoinToken(ctx) (string, time.Time, error)` — generates a
+  token, stores it, returns the code and expiry timestamp.
 - `Registry.Join` now takes an extra `joinToken string` parameter. Validation
   order (before touching devices):
-  1. Token exists → else `common.ErrInvalidJoinToken`
-  2. `time.Now() < expires_at` → else `common.ErrJoinTokenExpired`
-  3. `attempts < 5` → else `common.ErrMaxAttemptsExceeded`
-  4. Increment attempts.
-  5. Nickname uniqueness check (existing behavior).
-  6. Create device, sign cert, **delete token** (single use) within the same
-     transaction path.
-- On any failure after step 4, the token stays (attempts consumed), so a
-  wrong-nickname retry is allowed up to the attempt cap.
+  1. `joinToken != ""` → else `common.ErrInvalidJoinToken`.
+  2. `store.ClaimJoinToken(ctx, joinToken, now)` → `true` means access
+     granted. `false` → diagnostic `GetJoinToken` to distinguish expired
+     (`common.ErrJoinTokenExpired`) from missing/already-claimed
+     (`common.ErrInvalidJoinToken`).
+  3. Nickname uniqueness check (existing behavior).
+  4. Create device, sign cert, return.
+- There is no post-success deletion step — the claim already deleted the row.
+
+#### Why first-attempt claim (rather than "delete on success")
+
+Any scheme that keeps the token alive across failures must either (a) lock
+the row for the duration of Join (requires a long-lived transaction around
+non-DB work such as cert signing), or (b) increment a counter to detect
+reuse (leaves a brute-force surface; also race-prone, as Copilot noted).
+Consuming on the first claim closes both problems atomically: one DELETE
+is the security boundary, everything after is best-effort. A Join that
+fails post-claim (nickname collision, internal error) simply requires the
+operator to issue a fresh token — the failure mode is explicit and local.
 
 ### Proto change (`proto/hubfuse.proto`)
 

@@ -10,8 +10,11 @@ import (
 
 const defaultJoinTokenTTL = 10 * time.Minute
 
-// IssueJoinToken creates a single-use token authorising exactly one successful
-// Join. The returned code is in HUB-XXX-YYY format.
+// IssueJoinToken creates a single-use token authorising one Join attempt. The
+// token is consumed by the first Join call that presents it, whether or not
+// that Join ultimately succeeds (e.g. a nickname collision after the claim
+// still burns the token). Issue a fresh token if a retry is needed. The
+// returned code is in HUB-XXX-YYY format.
 func (r *Registry) IssueJoinToken(ctx context.Context) (string, time.Time, error) {
 	code := GenerateInviteCode()
 	now := time.Now()

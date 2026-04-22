@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-04-22-issue32-join-token-auth-design.md`
 
+> **Implementation note (post-review):** The final Store API landed simpler
+> than this plan prescribed. `IncrementJoinTokenAttempts` and `DeleteJoinToken`
+> were replaced by a single atomic `ClaimJoinToken(ctx, token, now) (bool, error)`
+> — one conditional `DELETE` with `RowsAffected == 1` is now the only access
+> gate. The 5-attempt retry cap was dropped; the token is single-use by first
+> claim. `DeleteExpiredJoinTokens` returns `error` (no count). The tasks below
+> describe the original path for historical context; the spec has the final
+> design.
+
 ---
 
 ## File Structure

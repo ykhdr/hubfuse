@@ -38,10 +38,12 @@ hubfuse join <hub-address>:9090 --token HUB-AB2-9XY
 hubfuse start
 ```
 
-Join tokens expire after 10 minutes and are consumed on first successful use,
-so running an unauthenticated hub on the network does not let arbitrary
-devices enroll themselves. Configure the TTL with `join-token-ttl "<duration>"`
-in `~/.hubfuse-hub/config.kdl`.
+Join tokens expire after 10 minutes and are consumed atomically by the first
+Join call that presents them — a Join that fails after claiming the token
+(for example, a nickname collision) does not restore it, so a retry requires
+issuing a fresh token. This is deliberate: it keeps the token single-use under
+concurrent requests and prevents exposing it to brute-force attempts. Configure
+the TTL with `join-token-ttl "<duration>"` in `~/.hubfuse-hub/config.kdl`.
 
 ## Configuration
 
