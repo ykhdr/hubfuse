@@ -152,7 +152,7 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
-	registry := hub.NewRegistry(s, caCert, caKey, logger)
+	registry := hub.NewRegistry(s, caCert, caKey, logger, 0)
 
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),

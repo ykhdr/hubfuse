@@ -26,13 +26,16 @@ func newTestRegistry(t *testing.T) *Registry {
 	require.NoError(t, err, "GenerateCA")
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return NewRegistry(s, caCert, caKey, logger)
+	return NewRegistry(s, caCert, caKey, logger, 0)
 }
 
-// joinDevice is a helper that calls Join and fatals on error.
+// joinDevice is a helper that issues a join token and calls Join, fataling on error.
 func joinDevice(t *testing.T, r *Registry, deviceID, nickname, ip string) {
 	t.Helper()
-	_, _, _, err := r.Join(context.Background(), deviceID, nickname, ip)
+	ctx := context.Background()
+	token, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken for Join(%q, %q)", deviceID, nickname)
+	_, _, _, err = r.Join(ctx, deviceID, nickname, ip, token)
 	require.NoError(t, err, "Join(%q, %q)", deviceID, nickname)
 }
 
@@ -50,7 +53,10 @@ func TestJoin_Success(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice", "1.2.3.4")
+	token, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken")
+
+	certPEM, keyPEM, caCertPEM, err := r.Join(ctx, "dev-1", "alice", "1.2.3.4", token)
 	require.NoError(t, err, "Join")
 	assert.NotEmpty(t, certPEM, "certPEM is empty")
 	assert.NotEmpty(t, keyPEM, "keyPEM is empty")
@@ -68,10 +74,14 @@ func TestJoin_DuplicateNickname(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	_, _, _, err := r.Join(ctx, "dev-1", "alice", "")
+	token1, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 1")
+	_, _, _, err = r.Join(ctx, "dev-1", "alice", "", token1)
 	require.NoError(t, err, "first Join")
 
-	_, _, _, err = r.Join(ctx, "dev-2", "alice", "")
+	token2, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 2")
+	_, _, _, err = r.Join(ctx, "dev-2", "alice", "", token2)
 	require.Error(t, err, "expected error for duplicate nickname")
 	assert.Equal(t, common.ErrNicknameTaken, err)
 }
@@ -80,11 +90,15 @@ func TestJoin_DuplicateDeviceID(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
 
-	_, _, _, err := r.Join(ctx, "dev-1", "alice", "")
+	token1, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 1")
+	_, _, _, err = r.Join(ctx, "dev-1", "alice", "", token1)
 	require.NoError(t, err, "first Join")
 
 	// Same device_id, different nickname — store should reject the duplicate.
-	_, _, _, err = r.Join(ctx, "dev-1", "bob", "")
+	token2, _, err := r.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 2")
+	_, _, _, err = r.Join(ctx, "dev-1", "bob", "", token2)
 	require.Error(t, err, "expected error for duplicate device_id")
 }
 

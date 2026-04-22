@@ -80,7 +80,7 @@ func NewHub(config Config) (*Hub, error) {
 		return nil, fmt.Errorf("load/generate certs: %w", err)
 	}
 
-	registry := NewRegistry(s, caCert, caKey, logger)
+	registry := NewRegistry(s, caCert, caKey, logger, defaultJoinTokenTTL)
 	heartbeat := NewHeartbeatMonitor(registry, s, 0, config.DeviceRetention, logger)
 
 	return &Hub{

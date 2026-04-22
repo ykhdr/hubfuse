@@ -31,7 +31,7 @@ func NewServer(registry *Registry, logger *slog.Logger) *Server {
 // authentication — the client will receive a signed cert it can use for
 // subsequent calls.
 func (s *Server) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
-	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname, peerIP(ctx))
+	certPEM, keyPEM, caCertPEM, err := s.registry.Join(ctx, req.DeviceId, req.Nickname, peerIP(ctx), req.JoinToken)
 	if err != nil {
 		return &pb.JoinResponse{Success: false, Error: err.Error()}, nil
 	}
