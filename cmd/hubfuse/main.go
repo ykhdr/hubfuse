@@ -71,7 +71,9 @@ func rootCmd() *cobra.Command {
 
 // joinCmd implements: hubfuse join <hub-address>
 func joinCmd() *cobra.Command {
-	return &cobra.Command{
+	var joinToken string
+
+	cmd := &cobra.Command{
 		Use:   "join <hub-address>",
 		Short: "Join a hub and register this device",
 		Args:  cobra.ExactArgs(1),
@@ -112,7 +114,7 @@ func joinCmd() *cobra.Command {
 				}
 
 				// Call Join.
-				resp, err = hubClient.Join(context.Background(), deviceID, nickname)
+				resp, err = hubClient.Join(context.Background(), deviceID, nickname, joinToken)
 				if err != nil {
 					if clierrors.IsNicknameTaken(err) {
 						printNicknameTaken(err)
@@ -172,6 +174,11 @@ func joinCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&joinToken, "token", "", "join token issued by the hub (required; get one via 'hubfuse-hub issue-join' on the hub host)")
+	_ = cmd.MarkFlagRequired("token")
+
+	return cmd
 }
 
 // startCmd implements: hubfuse start

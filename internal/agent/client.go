@@ -60,10 +60,11 @@ func DialWithMTLS(hubAddr, caCertPath, clientCertPath, clientKeyPath string, log
 }
 
 // Join calls the hub's Join RPC to register a new device and obtain certificates.
-func (c *HubClient) Join(ctx context.Context, deviceID, nickname string) (*pb.JoinResponse, error) {
+func (c *HubClient) Join(ctx context.Context, deviceID, nickname, joinToken string) (*pb.JoinResponse, error) {
 	resp, err := c.client.Join(ctx, &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: nickname,
+		DeviceId:  deviceID,
+		Nickname:  nickname,
+		JoinToken: joinToken,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Join RPC: %w", err)
