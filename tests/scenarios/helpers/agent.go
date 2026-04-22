@@ -118,12 +118,22 @@ func (a *Agent) tryRun(t *testing.T, args ...string) (string, bool) {
 	return string(out), err == nil
 }
 
-// Join runs `hubfuse join <hub-addr>` with the nickname fed via stdin (the
-// command prompts "Enter nickname for this device: ").
+// Join runs `hubfuse join <hub-addr> --token <token>` with the nickname fed
+// via stdin. It automatically issues a one-time join token from the hub so
+// callers do not need to manage the token lifecycle.
 func (a *Agent) Join(t *testing.T) {
 	t.Helper()
+	token := a.hub.IssueJoinToken(t)
 	stdin := []byte(a.Nickname + "\n")
-	a.runWithStdin(t, stdin, "join", a.hub.Address)
+	a.runWithStdin(t, stdin, "join", a.hub.Address, "--token", token)
+}
+
+// TryJoinWithoutToken runs `hubfuse join <addr>` with no --token flag and
+// returns the combined output and whether the command exited zero. It never
+// fails the test — use it to assert the negative (non-zero exit) path.
+func (a *Agent) TryJoinWithoutToken(t *testing.T, hubAddr string) (string, bool) {
+	t.Helper()
+	return a.tryRun(t, "join", hubAddr)
 }
 
 // StartDaemon launches the hubfuse daemon with the agent's configuration.
