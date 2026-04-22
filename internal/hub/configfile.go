@@ -15,6 +15,7 @@ import (
 // HubConfigFile represents options parsed from config.kdl in the hub data dir.
 type HubConfigFile struct {
 	DeviceRetention *time.Duration
+	JoinTokenTTL    *time.Duration
 }
 
 // LoadHubConfigFile parses an optional KDL config file. Missing files return
@@ -36,18 +37,28 @@ func LoadHubConfigFile(path string) (HubConfigFile, error) {
 	}
 
 	for _, node := range doc.Nodes {
-		if nodeName(node) != "device-retention" {
-			continue
+		switch nodeName(node) {
+		case "device-retention":
+			value := firstArgString(node)
+			if value == "" {
+				return cfg, fmt.Errorf("device-retention requires a duration argument")
+			}
+			dur, err := time.ParseDuration(value)
+			if err != nil {
+				return cfg, fmt.Errorf("parse device-retention: %w", err)
+			}
+			cfg.DeviceRetention = &dur
+		case "join-token-ttl":
+			value := firstArgString(node)
+			if value == "" {
+				return cfg, fmt.Errorf("join-token-ttl requires a duration argument")
+			}
+			dur, err := time.ParseDuration(value)
+			if err != nil {
+				return cfg, fmt.Errorf("parse join-token-ttl: %w", err)
+			}
+			cfg.JoinTokenTTL = &dur
 		}
-		value := firstArgString(node)
-		if value == "" {
-			return cfg, fmt.Errorf("device-retention requires a duration argument")
-		}
-		dur, err := time.ParseDuration(value)
-		if err != nil {
-			return cfg, fmt.Errorf("parse device-retention: %w", err)
-		}
-		cfg.DeviceRetention = &dur
 	}
 
 	return cfg, nil

@@ -37,3 +37,23 @@ func resolveDeviceRetention(flagValue string, flagChanged bool, configPath strin
 
 	return flagDuration, nil
 }
+
+// resolveJoinTokenTTL determines the effective join-token TTL from the config
+// file only (no CLI flag). Returns 10 minutes when the config file does not
+// set the value.
+func resolveJoinTokenTTL(configPath string) (time.Duration, error) {
+	const defaultTTL = 10 * time.Minute
+
+	cfg, err := hub.LoadHubConfigFile(configPath)
+	if err != nil {
+		return 0, err
+	}
+	if cfg.JoinTokenTTL != nil {
+		if *cfg.JoinTokenTTL <= 0 {
+			return 0, fmt.Errorf("join-token-ttl must be positive")
+		}
+		return *cfg.JoinTokenTTL, nil
+	}
+
+	return defaultTTL, nil
+}

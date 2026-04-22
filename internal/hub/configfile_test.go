@@ -46,3 +46,25 @@ func TestLoadHubConfigFile_ZeroDuration(t *testing.T) {
 	require.NotNil(t, cfg.DeviceRetention, "DeviceRetention is nil, want explicit zero")
 	assert.Equal(t, time.Duration(0), *cfg.DeviceRetention, "DeviceRetention = %v, want 0", *cfg.DeviceRetention)
 }
+
+func TestLoadHubConfigFile_JoinTokenTTL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.kdl")
+	require.NoError(t, os.WriteFile(path, []byte("join-token-ttl \"5m\"\ndevice-retention \"24h\""), 0o644), "write config")
+
+	cfg, err := LoadHubConfigFile(path)
+	require.NoError(t, err, "LoadHubConfigFile")
+	require.NotNil(t, cfg.JoinTokenTTL, "JoinTokenTTL is nil, want 5m")
+	assert.Equal(t, 5*time.Minute, *cfg.JoinTokenTTL, "JoinTokenTTL = %v, want 5m", *cfg.JoinTokenTTL)
+	require.NotNil(t, cfg.DeviceRetention, "DeviceRetention is nil, want 24h")
+	assert.Equal(t, 24*time.Hour, *cfg.DeviceRetention, "DeviceRetention = %v, want 24h", *cfg.DeviceRetention)
+}
+
+func TestLoadHubConfigFile_JoinTokenTTL_InvalidDuration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.kdl")
+	require.NoError(t, os.WriteFile(path, []byte(`join-token-ttl "notaduration"`), 0o644), "write config")
+
+	_, err := LoadHubConfigFile(path)
+	assert.Error(t, err, "expected error for invalid join-token-ttl duration, got nil")
+}
