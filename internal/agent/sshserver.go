@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
@@ -18,15 +18,21 @@ import (
 // authenticated peer devices.
 type SSHServer struct {
 	config                *gossh.ServerConfig
-	shares                map[string]string // alias -> local path
 	deviceIDByFingerprint map[string]string // key.Marshal() -> device_id
 	port                  int
 	listener              net.Listener
 	logger                *slog.Logger
 	mu                    sync.RWMutex
 
-	// sftpRoot is the directory that contains symlinks alias -> real path.
-	sftpRoot string
+	// acls is the current ACL snapshot swapped in by UpdateShares. Readers in
+	// the SFTP handler dereference this pointer on every request, so
+	// fsnotify-driven config reloads take effect on the next operation.
+	acls atomic.Pointer[[]ShareACL]
+
+	// resolver maps device_id -> nickname for ACL tokens that reference
+	// human-readable nicknames. Optional: when nil the handler falls back
+	// to device_id-only matching.
+	resolver DeviceResolver
 }
 
 // NewSSHServer creates a new SSHServer that listens on port and uses
@@ -42,16 +48,13 @@ func NewSSHServer(port int, hostKeyPath string, logger *slog.Logger) (*SSHServer
 		return nil, fmt.Errorf("parse host key %q: %w", hostKeyPath, err)
 	}
 
-	// Derive sftpRoot from the key file location.
-	sftpRoot := filepath.Join(filepath.Dir(hostKeyPath), "sftp-root")
-
 	s := &SSHServer{
-		shares:                make(map[string]string),
 		deviceIDByFingerprint: make(map[string]string),
 		port:                  port,
 		logger:                logger,
-		sftpRoot:              sftpRoot,
 	}
+	empty := []ShareACL{}
+	s.acls.Store(&empty)
 
 	cfg := &gossh.ServerConfig{
 		PublicKeyCallback: s.publicKeyCallback,
@@ -77,16 +80,35 @@ func (s *SSHServer) publicKeyCallback(_ gossh.ConnMetadata, key gossh.PublicKey)
 	}, nil
 }
 
-// UpdateShares replaces the current alias→path mapping and recreates symlinks
-// under sftpRoot so the SFTP handler can resolve them.
-func (s *SSHServer) UpdateShares(shares map[string]string) {
-	s.mu.Lock()
-	s.shares = shares
-	s.mu.Unlock()
+// UpdateShares replaces the current ACL snapshot. The slice is copied so the
+// caller is free to mutate its own buffer after the call returns.
+func (s *SSHServer) UpdateShares(shares []ShareACL) {
+	cp := append([]ShareACL(nil), shares...)
+	s.acls.Store(&cp)
+}
 
-	if err := s.rebuildSFTPRoot(shares); err != nil {
-		s.logger.Error("rebuild sftp root", "error", err)
+// aclSnapshot returns the current ACL snapshot. Used by the SFTP handler and
+// by tests.
+func (s *SSHServer) aclSnapshot() []ShareACL {
+	p := s.acls.Load()
+	if p == nil {
+		return nil
 	}
+	return *p
+}
+
+// SetDeviceResolver installs a resolver that maps device_id -> nickname. The
+// resolver is consulted by the SFTP handler when matching ACL tokens.
+func (s *SSHServer) SetDeviceResolver(r DeviceResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resolver = r
+}
+
+func (s *SSHServer) currentResolver() DeviceResolver {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.resolver
 }
 
 // UpdateAllowedKeys replaces the set of paired peers. The map is keyed by
@@ -100,36 +122,6 @@ func (s *SSHServer) UpdateAllowedKeys(keys map[string]gossh.PublicKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deviceIDByFingerprint = idx
-}
-
-// rebuildSFTPRoot recreates sftpRoot with one symlink per alias pointing to
-// the corresponding local path.
-func (s *SSHServer) rebuildSFTPRoot(shares map[string]string) error {
-	if err := os.MkdirAll(s.sftpRoot, 0700); err != nil {
-		return fmt.Errorf("create sftp root %q: %w", s.sftpRoot, err)
-	}
-
-	// Remove existing symlinks.
-	entries, err := os.ReadDir(s.sftpRoot)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read sftp root %q: %w", s.sftpRoot, err)
-	}
-	for _, e := range entries {
-		linkPath := filepath.Join(s.sftpRoot, e.Name())
-		if err := os.Remove(linkPath); err != nil {
-			s.logger.Warn("remove sftp root entry", "path", linkPath, "error", err)
-		}
-	}
-
-	// Create new symlinks.
-	for alias, realPath := range shares {
-		linkPath := filepath.Join(s.sftpRoot, alias)
-		if err := os.Symlink(realPath, linkPath); err != nil {
-			s.logger.Warn("create sftp symlink", "alias", alias, "target", realPath, "error", err)
-		}
-	}
-
-	return nil
 }
 
 // Start begins listening for SSH connections on the configured port.
@@ -185,7 +177,8 @@ func (s *SSHServer) Stop() error {
 	return nil
 }
 
-// handleConn performs the SSH handshake and dispatches channels.
+// handleConn performs the SSH handshake, extracts the caller's device_id from
+// Permissions.Extensions, and dispatches channels.
 func (s *SSHServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -196,20 +189,26 @@ func (s *SSHServer) handleConn(conn net.Conn) {
 	}
 	defer sshConn.Close()
 
-	s.logger.Info("ssh connection established", "remote", sshConn.RemoteAddr(), "user", sshConn.User())
+	deviceID := ""
+	if sshConn.Permissions != nil {
+		deviceID = sshConn.Permissions.Extensions["hubfuse-device-id"]
+	}
+	s.logger.Info("ssh connection established",
+		"remote", sshConn.RemoteAddr(),
+		"user", sshConn.User(),
+		"device_id", deviceID,
+	)
 
-	// Discard out-of-band requests.
 	go gossh.DiscardRequests(reqs)
 
-	// Handle each new channel.
 	for newChan := range chans {
-		go s.handleChannel(newChan)
+		go s.handleChannel(newChan, deviceID)
 	}
 }
 
 // handleChannel handles a single SSH channel. Only the "session" type with
 // the "sftp" subsystem is supported.
-func (s *SSHServer) handleChannel(newChan gossh.NewChannel) {
+func (s *SSHServer) handleChannel(newChan gossh.NewChannel, deviceID string) {
 	if newChan.ChannelType() != "session" {
 		_ = newChan.Reject(gossh.UnknownChannelType, "unsupported channel type")
 		return
@@ -222,7 +221,6 @@ func (s *SSHServer) handleChannel(newChan gossh.NewChannel) {
 	}
 	defer channel.Close()
 
-	// Wait for a subsystem request.
 	for req := range requests {
 		if req.Type != "subsystem" {
 			if req.WantReply {
@@ -258,36 +256,21 @@ func (s *SSHServer) handleChannel(newChan gossh.NewChannel) {
 			_ = req.Reply(true, nil)
 		}
 
-		s.serveSFTP(channel)
+		s.serveSFTP(channel, deviceID)
 		return
 	}
 }
 
-// serveSFTP starts an SFTP server on the channel, rooted at sftpRoot so that
-// alias symlinks resolve to the correct local paths.
-func (s *SSHServer) serveSFTP(channel gossh.Channel) {
-	s.mu.RLock()
-	root := s.sftpRoot
-	s.mu.RUnlock()
-
-	// Ensure root exists before serving.
-	if err := os.MkdirAll(root, 0700); err != nil {
-		s.logger.Error("ensure sftp root exists", "path", root, "error", err)
-		return
-	}
-
-	srv, err := sftp.NewServer(
-		channel,
-		sftp.WithServerWorkingDirectory(root),
-	)
-	if err != nil {
-		s.logger.Error("create sftp server", "error", err)
-		return
-	}
+// serveSFTP starts a request-based SFTP server on the channel. The handler is
+// bound to this connection's device_id and the current ACL snapshot; each
+// request re-reads the snapshot so hot-reloaded config takes effect live.
+func (s *SSHServer) serveSFTP(channel gossh.Channel, deviceID string) {
+	h := newACLHandlers(deviceID, s.currentResolver(), s.aclSnapshot, s.logger)
+	srv := sftp.NewRequestServer(channel, h.ToHandlers())
 	defer srv.Close()
 
 	if err := srv.Serve(); err != nil {
 		// EOF is expected when the client disconnects.
-		s.logger.Debug("sftp session ended", "error", err)
+		s.logger.Debug("sftp session ended", "device_id", deviceID, "error", err)
 	}
 }
