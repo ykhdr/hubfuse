@@ -44,15 +44,33 @@ hub "192.168.1.10:9090"
 ssh-port 2222
 
 shares {
-    projects "/home/user/projects" permissions="rw" allowed="all"
+    share "/home/user/projects" alias="projects" permissions="rw" {
+        allowed-devices "all"
+    }
 }
 
 mounts {
-    docs "work-pc" "docs" "/mnt/hubfuse/docs"
+    mount device="work-pc" share="docs" to="/mnt/hubfuse/docs"
 }
 ```
 
 Changes to `config.kdl` are hot-reloaded — no restart needed.
+
+### Share access control
+
+`permissions` and `allowed-devices` are enforced by the agent's SFTP
+server for every incoming request:
+
+- `permissions="ro"` rejects every SFTP write (create, write, rename,
+  remove, mkdir, chmod, symlink, link).
+- `allowed-devices` lists the peers that may see and access the share.
+  Tokens match the peer's nickname or device_id. Use the literal token
+  `"all"` to grant access to every paired device.
+
+Defaults are secure: omitting `permissions` treats the share as
+read-only, and omitting (or leaving empty) `allowed-devices` makes the
+share inaccessible to every peer. This is a deliberate tightening — in
+earlier releases these fields were documented but not enforced.
 
 ## Commands
 
