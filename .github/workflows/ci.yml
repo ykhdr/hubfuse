@@ -1,5 +1,9 @@
 name: CI
 
+# Every job — including Scenario Tests — runs on push to master,
+# pull_request, merge_group, and manual workflow_dispatch. The
+# workflow_dispatch trigger also gives us the "Run workflow" button in
+# the Actions tab for ad-hoc re-runs.
 on:
   push:
     branches: [master]
@@ -7,15 +11,6 @@ on:
     branches: [master]
   merge_group:
   workflow_dispatch:
-    inputs:
-      run_scenarios_only:
-        description: "Run only scenario tests"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
 
 permissions:
   contents: read
@@ -26,7 +21,6 @@ env:
 jobs:
   build:
     name: Build
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +48,6 @@ jobs:
 
   vet:
     name: Vet
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +61,6 @@ jobs:
 
   lint:
     name: Lint
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +76,6 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,7 +89,6 @@ jobs:
 
   test-integration:
     name: Integration Tests
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +102,6 @@ jobs:
 
   test-cli:
     name: CLI Tests
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +116,6 @@ jobs:
   test-scenarios:
     name: Scenario Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -140,7 +128,6 @@ jobs:
 
   proto-check:
     name: Proto Staleness Check
-    if: github.event_name != 'workflow_dispatch' || inputs.run_scenarios_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
