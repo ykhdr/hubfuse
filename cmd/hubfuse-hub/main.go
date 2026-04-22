@@ -36,7 +36,7 @@ func rootCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
+	cmd.AddCommand(startCmd(), stopCmd(), statusCmd(), issueJoinCmd())
 	return cmd
 }
 
