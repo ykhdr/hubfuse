@@ -68,10 +68,36 @@ func LoadPublicKey(path string) (string, error) {
 	return strings.TrimSuffix(string(data), "\n"), nil
 }
 
+// validateDeviceID rejects device IDs that would be unsafe to use as a
+// filename component. Peer IDs arrive from mTLS cert CNs via the hub and are
+// not otherwise validated, so every path-forming call site must pass through
+// this check to block traversal (e.g. "../etc/passwd") and NUL/control bytes.
+func validateDeviceID(deviceID string) error {
+	if deviceID == "" {
+		return fmt.Errorf("device ID is empty")
+	}
+	if deviceID == "." || deviceID == ".." {
+		return fmt.Errorf("invalid device ID %q", deviceID)
+	}
+	if strings.ContainsAny(deviceID, `/\`) || strings.Contains(deviceID, "..") {
+		return fmt.Errorf("invalid device ID %q: contains path separator or parent reference", deviceID)
+	}
+	for _, r := range deviceID {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid device ID %q: contains control character", deviceID)
+		}
+	}
+	return nil
+}
+
 // SavePeerPublicKey stores the public key for deviceID under knownDevicesDir.
 // The file is named <deviceID>.pub and is written with 0644 permissions.
 // Parent directories are created as needed.
 func SavePeerPublicKey(knownDevicesDir, deviceID, publicKey string) error {
+	if err := validateDeviceID(deviceID); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(knownDevicesDir, 0700); err != nil {
 		return fmt.Errorf("create known devices directory %q: %w", knownDevicesDir, err)
 	}
@@ -91,6 +117,10 @@ func SavePeerPublicKey(knownDevicesDir, deviceID, publicKey string) error {
 
 // LoadPeerPublicKey reads the stored public key for deviceID from knownDevicesDir.
 func LoadPeerPublicKey(knownDevicesDir, deviceID string) (string, error) {
+	if err := validateDeviceID(deviceID); err != nil {
+		return "", err
+	}
+
 	path := filepath.Join(knownDevicesDir, deviceID+".pub")
 	data, err := os.ReadFile(path)
 	if err != nil {

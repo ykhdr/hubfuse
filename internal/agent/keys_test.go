@@ -137,6 +137,35 @@ func TestLoadPeerPublicKey_NonExistentDevice(t *testing.T) {
 	assert.Error(t, err, "expected error for non-existent device key")
 }
 
+func TestSavePeerPublicKey_RejectsUnsafeDeviceID(t *testing.T) {
+	dir := t.TempDir()
+
+	cases := []struct {
+		name     string
+		deviceID string
+	}{
+		{"empty", ""},
+		{"dot", "."},
+		{"dot-dot", ".."},
+		{"parent-traversal", "../etc/passwd"},
+		{"nested-parent", "a/../b"},
+		{"forward-slash", "a/b"},
+		{"backslash", `a\b`},
+		{"nul-byte", "dev\x00id"},
+		{"newline", "dev\nid"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := SavePeerPublicKey(dir, tc.deviceID, "ssh-ed25519 key")
+			assert.Error(t, err, "SavePeerPublicKey(%q) must reject unsafe ID", tc.deviceID)
+
+			_, loadErr := LoadPeerPublicKey(dir, tc.deviceID)
+			assert.Error(t, loadErr, "LoadPeerPublicKey(%q) must reject unsafe ID", tc.deviceID)
+		})
+	}
+}
+
 // ─── ListPairedDevices ────────────────────────────────────────────────────────
 
 func TestListPairedDevices_Empty(t *testing.T) {

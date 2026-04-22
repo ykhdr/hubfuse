@@ -114,7 +114,7 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 		return
 	}
 
-	if err := d.mounter.Mount(context.Background(), mc, info.IP, info.SSHPort); err != nil {
+	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 		d.logger.Error("tryMount failed",
 			"device", mc.Device,
 			"share", mc.Share,
