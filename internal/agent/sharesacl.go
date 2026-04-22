@@ -1,5 +1,12 @@
 package agent
 
+import (
+	"fmt"
+	"path"
+	"path/filepath"
+	"strings"
+)
+
 // DeviceResolver maps a peer device_id to its hub-advertised nickname.
 // Returns ok=false if the mapping is not yet known (e.g. right after pairing,
 // before the hub has emitted a DeviceOnline event).
@@ -77,4 +84,35 @@ func ShareACLsFromConfig(shares []shareConfigView) []ShareACL {
 		out = append(out, acl)
 	}
 	return out
+}
+
+// ResolveSharePath translates a virtual SFTP path of the form
+// "/<alias>/sub/path" into a cleaned real filesystem path under shareRoot.
+// Returns an error if the first segment does not match expectedAlias, or if
+// the result would escape shareRoot after cleaning.
+func ResolveSharePath(shareRoot, virtualPath, expectedAlias string) (string, error) {
+	// path.Clean on posix-shaped SFTP paths, not filepath.Clean.
+	cleaned := path.Clean("/" + strings.TrimPrefix(virtualPath, "/"))
+
+	// Strip leading slash then split off the alias.
+	trimmed := strings.TrimPrefix(cleaned, "/")
+	var alias, rest string
+	if i := strings.Index(trimmed, "/"); i >= 0 {
+		alias = trimmed[:i]
+		rest = trimmed[i+1:]
+	} else {
+		alias = trimmed
+	}
+	if alias != expectedAlias {
+		return "", fmt.Errorf("path %q does not belong to share %q", virtualPath, expectedAlias)
+	}
+
+	// Join with the real root using filepath (OS-specific separators) and
+	// verify the result is still under the root after cleaning.
+	root := filepath.Clean(shareRoot)
+	joined := filepath.Clean(filepath.Join(root, rest))
+	if joined != root && !strings.HasPrefix(joined, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes share root", virtualPath)
+	}
+	return joined, nil
 }

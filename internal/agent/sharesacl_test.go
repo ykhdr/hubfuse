@@ -74,3 +74,31 @@ func TestFromShareConfigs_Defaults(t *testing.T) {
 	assert.False(t, got[2].AllowAll)
 	assert.Equal(t, []string{"bob", "carol"}, got[2].AllowedDevices)
 }
+
+func TestResolveSharePath_Basic(t *testing.T) {
+	got, err := ResolveSharePath("/srv/docs", "/docs/a/b.txt", "docs")
+	assert.NoError(t, err)
+	assert.Equal(t, "/srv/docs/a/b.txt", got)
+}
+
+func TestResolveSharePath_AliasRoot(t *testing.T) {
+	got, err := ResolveSharePath("/srv/docs", "/docs", "docs")
+	assert.NoError(t, err)
+	assert.Equal(t, "/srv/docs", got)
+}
+
+func TestResolveSharePath_TrailingSlash(t *testing.T) {
+	got, err := ResolveSharePath("/srv/docs", "/docs/", "docs")
+	assert.NoError(t, err)
+	assert.Equal(t, "/srv/docs", got)
+}
+
+func TestResolveSharePath_RejectsTraversal(t *testing.T) {
+	_, err := ResolveSharePath("/srv/docs", "/docs/../../etc/passwd", "docs")
+	assert.Error(t, err, "must reject path that escapes share root after cleaning")
+}
+
+func TestResolveSharePath_RejectsWrongAlias(t *testing.T) {
+	_, err := ResolveSharePath("/srv/docs", "/other/file", "docs")
+	assert.Error(t, err, "alias mismatch must error")
+}
