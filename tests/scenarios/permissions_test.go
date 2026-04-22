@@ -85,3 +85,59 @@ func TestACL_ReadOnlyRejectsWrites(t *testing.T) {
 	_, err = client.Create("/docs/new.txt")
 	assert.Error(t, err, "write to ro share must fail")
 }
+
+// TestACL_AllowedDevicesFiltersListing — alice exports a share that names
+// only bob in allowed-devices. bob sees it in the synthetic root listing and
+// can read; carol does not see it and is denied on direct access.
+func TestACL_AllowedDevicesFiltersListing(t *testing.T) {
+	hub := helpers.StartHub(t)
+	exportDir := t.TempDir()
+	require.NoError(t, writeTestFile(exportDir, "secret.txt", "s3cr3t"), "seed export")
+
+	alice := helpers.StartAgent(t, hub, "alice",
+		helpers.WithExportACL(exportDir, "docs", "ro", "bob"))
+	alice.Join(t)
+	alice.StartDaemon(t)
+
+	bob := helpers.StartAgent(t, hub, "bob")
+	bob.Join(t)
+	bob.StartDaemon(t)
+
+	carol := helpers.StartAgent(t, hub, "carol")
+	carol.Join(t)
+	carol.StartDaemon(t)
+
+	require.Eventually(t,
+		func() bool { return alice.HasPeer(t, "bob") && alice.HasPeer(t, "carol") },
+		5*time.Second, 200*time.Millisecond, "hub should see both peers")
+
+	bobCode := alice.RequestPairing(t, "bob")
+	bob.ConfirmPairing(t, bobCode)
+	require.True(t, alice.WaitForPairedCount(t, 1, 5*time.Second),
+		"alice should have saved bob's public key")
+
+	carolCode := alice.RequestPairing(t, "carol")
+	carol.ConfirmPairing(t, carolCode)
+	require.True(t, alice.WaitForPairedCount(t, 2, 5*time.Second),
+		"alice should have saved carol's public key")
+
+	// bob — share visible, read works.
+	bobClient := dialSFTPAs(t, bob, alice)
+	bobEntries, err := bobClient.ReadDir("/")
+	require.NoError(t, err)
+	var bobNames []string
+	for _, e := range bobEntries {
+		bobNames = append(bobNames, e.Name())
+	}
+	assert.Contains(t, bobNames, "docs", "bob should see docs in the root listing")
+
+	// carol — share must not appear; direct access denied.
+	carolClient := dialSFTPAs(t, carol, alice)
+	carolEntries, err := carolClient.ReadDir("/")
+	require.NoError(t, err, "root listing itself should succeed for carol")
+	for _, e := range carolEntries {
+		assert.NotEqual(t, "docs", e.Name(), "carol must not see docs")
+	}
+	_, err = carolClient.Open("/docs/secret.txt")
+	assert.Error(t, err, "direct access by carol must be denied")
+}

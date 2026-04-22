@@ -409,16 +409,19 @@ func (a *Agent) HasPeer(t *testing.T, nickname string) bool {
 // mount.
 func (a *Agent) WaitForPairedWith(t *testing.T, timeout time.Duration) bool {
 	t.Helper()
+	return a.WaitForPairedCount(t, 1, timeout)
+}
+
+// WaitForPairedCount polls until this agent's known_devices directory has at
+// least n entries, then pauses briefly so the SSH server's allowed-key cache
+// can catch up with the on-disk state. Used by multi-peer scenarios.
+func (a *Agent) WaitForPairedCount(t *testing.T, n int, timeout time.Duration) bool {
+	t.Helper()
 	knownDir := filepath.Join(a.HomeDir, ".hubfuse", common.KnownDevicesDir)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		entries, err := os.ReadDir(knownDir)
-		if err == nil && len(entries) > 0 {
-			// Sleep briefly to allow reloadSSHAllowedKeys to finish loading the
-			// key into the SSH server's in-memory cache. The file write and the
-			// cache reload happen sequentially in the daemon's event goroutine,
-			// but the test goroutine can observe the file before the cache is
-			// updated.
+		if err == nil && len(entries) >= n {
 			time.Sleep(200 * time.Millisecond)
 			return true
 		}
