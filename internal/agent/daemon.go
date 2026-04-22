@@ -78,7 +78,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	keysDir := filepath.Join(dir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 
-	mounter := NewMounter(keyPath, logger)
+	knownDevicesDir := filepath.Join(dir, common.KnownDevicesDir)
+	knownHostsDir := filepath.Join(dir, common.KnownHostsDir)
+	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
@@ -281,7 +283,7 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 		if !d.isPaired(dev.DeviceId) {
 			continue
 		}
-		if err := d.mounter.Mount(context.Background(), mc, info.IP, info.SSHPort); err != nil {
+		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 			d.logger.Error("auto-mount failed",
 				"device", dev.Nickname,
 				"share", mc.Share,
@@ -307,9 +309,13 @@ func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bo
 }
 
 // isPaired reports whether a device is paired by checking for a public key
-// file keyed on device_id in the known_devices directory.
+// file keyed on device_id in the known_devices directory. Returns false for
+// any deviceID that fails path-safety validation.
 func (d *Daemon) isPaired(deviceID string) bool {
-	knownDevicesDir := filepath.Join(d.dataDir, "known_devices")
+	if err := validateDeviceID(deviceID); err != nil {
+		return false
+	}
+	knownDevicesDir := filepath.Join(d.dataDir, common.KnownDevicesDir)
 	_, err := os.Stat(filepath.Join(knownDevicesDir, deviceID+".pub"))
 	return err == nil
 }

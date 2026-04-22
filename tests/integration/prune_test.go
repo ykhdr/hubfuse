@@ -72,7 +72,16 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 
 	// Set up a stubbed mounter that records unmounts.
 	mtLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mounter := agent.NewMounter(filepath.Join(t.TempDir(), "id_ed25519"), mtLogger)
+	agentDir := t.TempDir()
+	knownDevicesDir := filepath.Join(agentDir, common.KnownDevicesDir)
+	knownHostsDir := filepath.Join(agentDir, common.KnownHostsDir)
+	require.NoError(t, os.MkdirAll(knownDevicesDir, 0700), "MkdirAll known_devices")
+	require.NoError(t,
+		os.WriteFile(filepath.Join(knownDevicesDir, "stale-dev.pub"),
+			[]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n"), 0644),
+		"write stale-dev.pub")
+
+	mounter := agent.NewMounter(filepath.Join(agentDir, "id_ed25519"), knownDevicesDir, knownHostsDir, mtLogger)
 	mounter.SetExecCommandForTests(func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "true")
 	})
@@ -84,7 +93,7 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 
 	mountPath := filepath.Join(t.TempDir(), "mnt")
 	mc := agentconfig.MountConfig{Device: "stale", Share: "docs", To: mountPath}
-	require.NoError(t, mounter.Mount(context.Background(), mc, "127.0.0.1", 2222), "pre-mount")
+	require.NoError(t, mounter.Mount(context.Background(), mc, "stale-dev", "127.0.0.1", 2222), "pre-mount")
 
 	done := make(chan struct{})
 	go func() {

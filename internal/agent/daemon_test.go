@@ -239,8 +239,9 @@ func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
 func TestHandleDeviceOffline_UnmountsShares(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
+	writePubKey(t, dir, "device-123")
 	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")}
-	require.NoError(t, d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222), "pre-mount")
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
 
 	d.mu.Lock()
 	d.onlineDevices["device-123"] = &OnlineDevice{
@@ -286,8 +287,9 @@ func TestHandleDeviceRemoved_RemovesFromKnownDevices(t *testing.T) {
 func TestHandleDeviceRemoved_UnmountsShares(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
+	writePubKey(t, dir, "device-123")
 	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")}
-	if err := d.mounter.Mount(context.Background(), mc, "10.0.0.5", 2222); err != nil {
+	if err := d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222); err != nil {
 		t.Fatalf("pre-mount: %v", err)
 	}
 
@@ -465,12 +467,13 @@ func TestOnConfigChange_MountsAdded(t *testing.T) {
 func TestOnConfigChange_MountsRemoved(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
+	writePubKey(t, dir, "device-abc")
 	mc := agentconfig.MountConfig{
 		Device: "remote",
 		Share:  "music",
 		To:     filepath.Join(dir, "mnt", "music"),
 	}
-	require.NoError(t, d.mounter.Mount(context.Background(), mc, "10.0.0.9", 2222), "pre-mount")
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-abc", "10.0.0.9", 2222), "pre-mount")
 
 	// Unmounting via the diff path.
 	require.NoError(t, d.mounter.Unmount("remote", "music"), "Unmount")
