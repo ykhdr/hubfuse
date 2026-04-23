@@ -54,3 +54,16 @@ type PendingInvite struct {
 	ExpiresAt     time.Time
 	Attempts      int
 }
+
+// JoinToken is a single-use, short-lived credential that authorises a device
+// to call Hub.Join. Issued out-of-band via `hubfuse-hub issue-join` and
+// atomically consumed (deleted) by the first Join attempt that presents it —
+// a subsequent failure of the same Join does not restore the token, so a
+// retry requires a fresh token. The Attempts column is retained for forward
+// schema compatibility but is no longer read by the Join path.
+type JoinToken struct {
+	Token     string
+	ExpiresAt time.Time
+	Attempts  int
+	CreatedAt time.Time
+}

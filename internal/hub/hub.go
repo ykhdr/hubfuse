@@ -29,6 +29,7 @@ type Config struct {
 	Verbose         bool          // show debug logs in console
 	ExtraSANs       []string      // additional SANs for the server TLS certificate
 	DeviceRetention time.Duration // how long to keep offline devices before pruning (0 = never prune)
+	JoinTokenTTL    time.Duration // how long issued join tokens remain valid (0 = use default 10m)
 
 	// OnReady, if non-nil, is invoked exactly once from Start right
 	// after net.Listen returns — the TCP listener is bound and the
@@ -80,7 +81,7 @@ func NewHub(config Config) (*Hub, error) {
 		return nil, fmt.Errorf("load/generate certs: %w", err)
 	}
 
-	registry := NewRegistry(s, caCert, caKey, logger)
+	registry := NewRegistry(s, caCert, caKey, logger, config.JoinTokenTTL)
 	heartbeat := NewHeartbeatMonitor(registry, s, 0, config.DeviceRetention, logger)
 
 	return &Hub{
@@ -118,6 +119,21 @@ func (h *Hub) Start(ctx context.Context) error {
 	}
 
 	go h.heartbeat.Start(ctx)
+
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := h.store.DeleteExpiredJoinTokens(ctx); err != nil {
+					h.logger.Warn("sweep expired join tokens", slog.Any("error", err))
+				}
+			}
+		}
+	}()
 
 	h.logger.Info("hub gRPC server starting", slog.String("addr", h.config.ListenAddr))
 

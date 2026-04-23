@@ -34,9 +34,12 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 	unauth := dialNoClientCert(t, h)
 
 	// Register watcher device.
+	watchTok, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken watcher")
 	joinWatcher, err := unauth.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "watcher-dev",
-		Nickname: "watcher",
+		DeviceId:  "watcher-dev",
+		Nickname:  "watcher",
+		JoinToken: watchTok,
 	})
 	require.NoError(t, err, "join watcher: err")
 	require.True(t, joinWatcher.GetSuccess(), "join watcher: success=false")
@@ -57,9 +60,12 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 	require.NotNil(t, ev.GetSubscribeReady(), "subscribe ready: unexpected payload %T", ev.GetPayload())
 
 	// Join stale device; it stays offline and stale.
+	staleTok, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken stale")
 	joinStale, err := unauth.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "stale-dev",
-		Nickname: "stale",
+		DeviceId:  "stale-dev",
+		Nickname:  "stale",
+		JoinToken: staleTok,
 	})
 	require.NoError(t, err, "join stale: err")
 	require.True(t, joinStale.GetSuccess(), "join stale: success=false")

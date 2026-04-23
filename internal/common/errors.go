@@ -15,4 +15,6 @@ var (
 	ErrInviteExpired        = status.Error(codes.DeadlineExceeded, "invite code expired")
 	ErrNotAuthenticated     = status.Error(codes.Unauthenticated, "client certificate required")
 	ErrPairingAlreadyExists = status.Error(codes.AlreadyExists, "devices already paired")
+	ErrInvalidJoinToken     = status.Error(codes.PermissionDenied, "invalid join token")
+	ErrJoinTokenExpired     = status.Error(codes.DeadlineExceeded, "join token expired")
 )

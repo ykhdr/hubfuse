@@ -3,6 +3,7 @@ package scenarios_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -29,4 +30,20 @@ func TestJoinPersistsCert(t *testing.T) {
 	identityPath := filepath.Join(alice.HomeDir, ".hubfuse", "device.json")
 	_, err := os.Stat(identityPath)
 	require.NoErrorf(t, err, "expected %s on disk", identityPath)
+}
+
+// TestScenario_Join_RefusesWithoutToken verifies that `hubfuse join` exits
+// non-zero and reports a missing-flag error when --token is omitted. This
+// catches any regression that makes the flag optional again.
+func TestScenario_Join_RefusesWithoutToken(t *testing.T) {
+	hub := helpers.StartHub(t)
+	// StartAgent just creates an isolated HOME; no Join or daemon needed.
+	alice := helpers.StartAgent(t, hub, "alice")
+
+	// tryRun returns (combinedOutput, exitZero). We expect exitZero == false.
+	out, ok := alice.TryJoinWithoutToken(t, hub.Address)
+
+	require.False(t, ok, "hubfuse join without --token must exit non-zero")
+	require.True(t, strings.Contains(out, "required"),
+		"output should mention \"required\" (cobra flag error); got: %s", out)
 }

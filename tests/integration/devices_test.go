@@ -15,17 +15,27 @@ func TestListDevices_AllStatuses(t *testing.T) {
 	unauthClient := dialNoClientCert(t, h)
 
 	// Join two devices.
+	ldTok1, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken dev1: %v", err)
+	}
 	join1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-ld-1",
-		Nickname: "ld-alice",
+		DeviceId:  "dev-ld-1",
+		Nickname:  "ld-alice",
+		JoinToken: ldTok1,
 	})
 	if err != nil || !join1.Success {
 		t.Fatalf("Join dev1: err=%v", err)
 	}
 
+	ldTok2, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken dev2: %v", err)
+	}
 	join2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-ld-2",
-		Nickname: "ld-bob",
+		DeviceId:  "dev-ld-2",
+		Nickname:  "ld-bob",
+		JoinToken: ldTok2,
 	})
 	if err != nil || !join2.Success {
 		t.Fatalf("Join dev2: err=%v", err)

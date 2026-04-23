@@ -35,7 +35,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type HubFuseClient interface {
-	// Unauthenticated — first-time device registration
+	// First-time device registration; requires a hub-issued join token.
 	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error)
 	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
 	Rename(ctx context.Context, in *RenameRequest, opts ...grpc.CallOption) (*RenameResponse, error)
@@ -174,7 +174,7 @@ func (c *hubFuseClient) ListDevices(ctx context.Context, in *ListDevicesRequest,
 // All implementations must embed UnimplementedHubFuseServer
 // for forward compatibility
 type HubFuseServer interface {
-	// Unauthenticated — first-time device registration
+	// First-time device registration; requires a hub-issued join token.
 	Join(context.Context, *JoinRequest) (*JoinResponse, error)
 	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
 	Rename(context.Context, *RenameRequest) (*RenameResponse, error)

@@ -78,9 +78,13 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 
 	deviceID := "dev-" + uuid.New().String()
 
+	joinToken, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken")
+
 	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: "tester",
+		DeviceId:  deviceID,
+		Nickname:  "tester",
+		JoinToken: joinToken,
 	})
 	require.NoError(t, err, "Join RPC")
 	require.True(t, joinResp.Success, "Join failed: %s", joinResp.Error)
@@ -123,9 +127,12 @@ func TestIntegration_JoinRegisterSubscribeHeartbeatDeregister(t *testing.T) {
 
 	// Join + register device2.
 	device2ID := "dev-" + uuid.New().String()
+	joinToken2, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken2")
 	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: device2ID,
-		Nickname: "tester2",
+		DeviceId:  device2ID,
+		Nickname:  "tester2",
+		JoinToken: joinToken2,
 	})
 	require.NoError(t, err, "Join2")
 	require.True(t, joinResp2.Success, "Join2 resp=%+v", joinResp2)
@@ -209,11 +216,15 @@ func TestIntegration_JoinNicknameConflict(t *testing.T) {
 
 	ctx := context.Background()
 
-	resp1, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d1", Nickname: "clash"})
+	tok1, _, err := h.Registry.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 1")
+	resp1, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d1", Nickname: "clash", JoinToken: tok1})
 	require.NoError(t, err, "first Join")
 	require.True(t, resp1.GetSuccess(), "first Join success=false")
 
-	resp2, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d2", Nickname: "clash"})
+	tok2, _, err := h.Registry.IssueJoinToken(ctx)
+	require.NoError(t, err, "IssueJoinToken 2")
+	resp2, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "d2", Nickname: "clash", JoinToken: tok2})
 	require.NoError(t, err, "second Join RPC transport error")
 	assert.False(t, resp2.Success, "expected second Join to fail for duplicate nickname")
 	assert.NotEmpty(t, resp2.Error, "expected non-empty error message for duplicate nickname")
@@ -223,9 +234,12 @@ func TestRequestPairing_DeviceNotFound(t *testing.T) {
 	h := hubtest.StartTestHub(t)
 	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
+	dnfToken, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken")
 	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-pair-from",
-		Nickname: "pair-from",
+		DeviceId:  "dev-pair-from",
+		Nickname:  "pair-from",
+		JoinToken: dnfToken,
 	})
 	require.NoError(t, err, "Join")
 	require.True(t, joinResp.GetSuccess(), "Join success=false")
@@ -253,16 +267,22 @@ func TestRequestPairing_DeviceOffline(t *testing.T) {
 	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
 	// Join two devices but only register one.
+	doTok1, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken dev1")
 	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-pair-1",
-		Nickname: "pair-alice",
+		DeviceId:  "dev-pair-1",
+		Nickname:  "pair-alice",
+		JoinToken: doTok1,
 	})
 	require.NoError(t, err, "Join dev1")
 	require.True(t, joinResp1.GetSuccess(), "Join dev1 success=false")
 
+	doTok2, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken dev2")
 	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-pair-2",
-		Nickname: "pair-bob",
+		DeviceId:  "dev-pair-2",
+		Nickname:  "pair-bob",
+		JoinToken: doTok2,
 	})
 	require.NoError(t, err, "Join dev2")
 	require.True(t, joinResp2.GetSuccess(), "Join dev2 success=false")
@@ -292,16 +312,22 @@ func TestListDevices(t *testing.T) {
 	// Join two devices.
 	unauthClient := dialNoClientCert(t, h.Addr, h.CAPEM)
 
+	ldTok1, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken dev1")
 	joinResp1, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-list-1",
-		Nickname: "list-alice",
+		DeviceId:  "dev-list-1",
+		Nickname:  "list-alice",
+		JoinToken: ldTok1,
 	})
 	require.NoError(t, err, "Join dev1")
 	require.True(t, joinResp1.GetSuccess(), "Join dev1 success=false")
 
+	ldTok2, _, err := h.Registry.IssueJoinToken(context.Background())
+	require.NoError(t, err, "IssueJoinToken dev2")
 	joinResp2, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "dev-list-2",
-		Nickname: "list-bob",
+		DeviceId:  "dev-list-2",
+		Nickname:  "list-bob",
+		JoinToken: ldTok2,
 	})
 	require.NoError(t, err, "Join dev2")
 	require.True(t, joinResp2.GetSuccess(), "Join dev2 success=false")

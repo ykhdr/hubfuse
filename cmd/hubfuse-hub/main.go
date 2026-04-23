@@ -36,7 +36,7 @@ func rootCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(startCmd(), stopCmd(), statusCmd())
+	cmd.AddCommand(startCmd(), stopCmd(), statusCmd(), issueJoinCmd())
 	return cmd
 }
 
@@ -82,6 +82,11 @@ func startCmd() *cobra.Command {
 				return err
 			}
 
+			joinTokenTTL, err := resolveJoinTokenTTL(configPath)
+			if err != nil {
+				return err
+			}
+
 			cfg := hub.Config{
 				ListenAddr:      listen,
 				DataDir:         dataDir,
@@ -90,6 +95,7 @@ func startCmd() *cobra.Command {
 				Verbose:         verbose,
 				ExtraSANs:       extraSANs,
 				DeviceRetention: retention,
+				JoinTokenTTL:    joinTokenTTL,
 				OnReady: func() {
 					if err := daemonize.WritePIDFile(pidPath); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)

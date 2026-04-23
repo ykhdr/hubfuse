@@ -16,30 +16,45 @@ import (
 
 // Registry manages device registration and event broadcasting.
 type Registry struct {
-	store       store.Store
-	caCert      *x509.Certificate
-	caKey       *rsa.PrivateKey
-	subscribers map[string]chan *pb.Event // device_id -> event channel
-	mu          sync.RWMutex
-	logger      *slog.Logger
+	store         store.Store
+	caCert        *x509.Certificate
+	caKey         *rsa.PrivateKey
+	subscribers   map[string]chan *pb.Event // device_id -> event channel
+	mu            sync.RWMutex
+	logger        *slog.Logger
+	joinTokenTTL  time.Duration
 }
 
-// NewRegistry creates a new Registry backed by the given store.
-func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey, logger *slog.Logger) *Registry {
+// NewRegistry creates a new Registry backed by the given store. joinTokenTTL
+// controls how long issued join tokens remain valid; pass 0 to use the
+// default (10 minutes).
+func NewRegistry(s store.Store, caCert *x509.Certificate, caKey *rsa.PrivateKey, logger *slog.Logger, joinTokenTTL time.Duration) *Registry {
+	if joinTokenTTL == 0 {
+		joinTokenTTL = defaultJoinTokenTTL
+	}
 	return &Registry{
-		store:       s,
-		caCert:      caCert,
-		caKey:       caKey,
-		subscribers: make(map[string]chan *pb.Event),
-		logger:      logger,
+		store:        s,
+		caCert:       caCert,
+		caKey:        caKey,
+		subscribers:  make(map[string]chan *pb.Event),
+		logger:       logger,
+		joinTokenTTL: joinTokenTTL,
 	}
 }
 
 // Join creates a device record in the store and returns a signed client TLS
-// certificate, private key, and the CA certificate in PEM form. It returns
-// common.ErrNicknameTaken if the nickname is already in use. ip is the
-// caller's apparent address (best effort; may be empty).
-func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip string) (certPEM, keyPEM, caCertPEM []byte, err error) {
+// certificate, private key, and the CA certificate in PEM form. It validates
+// joinToken against the pending_join_tokens table and returns
+// common.ErrInvalidJoinToken or common.ErrJoinTokenExpired on failure. The
+// token is atomically consumed before any device state changes, so a token
+// is single-use even under concurrent Joins. It returns common.ErrNicknameTaken
+// if the nickname is already in use. ip is the caller's apparent address
+// (best effort; may be empty).
+func (r *Registry) Join(ctx context.Context, deviceID, nickname, ip, joinToken string) (certPEM, keyPEM, caCertPEM []byte, err error) {
+	if err := r.consumeJoinToken(ctx, joinToken); err != nil {
+		return nil, nil, nil, err
+	}
+
 	existing, _ := r.store.GetDeviceByNickname(ctx, nickname)
 	if existing != nil {
 		return nil, nil, nil, common.ErrNicknameTaken

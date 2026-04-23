@@ -18,9 +18,14 @@ func TestIntegration_Join_Success(t *testing.T) {
 	h := hubtest.StartTestHub(t)
 	client := dialNoClientCert(t, h)
 
+	joinTok, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken: %v", err)
+	}
 	resp, err := client.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: "join-dev-" + uuid.New().String(),
-		Nickname: "join-alice-" + uuid.New().String(),
+		DeviceId:  "join-dev-" + uuid.New().String(),
+		Nickname:  "join-alice-" + uuid.New().String(),
+		JoinToken: joinTok,
 	})
 	if err != nil {
 		t.Fatalf("Join RPC: %v", err)
@@ -47,9 +52,14 @@ func TestIntegration_Join_CertHasDeviceIDInCN(t *testing.T) {
 
 	deviceID := "cn-dev-" + uuid.New().String()
 
+	cnTok, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken: %v", err)
+	}
 	resp, err := client.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: "cn-alice-" + uuid.New().String(),
+		DeviceId:  deviceID,
+		Nickname:  "cn-alice-" + uuid.New().String(),
+		JoinToken: cnTok,
 	})
 	if err != nil {
 		t.Fatalf("Join RPC: %v", err)
@@ -61,6 +71,7 @@ func TestIntegration_Join_CertHasDeviceIDInCN(t *testing.T) {
 	block, _ := pem.Decode(resp.ClientCert)
 	if block == nil {
 		t.Fatal("Join: cannot decode ClientCert PEM")
+		return
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
@@ -80,9 +91,14 @@ func TestIntegration_Join_ReconnectWithMTLS(t *testing.T) {
 
 	deviceID := "mtls-dev-" + uuid.New().String()
 
+	mtlsTok, _, err := h.Registry.IssueJoinToken(context.Background())
+	if err != nil {
+		t.Fatalf("IssueJoinToken: %v", err)
+	}
 	joinResp, err := unauthClient.Join(context.Background(), &pb.JoinRequest{
-		DeviceId: deviceID,
-		Nickname: "mtls-alice-" + uuid.New().String(),
+		DeviceId:  deviceID,
+		Nickname:  "mtls-alice-" + uuid.New().String(),
+		JoinToken: mtlsTok,
 	})
 	if err != nil {
 		t.Fatalf("Join RPC: %v", err)
@@ -127,7 +143,11 @@ func TestIntegration_Join_DuplicateNickname(t *testing.T) {
 	ctx := context.Background()
 	nickname := "dup-nick-" + uuid.New().String()
 
-	resp1, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "dup-d1-" + uuid.New().String(), Nickname: nickname})
+	dupTok1, _, err := h.Registry.IssueJoinToken(ctx)
+	if err != nil {
+		t.Fatalf("IssueJoinToken 1: %v", err)
+	}
+	resp1, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "dup-d1-" + uuid.New().String(), Nickname: nickname, JoinToken: dupTok1})
 	if err != nil {
 		t.Fatalf("first Join RPC: %v", err)
 	}
@@ -135,7 +155,11 @@ func TestIntegration_Join_DuplicateNickname(t *testing.T) {
 		t.Fatalf("first Join failed: %s", resp1.Error)
 	}
 
-	resp2, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "dup-d2-" + uuid.New().String(), Nickname: nickname})
+	dupTok2, _, err := h.Registry.IssueJoinToken(ctx)
+	if err != nil {
+		t.Fatalf("IssueJoinToken 2: %v", err)
+	}
+	resp2, err := client.Join(ctx, &pb.JoinRequest{DeviceId: "dup-d2-" + uuid.New().String(), Nickname: nickname, JoinToken: dupTok2})
 	if err != nil {
 		t.Fatalf("second Join RPC transport error: %v", err)
 	}

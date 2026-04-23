@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -107,6 +108,25 @@ func StartHubWithRetention(t *testing.T, retention time.Duration) *Hub {
 
 	WaitForPort(t, port, 5*time.Second)
 	return h
+}
+
+// IssueJoinToken runs `hubfuse-hub issue-join --data-dir <DataDir>` against
+// this hub's data directory and returns the token printed on stdout. The hub
+// process must already be running (WAL mode permits concurrent access).
+func (h *Hub) IssueJoinToken(t *testing.T) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, HubBinaryPath, "issue-join", "--data-dir", h.DataDir)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("hubfuse-hub issue-join: %v", err)
+	}
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		t.Fatal("hubfuse-hub issue-join: empty token")
+	}
+	return token
 }
 
 // Stop signals the hub to exit and waits up to 5s for it to do so.

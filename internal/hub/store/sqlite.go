@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS pending_invites (
     expires_at     DATETIME,
     attempts       INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS pending_join_tokens (
+    token      TEXT PRIMARY KEY,
+    expires_at TIMESTAMP NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_join_tokens_expires_at
+    ON pending_join_tokens(expires_at);
 `
 
 var _ Store = (*sqliteStore)(nil)
@@ -59,6 +68,10 @@ const pruneBatchLimit = 500
 // NewSQLiteStore opens (or creates) a SQLite database at dbPath, runs the
 // schema migrations, and returns a ready-to-use Store. Use ":memory:" for
 // an in-process, ephemeral database suitable for tests.
+//
+// On-disk databases are opened in WAL mode with a 5s busy_timeout so that a
+// second process (e.g. "hubfuse-hub issue-join" running while the hub daemon
+// holds the file) can write without spurious "database is locked" errors.
 func NewSQLiteStore(dbPath string) (Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -70,6 +83,19 @@ func NewSQLiteStore(dbPath string) (Store, error) {
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+
+	// Enable WAL + a generous busy_timeout for on-disk stores. The in-memory
+	// driver rejects journal_mode=WAL, so skip that PRAGMA for ":memory:".
+	if dbPath != ":memory:" {
+		if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("enable WAL: %w", err)
+		}
+		if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set busy_timeout: %w", err)
+		}
 	}
 
 	if _, err := db.Exec(schema); err != nil {
@@ -480,6 +506,73 @@ func (s *sqliteStore) DeleteExpiredInvites(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, q, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("delete expired invites: %w", err)
+	}
+	return nil
+}
+
+// --- Join Tokens ---
+
+// CreateJoinToken stores a new join token.
+func (s *sqliteStore) CreateJoinToken(ctx context.Context, t *JoinToken) error {
+	const q = `
+		INSERT INTO pending_join_tokens (token, expires_at, attempts, created_at)
+		VALUES (?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, q,
+		t.Token, t.ExpiresAt.UTC(), t.Attempts, t.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("create join token %q: %w", t.Token, err)
+	}
+	return nil
+}
+
+// GetJoinToken retrieves a join token by its token string.
+func (s *sqliteStore) GetJoinToken(ctx context.Context, token string) (*JoinToken, error) {
+	const q = `
+		SELECT token, expires_at, attempts, created_at
+		FROM pending_join_tokens WHERE token = ?`
+	row := s.db.QueryRowContext(ctx, q, token)
+	var jt JoinToken
+	var expiresAt, createdAt string
+	if err := row.Scan(&jt.Token, &expiresAt, &jt.Attempts, &createdAt); err != nil {
+		return nil, fmt.Errorf("get join token %q: %w", token, err)
+	}
+	exp, err := parseDateTime(expiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse expires_at for join token %q: %w", token, err)
+	}
+	jt.ExpiresAt = exp
+	cre, err := parseDateTime(createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse created_at for join token %q: %w", token, err)
+	}
+	jt.CreatedAt = cre
+	return &jt, nil
+}
+
+// ClaimJoinToken atomically deletes the row if it exists and has not expired,
+// returning true iff a row was removed. Concurrent callers holding the same
+// token observe exactly one true return; all others get false.
+func (s *sqliteStore) ClaimJoinToken(ctx context.Context, token string, now time.Time) (bool, error) {
+	const q = `DELETE FROM pending_join_tokens WHERE token = ? AND expires_at > ?`
+	res, err := s.db.ExecContext(ctx, q, token, now.UTC())
+	if err != nil {
+		return false, fmt.Errorf("claim join token %q: %w", token, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim join token %q: rows affected: %w", token, err)
+	}
+	return n == 1, nil
+}
+
+// DeleteExpiredJoinTokens removes all join tokens whose expires_at timestamp
+// is in the past.
+func (s *sqliteStore) DeleteExpiredJoinTokens(ctx context.Context) error {
+	const q = `DELETE FROM pending_join_tokens WHERE expires_at < ?`
+	_, err := s.db.ExecContext(ctx, q, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("delete expired join tokens: %w", err)
 	}
 	return nil
 }
