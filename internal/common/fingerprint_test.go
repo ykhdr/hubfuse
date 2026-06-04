@@ -88,6 +88,24 @@ func TestParseJoinToken_MissingDot(t *testing.T) {
 	}
 }
 
+// TestParseJoinToken_TrailingDot ensures a token ending in '.' (empty fp) is
+// rejected as malformed up front rather than surfacing later as a misleading
+// fingerprint-mismatch / MITM error.
+func TestParseJoinToken_TrailingDot(t *testing.T) {
+	_, _, err := ParseJoinToken("HUB-XXX-YYY.")
+	if !errors.Is(err, ErrJoinTokenMissingFingerprint) {
+		t.Errorf("err = %v, want ErrJoinTokenMissingFingerprint", err)
+	}
+}
+
+// TestParseJoinToken_LeadingDot guards against the symmetric malformed case.
+func TestParseJoinToken_LeadingDot(t *testing.T) {
+	_, _, err := ParseJoinToken(".abcdef")
+	if !errors.Is(err, ErrJoinTokenMissingFingerprint) {
+		t.Errorf("err = %v, want ErrJoinTokenMissingFingerprint", err)
+	}
+}
+
 // TestParseJoinToken_MultipleDots verifies that only the first dot separates the
 // prefix from the fingerprint — everything after the first dot is the fp.
 func TestParseJoinToken_MultipleDots(t *testing.T) {

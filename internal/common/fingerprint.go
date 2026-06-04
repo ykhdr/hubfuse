@@ -18,10 +18,12 @@ func FingerprintFromCertDER(der []byte) string {
 // ParseJoinToken splits a token of the form HUB-XXX-YYY.<fp> into its parts.
 // Only the first dot separates the prefix from the fingerprint; any additional
 // dots are considered part of the fingerprint. Returns
-// ErrJoinTokenMissingFingerprint when no dot is present.
+// ErrJoinTokenMissingFingerprint when the dot is absent, the prefix is empty,
+// or the fingerprint is empty — surfacing those as a malformed-token error is
+// clearer than letting them slip through into a misleading MITM error later.
 func ParseJoinToken(token string) (prefix, fingerprint string, err error) {
 	idx := strings.IndexByte(token, '.')
-	if idx < 0 {
+	if idx <= 0 || idx == len(token)-1 {
 		return "", "", ErrJoinTokenMissingFingerprint
 	}
 	return token[:idx], token[idx+1:], nil

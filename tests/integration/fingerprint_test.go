@@ -98,8 +98,11 @@ func TestJoin_FingerprintMismatch_Refused(t *testing.T) {
 
 	hubClient, err := agent.DialPinned(h.Addr, tampered, silentLogger())
 	if err != nil {
-		// Some gRPC implementations reject at dial time — that's acceptable.
-		t.Logf("DialPinned returned early error (acceptable): %v", err)
+		// Some gRPC implementations reject at dial time — acceptable, but the
+		// error must still be a TLS/pinning failure, not an unrelated dial
+		// problem (refused connection, address parse, etc.) that would mask a
+		// regression of the actual security control.
+		assertTLSFingerprintError(t, err, "DialPinned early error")
 		return
 	}
 	t.Cleanup(func() { _ = hubClient.Close() })
@@ -117,13 +120,24 @@ func TestJoin_FingerprintMismatch_Refused(t *testing.T) {
 	if err == nil {
 		t.Fatal("Join RPC succeeded with tampered fingerprint — expected TLS rejection")
 	}
-	// The error must indicate a TLS/fingerprint-level failure.
-	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "fingerprint") && !strings.Contains(msg, "tls") &&
-		!strings.Contains(msg, "handshake") && !strings.Contains(msg, "certificate") &&
-		!strings.Contains(msg, "transport") {
-		t.Errorf("unexpected error message (expected TLS/fingerprint failure): %v", err)
+	assertTLSFingerprintError(t, err, "Join RPC")
+}
+
+// assertTLSFingerprintError fails the test unless err names a TLS/pinning
+// failure — guards against a regression where the test would pass on an
+// unrelated dial error (refused connection, parse failure, etc.).
+func assertTLSFingerprintError(t *testing.T, err error, context string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: expected error, got nil", context)
 	}
+	msg := strings.ToLower(err.Error())
+	for _, want := range []string{"fingerprint", "tls", "handshake", "certificate", "transport"} {
+		if strings.Contains(msg, want) {
+			return
+		}
+	}
+	t.Errorf("%s: error does not look like a TLS/fingerprint failure: %v", context, err)
 }
 
 // TestJoin_NoFingerprint_Refused verifies that ParseJoinToken rejects a token
