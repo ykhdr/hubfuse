@@ -13,6 +13,7 @@ service HubFuse {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc UpdateShares(UpdateSharesRequest) returns (UpdateSharesResponse);
   rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
 
   // Server-streaming: push events to the agent
   rpc Subscribe(SubscribeRequest) returns (stream Event);
@@ -105,6 +106,15 @@ message DeregisterRequest {}
 
 message DeregisterResponse {
   bool success = 1;
+}
+
+// ─── Leave ───────────────────────────────────────────────────────────────────
+
+message LeaveRequest {}
+
+message LeaveResponse {
+  bool success = 1;
+  string error = 2;
 }
 
 // ─── Subscribe / Events ──────────────────────────────────────────────────────

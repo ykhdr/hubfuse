@@ -1,0 +1,4 @@
+# `hubfuse leave --help` must exit 0 and mention --force-local.
+exec hubfuse leave --help
+stdout 'force-local'
+! stderr 'panic'

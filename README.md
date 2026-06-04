@@ -100,7 +100,8 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 
 | Command | Description |
 |---|---|
-| `join <hub-address> --token HUB-XXX-YYY` | Register this device with a hub using a token issued via `hubfuse-hub issue-join`; receives TLS certs |
+| `join <hub-address> --token HUB-XXX-YYY [--force]` | Register this device with a hub using a token issued via `hubfuse-hub issue-join`; receives TLS certs. Refuses if already joined unless `--force` is passed. |
+| `leave [--force-local]` | Permanently remove this device from the hub and wipe local TLS state. Pass `--force-local` to wipe even if the hub is unreachable. |
 | `start [-d]` | Start the agent daemon |
 | `stop` | Stop the running agent |
 | `status` | Show agent status |
@@ -113,6 +114,14 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 | `mount add <device>:<share> --to <path>` | Mount a remote share |
 | `mount remove <device>:<share>` | Unmount |
 | `mount list` | List mounts |
+
+### Recovery
+
+If local state is lost (e.g. after wiping `~/.hubfuse/`) but the device record
+still exists on the hub, ask the hub operator to prune it or wait for the
+retention window to expire. Then rejoin with a fresh token as normal.
+If the hub is unreachable, run `hubfuse leave --force-local` to wipe the stale
+local state before rejoining a new hub.
 
 ## Development
 

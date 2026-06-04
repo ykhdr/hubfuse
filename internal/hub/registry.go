@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -208,6 +209,32 @@ func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 		},
 	}
 	r.Broadcast(event, deviceID)
+
+	r.mu.Lock()
+	if ch, ok := r.subscribers[deviceID]; ok {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	r.mu.Unlock()
+
+	return nil
+}
+
+// Leave permanently removes a device from the hub: it deletes the device row
+// (cascading to shares, pairings, and pending invites), broadcasts a
+// DeviceRemoved event to all other subscribers, and closes the caller's
+// subscriber channel.
+func (r *Registry) Leave(ctx context.Context, deviceID string) error {
+	device, err := r.store.GetDevice(ctx, deviceID)
+	if err != nil {
+		return fmt.Errorf("leave: get device %q: %w", deviceID, err)
+	}
+
+	if err := r.store.DeleteDevice(ctx, deviceID); err != nil {
+		return fmt.Errorf("leave: delete device %q: %w", deviceID, err)
+	}
+
+	r.BroadcastDeviceRemoved(device)
 
 	r.mu.Lock()
 	if ch, ok := r.subscribers[deviceID]; ok {

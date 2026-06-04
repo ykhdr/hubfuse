@@ -125,6 +125,19 @@ func (c *HubClient) Deregister(ctx context.Context) error {
 	return nil
 }
 
+// Leave deregisters this device permanently. The hub deletes the device row
+// and all dependent shares/pairings. Returns nil on success.
+func (c *HubClient) Leave(ctx context.Context) error {
+	resp, err := c.client.Leave(ctx, &pb.LeaveRequest{})
+	if err != nil {
+		return fmt.Errorf("Leave RPC: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("leave failed: %s", resp.Error)
+	}
+	return nil
+}
+
 // Subscribe opens a server-streaming RPC to receive events from the hub.
 // The hub identifies the subscriber from the mTLS client certificate.
 func (c *HubClient) Subscribe(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {

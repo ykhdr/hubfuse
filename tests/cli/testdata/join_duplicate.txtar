@@ -1,0 +1,13 @@
+# Seed a fake identity.json under HOME and assert `hubfuse join` refuses
+# without making any network call (the precheck fires before dialing).
+mkdir $HOME/.hubfuse
+cp device.json $HOME/.hubfuse/device.json
+
+! exec hubfuse join localhost:9090 --token DUMMY
+stderr 'already joined'
+stderr 'force'
+! stderr 'Usage:'
+! stderr 'panic'
+
+-- device.json --
+{"device_id":"test-device-id","nickname":"alice"}
