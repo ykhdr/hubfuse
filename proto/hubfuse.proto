@@ -197,6 +197,8 @@ message ConfirmPairingResponse {
   bool success = 1;
   string error = 2;
   string peer_public_key = 3;
+  string peer_device_id = 4;
+  string peer_nickname = 5;
 }
 
 // ─── ListDevices ────────────────────────────────────────────────────────────

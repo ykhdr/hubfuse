@@ -330,12 +330,19 @@ func (a *Agent) RequestPairing(t *testing.T, targetNickname string) string {
 	return ""
 }
 
+// ConfirmPairingCLI runs `hubfuse pair-confirm <inviteCode>` and returns the
+// combined output. Fatals if the command exits non-zero.
+func (a *Agent) ConfirmPairingCLI(t *testing.T, inviteCode string) string {
+	t.Helper()
+	return a.run(t, "pair-confirm", inviteCode)
+}
+
 // ConfirmPairing completes a pairing handshake using the given invite code.
-// It calls ConfirmPairing directly via gRPC (there is no CLI for this side).
-// After the RPC completes, it saves the peer's public key to
-// known_devices/<peerDeviceID>.pub so the local daemon can authenticate the
-// peer's SSH connections without waiting for a PairingCompleted event (which
-// the hub only sends to the initiator, not the confirmer).
+// It calls ConfirmPairing directly via gRPC (the `pair-confirm` CLI exists,
+// but tests that don't run a daemon prefer the direct path). After the RPC,
+// it saves the peer's public key to known_devices/<peerDeviceID>.pub as a
+// daemon-offline fallback — when a daemon IS running it also receives a
+// PairingCompleted event from the hub and writes the same file idempotently.
 func (a *Agent) ConfirmPairing(t *testing.T, inviteCode string) {
 	t.Helper()
 
@@ -363,30 +370,19 @@ func (a *Agent) ConfirmPairing(t *testing.T, inviteCode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	peerPublicKey, err := client.ConfirmPairing(ctx, inviteCode, myPubKey)
+	peerPublicKey, peerDeviceID, _, err := client.ConfirmPairing(ctx, inviteCode, myPubKey)
 	if err != nil {
 		t.Fatalf("ConfirmPairing: RPC: %v", err)
 	}
 
-	// The hub sends PairingCompleted only to the initiator (alice), not to the
-	// confirmer (bob). Save alice's public key manually so the local daemon's
-	// isPaired check passes when bob tries to mount alice's share.
-	if peerPublicKey != "" {
-		devResp, listErr := client.ListDevices(ctx)
-		if listErr != nil {
-			t.Logf("ConfirmPairing: ListDevices failed (non-fatal): %v", listErr)
-		} else {
-			// Find the device whose public key matches peerPublicKey by nickname
-			// exclusion — in a two-device test this is always the other device.
-			knownDevicesDir := filepath.Join(hubDir, common.KnownDevicesDir)
-			for _, dev := range devResp.Devices {
-				if dev.Nickname != a.Nickname {
-					if saveErr := agent.SavePeerPublicKey(knownDevicesDir, dev.DeviceId, peerPublicKey); saveErr != nil {
-						t.Logf("ConfirmPairing: save peer key (non-fatal): %v", saveErr)
-					}
-					break
-				}
-			}
+	// Save the peer key locally regardless of whether a daemon is running:
+	// when one is, the hub-emitted PairingCompleted event will write the same
+	// file too; when one isn't (most scenarios), this is the only writer and
+	// is what makes isPaired return true on the next daemon start.
+	if peerPublicKey != "" && peerDeviceID != "" {
+		knownDevicesDir := filepath.Join(hubDir, common.KnownDevicesDir)
+		if saveErr := agent.SavePeerPublicKey(knownDevicesDir, peerDeviceID, peerPublicKey); saveErr != nil {
+			t.Logf("ConfirmPairing: save peer key (non-fatal): %v", saveErr)
 		}
 	}
 }

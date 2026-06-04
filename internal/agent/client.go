@@ -184,17 +184,18 @@ func (c *HubClient) ListDevices(ctx context.Context) (*pb.ListDevicesResponse, e
 	return resp, nil
 }
 
-// ConfirmPairing completes a pairing handshake and returns the peer's public key.
-// The hub identifies the caller from the mTLS client certificate.
-func (c *HubClient) ConfirmPairing(ctx context.Context, inviteCode, publicKey string) (string, error) {
+// ConfirmPairing completes a pairing handshake and returns the peer's public
+// key, device ID, and nickname. The hub identifies the caller from the mTLS
+// client certificate.
+func (c *HubClient) ConfirmPairing(ctx context.Context, inviteCode, publicKey string) (peerPublicKey, peerDeviceID, peerNickname string, err error) {
 	resp, err := c.client.ConfirmPairing(ctx, &pb.ConfirmPairingRequest{
 		InviteCode: inviteCode,
 		PublicKey:  publicKey,
 	})
 	if err != nil {
-		return "", fmt.Errorf("ConfirmPairing RPC: %w", err)
+		return "", "", "", fmt.Errorf("ConfirmPairing RPC: %w", err)
 	}
-	return resp.PeerPublicKey, nil
+	return resp.PeerPublicKey, resp.PeerDeviceId, resp.PeerNickname, nil
 }
 
 // Close shuts down the underlying gRPC connection.

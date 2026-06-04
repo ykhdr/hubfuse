@@ -153,9 +153,11 @@ func TestConfirmPairing_Success(t *testing.T) {
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	require.NoError(t, err, "RequestPairing")
 
-	peerPK, err := r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	peerPK, peerDeviceID, peerNickname, err := r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
 	require.NoError(t, err, "ConfirmPairing")
 	assert.Equal(t, "pk-alice", peerPK)
+	assert.Equal(t, "dev-a", peerDeviceID)
+	assert.Equal(t, "alice", peerNickname)
 }
 
 func TestConfirmPairing_SendsCompletedEventToInitiator(t *testing.T) {
@@ -169,7 +171,7 @@ func TestConfirmPairing_SendsCompletedEventToInitiator(t *testing.T) {
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	require.NoError(t, err, "RequestPairing")
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
 	require.NoError(t, err, "ConfirmPairing")
 
 	select {
@@ -184,6 +186,54 @@ func TestConfirmPairing_SendsCompletedEventToInitiator(t *testing.T) {
 	}
 }
 
+func TestConfirmPairing_DeliversEventToBothParties(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+	setupPairingDevices(t, r)
+
+	chInitiator, unsubInitiator := r.Subscribe("dev-a")
+	defer unsubInitiator()
+
+	chConfirmer, unsubConfirmer := r.Subscribe("dev-b")
+	defer unsubConfirmer()
+
+	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
+	require.NoError(t, err, "RequestPairing")
+
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	require.NoError(t, err, "ConfirmPairing")
+
+	// Drain the PairingRequested event that was delivered to dev-b during RequestPairing.
+	select {
+	case ev := <-chConfirmer:
+		if ev.GetPairingRequested() == nil {
+			t.Fatalf("expected PairingRequested as first event for confirmer, got %T", ev.GetPayload())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for PairingRequested event on confirmer channel")
+	}
+
+	// Initiator must receive PairingCompleted with confirmer's info.
+	select {
+	case event := <-chInitiator:
+		require.NotNil(t, event.GetPairingCompleted(), "initiator: expected PairingCompleted, got %T", event.GetPayload())
+		assert.Equal(t, "dev-b", event.GetPairingCompleted().PeerDeviceId)
+		assert.Equal(t, "pk-bob", event.GetPairingCompleted().PeerPublicKey)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for PairingCompleted event on initiator channel")
+	}
+
+	// Confirmer must receive PairingCompleted with initiator's info.
+	select {
+	case event := <-chConfirmer:
+		require.NotNil(t, event.GetPairingCompleted(), "confirmer: expected PairingCompleted, got %T", event.GetPayload())
+		assert.Equal(t, "dev-a", event.GetPairingCompleted().PeerDeviceId)
+		assert.Equal(t, "pk-alice", event.GetPairingCompleted().PeerPublicKey)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for PairingCompleted event on confirmer channel")
+	}
+}
+
 func TestConfirmPairing_WrongCode(t *testing.T) {
 	r := newTestRegistry(t)
 	ctx := context.Background()
@@ -192,7 +242,7 @@ func TestConfirmPairing_WrongCode(t *testing.T) {
 	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	require.NoError(t, err, "RequestPairing")
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", "HUB-WRONG-CODE", "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", "HUB-WRONG-CODE", "pk-bob")
 	require.Error(t, err, "expected error for wrong code")
 	assert.Equal(t, common.ErrInvalidInviteCode, err)
 }
@@ -211,7 +261,7 @@ func TestConfirmPairing_MaxAttempts(t *testing.T) {
 		require.NoError(t, err, "IncrementInviteAttempts")
 	}
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
 	require.Error(t, err, "expected ErrMaxAttemptsExceeded")
 	assert.Equal(t, common.ErrMaxAttemptsExceeded, err)
 }
@@ -233,7 +283,7 @@ func TestConfirmPairing_Expired(t *testing.T) {
 	err := r.store.CreateInvite(ctx, inv)
 	require.NoError(t, err, "CreateInvite")
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", "HUB-EXP-IRD", "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", "HUB-EXP-IRD", "pk-bob")
 	require.Error(t, err, "expected ErrInviteExpired")
 	assert.Equal(t, common.ErrInviteExpired, err)
 }
@@ -247,7 +297,7 @@ func TestConfirmPairing_WrongTargetDevice(t *testing.T) {
 	require.NoError(t, err, "RequestPairing")
 
 	// dev-a tries to confirm, but the invite targets dev-b.
-	_, err = r.ConfirmPairing(ctx, "dev-a", code, "pk-alice")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-a", code, "pk-alice")
 	require.Error(t, err, "expected error for wrong target device")
 	assert.Equal(t, common.ErrInvalidInviteCode, err)
 }
@@ -260,7 +310,7 @@ func TestConfirmPairing_InviteDeletedAfterSuccess(t *testing.T) {
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	require.NoError(t, err, "RequestPairing")
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
 	require.NoError(t, err, "ConfirmPairing")
 
 	// The invite must no longer exist in the store.
@@ -276,7 +326,7 @@ func TestConfirmPairing_PairingRecordCreated(t *testing.T) {
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
 	require.NoError(t, err, "RequestPairing")
 
-	_, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
+	_, _, _, err = r.ConfirmPairing(ctx, "dev-b", code, "pk-bob")
 	require.NoError(t, err, "ConfirmPairing")
 
 	paired, err := r.store.IsPaired(ctx, "dev-a", "dev-b")
