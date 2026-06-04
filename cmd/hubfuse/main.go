@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/ykhdr/hubfuse/cmd/internal/clierrors"
@@ -57,6 +58,7 @@ func rootCmd() *cobra.Command {
 
 	cmd.AddCommand(
 		joinCmd(),
+		leaveCmd(),
 		startCmd(),
 		stopCmd(),
 		statusCmd(),
@@ -72,6 +74,7 @@ func rootCmd() *cobra.Command {
 // joinCmd implements: hubfuse join <hub-address>
 func joinCmd() *cobra.Command {
 	var joinToken string
+	var force bool
 
 	cmd := &cobra.Command{
 		Use:   "join <hub-address>",
@@ -80,14 +83,38 @@ func joinCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			hubAddr := args[0]
 
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			identityPath := filepath.Join(dataDir, common.IdentityFile)
+
+			// Duplicate-join guard: refuse if already joined, unless --force.
+			if existingID, loadErr := agent.LoadIdentity(identityPath); loadErr == nil {
+				if !force {
+					// Read the hub address from config if available.
+					existingHub := hubAddr
+					cfgPath := filepath.Join(dataDir, common.ConfigFile)
+					if cfg, cfgErr := loadConfig(cfgPath); cfgErr == nil && cfg.Hub.Address != "" {
+						existingHub = cfg.Hub.Address
+					}
+					return fmt.Errorf(
+						"this agent is already joined to hub %q as %q\nrun `hubfuse leave` first, or pass --force to overwrite",
+						existingHub, existingID.Nickname,
+					)
+				}
+
+				// --force: best-effort Leave against the old hub before overwriting.
+				if err := bestEffortLeave(dataDir); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: cannot deregister from old hub (proceeding, the old device may linger until pruned): %v\n", err)
+				}
+			}
+
 			deviceID := agent.GenerateDeviceID()
-			ctx := &clierrors.Context{HubAddr: hubAddr}
+			cliCtx := &clierrors.Context{HubAddr: hubAddr}
 
 			// Dial hub insecurely (no client cert yet).
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			hubClient, err := agent.DialInsecure(hubAddr, logger)
 			if err != nil {
-				return clierrors.Wrap(fmt.Errorf("dial hub: %w", err), ctx)
+				return clierrors.Wrap(fmt.Errorf("dial hub: %w", err), cliCtx)
 			}
 			defer hubClient.Close()
 
@@ -97,8 +124,8 @@ func joinCmd() *cobra.Command {
 				resp     *pb.JoinResponse
 			)
 			printNicknameTaken := func(err error) {
-				ctx.Nickname = nickname
-				fmt.Fprintln(os.Stderr, clierrors.Format(err, ctx))
+				cliCtx.Nickname = nickname
+				fmt.Fprintln(os.Stderr, clierrors.Format(err, cliCtx))
 			}
 
 			for {
@@ -107,7 +134,7 @@ func joinCmd() *cobra.Command {
 					return err
 				}
 				nickname = n
-				ctx.Nickname = nickname
+				cliCtx.Nickname = nickname
 				if nickname == "" {
 					fmt.Fprintln(os.Stderr, "error: nickname cannot be empty")
 					continue
@@ -120,7 +147,7 @@ func joinCmd() *cobra.Command {
 						printNicknameTaken(err)
 						continue
 					}
-					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), ctx)
+					return clierrors.Wrap(fmt.Errorf("join hub: %w", err), cliCtx)
 				}
 				if !resp.Success {
 					respErr := errors.New(resp.Error)
@@ -128,14 +155,13 @@ func joinCmd() *cobra.Command {
 						printNicknameTaken(respErr)
 						continue
 					}
-					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), ctx)
+					return clierrors.Wrap(fmt.Errorf("join failed: %w", respErr), cliCtx)
 				}
 
 				break
 			}
 
 			// Save certs to ~/.hubfuse/tls/.
-			dataDir := common.ExpandHome(common.AgentDataDir)
 			tlsDirPath := filepath.Join(dataDir, common.TLSDir)
 			if err := os.MkdirAll(tlsDirPath, 0700); err != nil {
 				return fmt.Errorf("create tls dir: %w", err)
@@ -156,7 +182,6 @@ func joinCmd() *cobra.Command {
 				DeviceID: deviceID,
 				Nickname: nickname,
 			}
-			identityPath := filepath.Join(dataDir, common.IdentityFile)
 			if err := agent.SaveIdentity(identityPath, identity); err != nil {
 				return fmt.Errorf("save identity: %w", err)
 			}
@@ -176,9 +201,115 @@ func joinCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&joinToken, "token", "", "join token issued by the hub (required; get one via 'hubfuse-hub issue-join' on the hub host)")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing join (best-effort Leave against the old hub first)")
 	_ = cmd.MarkFlagRequired("token")
 
 	return cmd
+}
+
+// leaveCmd implements: hubfuse leave
+func leaveCmd() *cobra.Command {
+	var forceLocal bool
+
+	cmd := &cobra.Command{
+		Use:   "leave",
+		Short: "Permanently leave the hub and wipe local state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			identityPath := filepath.Join(dataDir, common.IdentityFile)
+
+			identity, err := agent.LoadIdentity(identityPath)
+			if err != nil {
+				return fmt.Errorf("not joined to any hub (no identity found): %w", err)
+			}
+
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			hubClient, _, hubAddr, dialErr := dialHub(dataDir, logger)
+			if dialErr != nil {
+				if !forceLocal {
+					return clierrors.Wrap(fmt.Errorf("connect to hub: %w", dialErr), &clierrors.Context{HubAddr: hubAddr})
+				}
+				fmt.Fprintf(os.Stderr, "warning: cannot reach hub (proceeding with --force-local): %v\n", dialErr)
+			} else {
+				defer hubClient.Close()
+				leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer leaveCancel()
+				if rpcErr := hubClient.Leave(leaveCtx); rpcErr != nil {
+					if !forceLocal {
+						return clierrors.Wrap(fmt.Errorf("leave hub: %w", rpcErr), &clierrors.Context{HubAddr: hubAddr})
+					}
+					fmt.Fprintf(os.Stderr, "warning: leave RPC failed (proceeding with --force-local): %v\n", rpcErr)
+				}
+			}
+
+			// Wipe local identity state (preserve config.kdl and keys/).
+			tlsDirPath := filepath.Join(dataDir, common.TLSDir)
+			knownDevicesDir := filepath.Join(dataDir, common.KnownDevicesDir)
+
+			if err := os.RemoveAll(tlsDirPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove tls dir: %w", err)
+			}
+			if err := os.Remove(identityPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove identity: %w", err)
+			}
+			if err := os.RemoveAll(knownDevicesDir); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove known_devices dir: %w", err)
+			}
+
+			fmt.Printf("left hub %s (device_id: %s)\n", hubAddr, identity.DeviceID)
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&forceLocal, "force-local", false, "wipe local state even if the hub RPC fails (use when the hub is gone permanently)")
+
+	return cmd
+}
+
+// bestEffortLeave runs a best-effort Leave RPC against the hub recorded in
+// config.kdl using the on-disk TLS material. It is called from `join --force`
+// so the old device row doesn't outlive the local cert. The caller surfaces
+// any returned error as a warning; we never fail the surrounding join because
+// of cleanup trouble.
+func bestEffortLeave(dataDir string) error {
+	cfgPath := filepath.Join(dataDir, common.ConfigFile)
+	oldCfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load old config: %w", err)
+	}
+	oldHub := oldCfg.Hub.Address
+	if oldHub == "" {
+		return fmt.Errorf("old config has no hub address")
+	}
+
+	tlsDirPath := filepath.Join(dataDir, common.TLSDir)
+	for _, p := range []string{
+		filepath.Join(tlsDirPath, common.CACertFile),
+		filepath.Join(tlsDirPath, common.ClientCertFile),
+		filepath.Join(tlsDirPath, common.ClientKeyFile),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("stat %s: %w", p, err)
+		}
+	}
+
+	caCertPath := filepath.Join(tlsDirPath, common.CACertFile)
+	clientCertPath := filepath.Join(tlsDirPath, common.ClientCertFile)
+	clientKeyPath := filepath.Join(tlsDirPath, common.ClientKeyFile)
+
+	leaveLogger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	leaveClient, err := agent.DialWithMTLS(oldHub, caCertPath, clientCertPath, clientKeyPath, leaveLogger)
+	if err != nil {
+		return fmt.Errorf("dial old hub %q: %w", oldHub, err)
+	}
+	defer leaveClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := leaveClient.Leave(ctx); err != nil {
+		return fmt.Errorf("leave old hub %q: %w", oldHub, err)
+	}
+	return nil
 }
 
 // startCmd implements: hubfuse start

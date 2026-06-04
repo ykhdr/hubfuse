@@ -25,6 +25,7 @@ const (
 	HubFuse_Heartbeat_FullMethodName      = "/hubfuse.HubFuse/Heartbeat"
 	HubFuse_UpdateShares_FullMethodName   = "/hubfuse.HubFuse/UpdateShares"
 	HubFuse_Deregister_FullMethodName     = "/hubfuse.HubFuse/Deregister"
+	HubFuse_Leave_FullMethodName          = "/hubfuse.HubFuse/Leave"
 	HubFuse_Subscribe_FullMethodName      = "/hubfuse.HubFuse/Subscribe"
 	HubFuse_RequestPairing_FullMethodName = "/hubfuse.HubFuse/RequestPairing"
 	HubFuse_ConfirmPairing_FullMethodName = "/hubfuse.HubFuse/ConfirmPairing"
@@ -42,6 +43,7 @@ type HubFuseClient interface {
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	UpdateShares(ctx context.Context, in *UpdateSharesRequest, opts ...grpc.CallOption) (*UpdateSharesResponse, error)
 	Deregister(ctx context.Context, in *DeregisterRequest, opts ...grpc.CallOption) (*DeregisterResponse, error)
+	Leave(ctx context.Context, in *LeaveRequest, opts ...grpc.CallOption) (*LeaveResponse, error)
 	// Server-streaming: push events to the agent
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (HubFuse_SubscribeClient, error)
 	RequestPairing(ctx context.Context, in *RequestPairingRequest, opts ...grpc.CallOption) (*RequestPairingResponse, error)
@@ -105,6 +107,15 @@ func (c *hubFuseClient) UpdateShares(ctx context.Context, in *UpdateSharesReques
 func (c *hubFuseClient) Deregister(ctx context.Context, in *DeregisterRequest, opts ...grpc.CallOption) (*DeregisterResponse, error) {
 	out := new(DeregisterResponse)
 	err := c.cc.Invoke(ctx, HubFuse_Deregister_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hubFuseClient) Leave(ctx context.Context, in *LeaveRequest, opts ...grpc.CallOption) (*LeaveResponse, error) {
+	out := new(LeaveResponse)
+	err := c.cc.Invoke(ctx, HubFuse_Leave_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +192,7 @@ type HubFuseServer interface {
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	UpdateShares(context.Context, *UpdateSharesRequest) (*UpdateSharesResponse, error)
 	Deregister(context.Context, *DeregisterRequest) (*DeregisterResponse, error)
+	Leave(context.Context, *LeaveRequest) (*LeaveResponse, error)
 	// Server-streaming: push events to the agent
 	Subscribe(*SubscribeRequest, HubFuse_SubscribeServer) error
 	RequestPairing(context.Context, *RequestPairingRequest) (*RequestPairingResponse, error)
@@ -210,6 +222,9 @@ func (UnimplementedHubFuseServer) UpdateShares(context.Context, *UpdateSharesReq
 }
 func (UnimplementedHubFuseServer) Deregister(context.Context, *DeregisterRequest) (*DeregisterResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Deregister not implemented")
+}
+func (UnimplementedHubFuseServer) Leave(context.Context, *LeaveRequest) (*LeaveResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Leave not implemented")
 }
 func (UnimplementedHubFuseServer) Subscribe(*SubscribeRequest, HubFuse_SubscribeServer) error {
 	return status.Errorf(codes.Unimplemented, "method Subscribe not implemented")
@@ -344,6 +359,24 @@ func _HubFuse_Deregister_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HubFuse_Leave_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LeaveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HubFuseServer).Leave(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HubFuse_Leave_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HubFuseServer).Leave(ctx, req.(*LeaveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _HubFuse_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -449,6 +482,10 @@ var HubFuse_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Deregister",
 			Handler:    _HubFuse_Deregister_Handler,
+		},
+		{
+			MethodName: "Leave",
+			Handler:    _HubFuse_Leave_Handler,
 		},
 		{
 			MethodName: "RequestPairing",

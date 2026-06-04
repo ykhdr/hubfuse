@@ -143,6 +143,21 @@ func (s *Server) Deregister(ctx context.Context, req *pb.DeregisterRequest) (*pb
 	return &pb.DeregisterResponse{Success: true}, nil
 }
 
+// Leave permanently removes the calling device from the hub, cascading
+// deletes to its shares, pairings, and pending invites.
+func (s *Server) Leave(ctx context.Context, _ *pb.LeaveRequest) (*pb.LeaveResponse, error) {
+	deviceID, err := common.ExtractDeviceID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.registry.Leave(ctx, deviceID); err != nil {
+		return &pb.LeaveResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &pb.LeaveResponse{Success: true}, nil
+}
+
 // Subscribe opens a server-streaming RPC that pushes events to the device
 // until the context is cancelled. The device_id is taken from the mTLS client
 // certificate; req.DeviceId is ignored (deprecated, see proto comment).

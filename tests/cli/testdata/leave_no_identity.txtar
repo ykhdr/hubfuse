@@ -1,0 +1,6 @@
+# `hubfuse leave` with no identity file must exit non-zero and mention
+# that no identity was found.
+! exec hubfuse leave
+stderr 'not joined'
+! stderr 'Usage:'
+! stderr 'panic'

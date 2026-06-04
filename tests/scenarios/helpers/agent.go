@@ -285,6 +285,19 @@ func (a *Agent) Stop(t *testing.T) {
 	a.daemonCmd = nil
 }
 
+// Leave runs `hubfuse leave` for this agent and fatals if it exits non-zero.
+func (a *Agent) Leave(t *testing.T) {
+	t.Helper()
+	a.run(t, "leave")
+}
+
+// TryLeave runs `hubfuse leave` and returns (output, true) on success or
+// (output, false) on non-zero exit. Never fails the test.
+func (a *Agent) TryLeave(t *testing.T) (string, bool) {
+	t.Helper()
+	return a.tryRun(t, "leave")
+}
+
 // RequestPairing runs `hubfuse pair <targetNickname>` and returns the invite
 // code printed by the command. Fatals if the expected line is not found.
 func (a *Agent) RequestPairing(t *testing.T, targetNickname string) string {
