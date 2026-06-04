@@ -25,6 +25,12 @@ func SignalStop(pidPath, name string) error {
 	if err != nil {
 		return err
 	}
+	// Reject non-positive PIDs: on Unix, kill(0, sig) signals the entire
+	// process group and kill(-1, sig) every process the caller can reach.
+	// A corrupt pidfile must never escalate into either.
+	if pid <= 0 {
+		return fmt.Errorf("pidfile %q contains non-positive pid %d", pidPath, pid)
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return fmt.Errorf("find process %d: %w", pid, err)
@@ -46,7 +52,15 @@ func SignalStop(pidPath, name string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "%s did not exit after SIGTERM; escalating to SIGKILL (pid %d)\n", name, pid)
-	_ = proc.Signal(syscall.SIGKILL)
+	if killErr := proc.Signal(syscall.SIGKILL); killErr != nil {
+		// ESRCH here means the process exited between the wait loop and
+		// the kill — treat as success rather than reporting a refusal.
+		if errors.Is(killErr, syscall.ESRCH) || errors.Is(killErr, os.ErrProcessDone) {
+			fmt.Printf("%s stopped (pid %d)\n", name, pid)
+			return nil
+		}
+		return fmt.Errorf("send SIGKILL to %d: %w", pid, killErr)
+	}
 
 	if waitForExit(pid, stopKillTimeout) {
 		fmt.Printf("%s stopped (pid %d)\n", name, pid)

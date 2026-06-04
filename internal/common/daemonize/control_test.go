@@ -124,6 +124,25 @@ func TestSignalStop_ProcessAlreadyDead(t *testing.T) {
 	assert.NoError(t, err, "SignalStop should return nil for already-dead process")
 }
 
+// TestSignalStop_RejectsNonPositivePID verifies SignalStop refuses to act on
+// a pidfile containing 0 or a negative value. On Unix, signalling pid 0 hits
+// the entire process group and pid <0 the whole reachable system — a corrupt
+// pidfile must never escalate into either.
+func TestSignalStop_RejectsNonPositivePID(t *testing.T) {
+	for _, raw := range []string{"0", "-1"} {
+		t.Run("pid_"+raw, func(t *testing.T) {
+			dir := t.TempDir()
+			pidPath := filepath.Join(dir, "bad.pid")
+			require.NoError(t, os.WriteFile(pidPath, []byte(raw+"\n"), 0o644))
+
+			err := SignalStop(pidPath, "bad-pid")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "non-positive pid",
+				"error should mention non-positive pid; got: %v", err)
+		})
+	}
+}
+
 func TestReportStatus_Running(t *testing.T) {
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "live.pid")
