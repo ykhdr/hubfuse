@@ -186,7 +186,10 @@ func (c *HubClient) ListDevices(ctx context.Context) (*pb.ListDevicesResponse, e
 
 // ConfirmPairing completes a pairing handshake and returns the peer's public
 // key, device ID, and nickname. The hub identifies the caller from the mTLS
-// client certificate.
+// client certificate. Application-level failures (invalid/expired invite,
+// attempts exceeded) come back as Success=false with a nil gRPC error — those
+// are translated into a real Go error so the CLI doesn't print a misleading
+// "paired with ..." line on failure.
 func (c *HubClient) ConfirmPairing(ctx context.Context, inviteCode, publicKey string) (peerPublicKey, peerDeviceID, peerNickname string, err error) {
 	resp, err := c.client.ConfirmPairing(ctx, &pb.ConfirmPairingRequest{
 		InviteCode: inviteCode,
@@ -194,6 +197,9 @@ func (c *HubClient) ConfirmPairing(ctx context.Context, inviteCode, publicKey st
 	})
 	if err != nil {
 		return "", "", "", fmt.Errorf("ConfirmPairing RPC: %w", err)
+	}
+	if !resp.Success {
+		return "", "", "", fmt.Errorf("confirm pairing: %s", resp.Error)
 	}
 	return resp.PeerPublicKey, resp.PeerDeviceId, resp.PeerNickname, nil
 }

@@ -435,16 +435,23 @@ func statusCmd() *cobra.Command {
 
 // ensureAgentPublicKey loads the SSH public key from dataDir, generating a new
 // key pair if none exists. Returns the OpenSSH-format public key string.
+// Stat errors other than IsNotExist (e.g. EACCES on the keys directory) are
+// surfaced directly so the user sees the real failure instead of a misleading
+// "load public key" error from the fallthrough path.
 func ensureAgentPublicKey(dataDir string) (string, error) {
 	keysDirPath := filepath.Join(dataDir, common.KeysDir)
 	pubKeyPath := filepath.Join(keysDirPath, common.PublicKeyFile)
 
-	if _, err := os.Stat(pubKeyPath); os.IsNotExist(err) {
+	_, statErr := os.Stat(pubKeyPath)
+	switch {
+	case os.IsNotExist(statErr):
 		pk, err := agent.GenerateSSHKeyPair(keysDirPath)
 		if err != nil {
 			return "", fmt.Errorf("generate SSH key pair: %w", err)
 		}
 		return pk, nil
+	case statErr != nil:
+		return "", fmt.Errorf("stat public key %q: %w", pubKeyPath, statErr)
 	}
 
 	pk, err := agent.LoadPublicKey(pubKeyPath)

@@ -173,6 +173,14 @@ func (a *Agent) TryJoinWithTamperedToken(t *testing.T, hubAddr, token, nickname 
 	return string(out), err == nil
 }
 
+// TryRun runs the hubfuse binary with arbitrary args and returns (output, ok).
+// Use this for negative-path assertions where the test cares whether the
+// command exited non-zero. Never fails the test by itself.
+func (a *Agent) TryRun(t *testing.T, args ...string) (string, bool) {
+	t.Helper()
+	return a.tryRun(t, args...)
+}
+
 // StartDaemon launches the hubfuse daemon with the agent's configuration.
 // It updates config.kdl with the SSH port and exports, then starts the daemon.
 // Returns once the SSH server port is confirmed listening.
