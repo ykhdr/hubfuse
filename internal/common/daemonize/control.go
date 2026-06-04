@@ -4,29 +4,85 @@
 package daemonize
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
-// SignalStop reads a PID file and sends SIGTERM to the recorded
-// process. On success it prints "sent SIGTERM to <name> (pid N)" to
-// stdout and returns nil. `name` is the process label shown in
-// messages (e.g. "agent" or "hub").
+const (
+	stopGracefulTimeout = 10 * time.Second
+	stopKillTimeout     = 3 * time.Second
+	stopPollInterval    = 100 * time.Millisecond
+)
+
+// SignalStop reads a PID file, sends SIGTERM to the recorded process,
+// waits for it to exit, and escalates to SIGKILL if the graceful
+// deadline expires. Returns nil once the process is gone.
 func SignalStop(pidPath, name string) error {
 	pid, err := ReadPID(pidPath)
 	if err != nil {
 		return err
 	}
+	// Reject non-positive PIDs: on Unix, kill(0, sig) signals the entire
+	// process group and kill(-1, sig) every process the caller can reach.
+	// A corrupt pidfile must never escalate into either.
+	if pid <= 0 {
+		return fmt.Errorf("pidfile %q contains non-positive pid %d", pidPath, pid)
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return fmt.Errorf("find process %d: %w", pid, err)
 	}
+
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		// Process already gone — the caller's goal is achieved.
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+			fmt.Printf("%s stopped (pid %d)\n", name, pid)
+			return nil
+		}
 		return fmt.Errorf("send SIGTERM to %d: %w", pid, err)
 	}
 	fmt.Printf("sent SIGTERM to %s (pid %d)\n", name, pid)
-	return nil
+
+	if waitForExit(pid, stopGracefulTimeout) {
+		fmt.Printf("%s stopped (pid %d)\n", name, pid)
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "%s did not exit after SIGTERM; escalating to SIGKILL (pid %d)\n", name, pid)
+	if killErr := proc.Signal(syscall.SIGKILL); killErr != nil {
+		// ESRCH here means the process exited between the wait loop and
+		// the kill — treat as success rather than reporting a refusal.
+		if errors.Is(killErr, syscall.ESRCH) || errors.Is(killErr, os.ErrProcessDone) {
+			fmt.Printf("%s stopped (pid %d)\n", name, pid)
+			return nil
+		}
+		return fmt.Errorf("send SIGKILL to %d: %w", pid, killErr)
+	}
+
+	if waitForExit(pid, stopKillTimeout) {
+		fmt.Printf("%s stopped (pid %d)\n", name, pid)
+		return nil
+	}
+
+	return fmt.Errorf("%s (pid %d) refused to exit after SIGKILL", name, pid)
+}
+
+// waitForExit polls the given pid with syscall.Kill(pid, 0) until the process
+// is gone (ESRCH) or the deadline expires. Returns true if the process exited.
+// Using the raw syscall avoids the os.Process zombie caveat where Signal(0)
+// returns nil until the caller has called Wait.
+func waitForExit(pid int, deadline time.Duration) bool {
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		time.Sleep(stopPollInterval)
+	}
+	return false
 }
 
 // ReportStatus prints a human-readable liveness report for the
