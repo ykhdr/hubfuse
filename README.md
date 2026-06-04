@@ -31,10 +31,12 @@ hubfuse-hub start
 
 # On the hub host — issue a single-use token for the joining device
 hubfuse-hub issue-join
-# -> HUB-AB2-9XY
+# -> HUB-AB2-9XY.mfqwcylbmfqwcylbmfqwcylb
+#    ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+#    DB prefix    hub TLS fingerprint (26-char base32)
 
-# On each device — join the hub with the token, then start the agent
-hubfuse join <hub-address>:9090 --token HUB-AB2-9XY
+# On each device — join the hub with the full token, then start the agent
+hubfuse join <hub-address>:9090 --token HUB-AB2-9XY.mfqwcylbmfqwcylbmfqwcylb
 hubfuse start
 ```
 
@@ -44,6 +46,15 @@ Join call that presents them — a Join that fails after claiming the token
 issuing a fresh token. This is deliberate: it keeps the token single-use under
 concurrent requests and prevents exposing it to brute-force attempts. Configure
 the TTL with `join-token-ttl "<duration>"` in `~/.hubfuse-hub/config.kdl`.
+
+### Security
+
+The suffix after the `.` is a truncated SHA-256 fingerprint of the hub's TLS
+leaf certificate (first 16 bytes, base32-encoded). During `hubfuse join`, the
+agent pins this fingerprint against the server's certificate before sending
+any data — an active MITM presenting a different certificate is rejected before
+the Join RPC is ever issued. Rotating the hub's server certificate invalidates
+all outstanding join tokens; issue fresh ones after rotation.
 
 ## Configuration
 
@@ -100,7 +111,7 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 
 | Command | Description |
 |---|---|
-| `join <hub-address> --token HUB-XXX-YYY [--force]` | Register this device with a hub using a token issued via `hubfuse-hub issue-join`; receives TLS certs. Refuses if already joined unless `--force` is passed. |
+| `join <hub-address> --token HUB-XXX-YYY.<fp> [--force]` | Register this device with a hub using a token issued via `hubfuse-hub issue-join`; receives TLS certs. Refuses if already joined unless `--force` is passed. |
 | `leave [--force-local]` | Permanently remove this device from the hub and wipe local TLS state. Pass `--force-local` to wipe even if the hub is unreachable. |
 | `start [-d]` | Start the agent daemon |
 | `stop` | Stop the running agent |
