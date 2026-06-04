@@ -1,0 +1,7 @@
+# pair-confirm requires an existing hub connection (identity + TLS certs).
+# With an empty HOME, it fails on missing identity before making any network call.
+env HOME=$WORK/home
+mkdir $WORK/home
+! exec hubfuse pair-confirm SOMECODE
+stderr 'error:.*identity|error:.*not joined|error:.*load'
+! stderr 'Usage:'

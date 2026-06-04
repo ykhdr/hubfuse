@@ -1,0 +1,4 @@
+# pair-confirm with no arguments must show the arg-validation error and usage.
+! exec hubfuse pair-confirm
+stderr 'accepts 1 arg\(s\), received 0'
+stderr 'Usage:'

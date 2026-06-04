@@ -1,0 +1,4 @@
+# pair-confirm --help exits zero and describes the invite argument.
+exec hubfuse pair-confirm --help
+stdout 'invite'
+stdout 'pair-confirm'

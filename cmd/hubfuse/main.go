@@ -63,6 +63,7 @@ func rootCmd() *cobra.Command {
 		stopCmd(),
 		statusCmd(),
 		pairCmd(),
+		pairConfirmCmd(),
 		devicesCmd(),
 		renameCmd(),
 		shareCmd,
@@ -432,6 +433,34 @@ func statusCmd() *cobra.Command {
 	}
 }
 
+// ensureAgentPublicKey loads the SSH public key from dataDir, generating a new
+// key pair if none exists. Returns the OpenSSH-format public key string.
+// Stat errors other than IsNotExist (e.g. EACCES on the keys directory) are
+// surfaced directly so the user sees the real failure instead of a misleading
+// "load public key" error from the fallthrough path.
+func ensureAgentPublicKey(dataDir string) (string, error) {
+	keysDirPath := filepath.Join(dataDir, common.KeysDir)
+	pubKeyPath := filepath.Join(keysDirPath, common.PublicKeyFile)
+
+	_, statErr := os.Stat(pubKeyPath)
+	switch {
+	case os.IsNotExist(statErr):
+		pk, err := agent.GenerateSSHKeyPair(keysDirPath)
+		if err != nil {
+			return "", fmt.Errorf("generate SSH key pair: %w", err)
+		}
+		return pk, nil
+	case statErr != nil:
+		return "", fmt.Errorf("stat public key %q: %w", pubKeyPath, statErr)
+	}
+
+	pk, err := agent.LoadPublicKey(pubKeyPath)
+	if err != nil {
+		return "", fmt.Errorf("load public key: %w", err)
+	}
+	return pk, nil
+}
+
 // pairCmd implements: hubfuse pair <device>
 func pairCmd() *cobra.Command {
 	return &cobra.Command{
@@ -442,23 +471,10 @@ func pairCmd() *cobra.Command {
 			toDevice := args[0]
 
 			dataDir := common.ExpandHome(common.AgentDataDir)
-			keysDirPath := filepath.Join(dataDir, common.KeysDir)
-			pubKeyPath := filepath.Join(keysDirPath, common.PublicKeyFile)
 
-			// Load or generate SSH key pair.
-			var publicKey string
-			if _, err := os.Stat(pubKeyPath); os.IsNotExist(err) {
-				pk, err := agent.GenerateSSHKeyPair(keysDirPath)
-				if err != nil {
-					return fmt.Errorf("generate SSH key pair: %w", err)
-				}
-				publicKey = pk
-			} else {
-				pk, err := agent.LoadPublicKey(pubKeyPath)
-				if err != nil {
-					return fmt.Errorf("load public key: %w", err)
-				}
-				publicKey = pk
+			publicKey, err := ensureAgentPublicKey(dataDir)
+			if err != nil {
+				return err
 			}
 
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -476,6 +492,53 @@ func pairCmd() *cobra.Command {
 
 			fmt.Printf("pairing invite code: %s\n", inviteCode)
 			fmt.Printf("share this code with %q to complete pairing\n", toDevice)
+			return nil
+		},
+	}
+}
+
+// pairConfirmCmd implements: hubfuse pair-confirm <invite-code>
+func pairConfirmCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pair-confirm <invite-code>",
+		Short: "Accept a pairing invite from a remote device",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			inviteCode := args[0]
+
+			dataDir := common.ExpandHome(common.AgentDataDir)
+
+			publicKey, err := ensureAgentPublicKey(dataDir)
+			if err != nil {
+				return err
+			}
+
+			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			hubClient, _, hubAddr, err := dialHub(dataDir, logger)
+			if err != nil {
+				return clierrors.Wrap(fmt.Errorf("connect to hub: %w", err), &clierrors.Context{HubAddr: hubAddr})
+			}
+			defer hubClient.Close()
+
+			ctx := &clierrors.Context{HubAddr: hubAddr}
+			peerPublicKey, peerDeviceID, peerNickname, err := hubClient.ConfirmPairing(context.Background(), inviteCode, publicKey)
+			if err != nil {
+				return clierrors.Wrap(fmt.Errorf("confirm pairing: %w", err), ctx)
+			}
+
+			if peerPublicKey != "" && peerDeviceID != "" {
+				knownDevicesDir := filepath.Join(dataDir, common.KnownDevicesDir)
+				// Save the peer key even when the daemon is running: the hub now also
+				// sends a PairingCompleted event to the confirmer so the daemon's
+				// in-memory SSH allowed-keys map is updated live. Writing the file here
+				// is idempotent and ensures the key persists for future daemon restarts
+				// when no event is in-flight (e.g. daemon was offline during confirm).
+				if saveErr := agent.SavePeerPublicKey(knownDevicesDir, peerDeviceID, peerPublicKey); saveErr != nil {
+					return fmt.Errorf("save peer public key: %w", saveErr)
+				}
+			}
+
+			fmt.Printf("paired with %q (device_id: %s)\n", peerNickname, peerDeviceID)
 			return nil
 		},
 	}

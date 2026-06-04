@@ -218,7 +218,7 @@ func (s *Server) ConfirmPairing(ctx context.Context, req *pb.ConfirmPairingReque
 		return nil, err
 	}
 
-	peerPublicKey, err := s.registry.ConfirmPairing(ctx, deviceID, req.InviteCode, req.PublicKey)
+	peerPublicKey, peerDeviceID, peerNickname, err := s.registry.ConfirmPairing(ctx, deviceID, req.InviteCode, req.PublicKey)
 	if err != nil {
 		return &pb.ConfirmPairingResponse{Success: false, Error: err.Error()}, nil
 	}
@@ -226,6 +226,8 @@ func (s *Server) ConfirmPairing(ctx context.Context, req *pb.ConfirmPairingReque
 	return &pb.ConfirmPairingResponse{
 		Success:       true,
 		PeerPublicKey: peerPublicKey,
+		PeerDeviceId:  peerDeviceID,
+		PeerNickname:  peerNickname,
 	}, nil
 }
 

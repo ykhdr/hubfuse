@@ -81,38 +81,47 @@ func (r *Registry) RequestPairing(ctx context.Context, fromDevice, toDevice, pub
 }
 
 // ConfirmPairing validates an invite code and completes the pairing. Returns
-// the initiator's public key on success.
-func (r *Registry) ConfirmPairing(ctx context.Context, deviceID, inviteCode, publicKey string) (peerPublicKey string, err error) {
+// the initiator's public key, device ID, and nickname on success.
+func (r *Registry) ConfirmPairing(ctx context.Context, deviceID, inviteCode, publicKey string) (peerPublicKey, peerDeviceID, peerNickname string, err error) {
 	inv, err := r.store.GetInvite(ctx, inviteCode)
 	if err != nil {
-		return "", common.ErrInvalidInviteCode
+		return "", "", "", common.ErrInvalidInviteCode
 	}
 
 	if inv.ToDevice != deviceID {
-		return "", common.ErrInvalidInviteCode
+		return "", "", "", common.ErrInvalidInviteCode
 	}
 
 	if time.Now().After(inv.ExpiresAt) {
-		return "", common.ErrInviteExpired
+		return "", "", "", common.ErrInviteExpired
 	}
 
 	if inv.Attempts >= maxPairingAttempts {
-		return "", common.ErrMaxAttemptsExceeded
+		return "", "", "", common.ErrMaxAttemptsExceeded
+	}
+
+	// Resolve the initiator before any write so a lookup failure can't leave
+	// the pairing row + deleted invite half-committed (which would make a
+	// retry impossible: CreatePairing would hit a duplicate-key error).
+	fromDevice, err := r.store.GetDevice(ctx, inv.FromDevice)
+	if err != nil {
+		return "", "", "", fmt.Errorf("get initiator device: %w", err)
 	}
 
 	if err := r.store.IncrementInviteAttempts(ctx, inviteCode); err != nil {
-		return "", err
+		return "", "", "", err
 	}
 
 	if err := r.store.CreatePairing(ctx, inv.FromDevice, deviceID); err != nil {
-		return "", err
+		return "", "", "", err
 	}
 
 	if err := r.store.DeleteInvite(ctx, inviteCode); err != nil {
-		return "", err
+		return "", "", "", err
 	}
 
-	event := &pb.Event{
+	// Notify the initiator: peer is the confirmer.
+	eventForInitiator := &pb.Event{
 		Payload: &pb.Event_PairingCompleted{
 			PairingCompleted: &pb.PairingCompletedEvent{
 				PeerDeviceId:  deviceID,
@@ -120,9 +129,22 @@ func (r *Registry) ConfirmPairing(ctx context.Context, deviceID, inviteCode, pub
 			},
 		},
 	}
-	r.sendToDevice(inv.FromDevice, event)
+	r.sendToDevice(inv.FromDevice, eventForInitiator)
 
-	return inv.FromPublicKey, nil
+	// Notify the confirmer: peer is the initiator. Without this event the
+	// confirmer's daemon never updates its SSH allowed-keys map and rejects
+	// incoming SSHFS from the newly-paired peer until restart.
+	eventForConfirmer := &pb.Event{
+		Payload: &pb.Event_PairingCompleted{
+			PairingCompleted: &pb.PairingCompletedEvent{
+				PeerDeviceId:  inv.FromDevice,
+				PeerPublicKey: inv.FromPublicKey,
+			},
+		},
+	}
+	r.sendToDevice(deviceID, eventForConfirmer)
+
+	return inv.FromPublicKey, fromDevice.DeviceID, fromDevice.Nickname, nil
 }
 
 // sendToDevice delivers an event to a single subscribed device. If the channel
