@@ -102,33 +102,8 @@ func joinCmd() *cobra.Command {
 				}
 
 				// --force: best-effort Leave against the old hub before overwriting.
-				tlsDirPath := filepath.Join(dataDir, common.TLSDir)
-				caCertPath := filepath.Join(tlsDirPath, common.CACertFile)
-				clientCertPath := filepath.Join(tlsDirPath, common.ClientCertFile)
-				clientKeyPath := filepath.Join(tlsDirPath, common.ClientKeyFile)
-
-				cfgPath := filepath.Join(dataDir, common.ConfigFile)
-				if oldCfg, cfgErr := loadConfig(cfgPath); cfgErr == nil {
-					oldHub := oldCfg.Hub.Address
-					if oldHub != "" {
-						if _, statErr := os.Stat(caCertPath); statErr == nil {
-							if _, statErr := os.Stat(clientCertPath); statErr == nil {
-								if _, statErr := os.Stat(clientKeyPath); statErr == nil {
-									leaveLogger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-									if leaveClient, dialErr := agent.DialWithMTLS(oldHub, caCertPath, clientCertPath, clientKeyPath, leaveLogger); dialErr == nil {
-										leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 5*time.Second)
-										if leaveErr := leaveClient.Leave(leaveCtx); leaveErr != nil {
-											fmt.Fprintf(os.Stderr, "warning: leave old hub %q failed (proceeding): %v\n", oldHub, leaveErr)
-										}
-										leaveCancel()
-										_ = leaveClient.Close()
-									} else {
-										fmt.Fprintf(os.Stderr, "warning: dial old hub %q failed (proceeding): %v\n", oldHub, dialErr)
-									}
-								}
-							}
-						}
-					}
+				if err := bestEffortLeave(dataDir); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: cannot deregister from old hub (proceeding, the old device may linger until pruned): %v\n", err)
 				}
 			}
 
@@ -289,6 +264,52 @@ func leaveCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&forceLocal, "force-local", false, "wipe local state even if the hub RPC fails (use when the hub is gone permanently)")
 
 	return cmd
+}
+
+// bestEffortLeave runs a best-effort Leave RPC against the hub recorded in
+// config.kdl using the on-disk TLS material. It is called from `join --force`
+// so the old device row doesn't outlive the local cert. The caller surfaces
+// any returned error as a warning; we never fail the surrounding join because
+// of cleanup trouble.
+func bestEffortLeave(dataDir string) error {
+	cfgPath := filepath.Join(dataDir, common.ConfigFile)
+	oldCfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("load old config: %w", err)
+	}
+	oldHub := oldCfg.Hub.Address
+	if oldHub == "" {
+		return fmt.Errorf("old config has no hub address")
+	}
+
+	tlsDirPath := filepath.Join(dataDir, common.TLSDir)
+	for _, p := range []string{
+		filepath.Join(tlsDirPath, common.CACertFile),
+		filepath.Join(tlsDirPath, common.ClientCertFile),
+		filepath.Join(tlsDirPath, common.ClientKeyFile),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("stat %s: %w", p, err)
+		}
+	}
+
+	caCertPath := filepath.Join(tlsDirPath, common.CACertFile)
+	clientCertPath := filepath.Join(tlsDirPath, common.ClientCertFile)
+	clientKeyPath := filepath.Join(tlsDirPath, common.ClientKeyFile)
+
+	leaveLogger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	leaveClient, err := agent.DialWithMTLS(oldHub, caCertPath, clientCertPath, clientKeyPath, leaveLogger)
+	if err != nil {
+		return fmt.Errorf("dial old hub %q: %w", oldHub, err)
+	}
+	defer leaveClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := leaveClient.Leave(ctx); err != nil {
+		return fmt.Errorf("leave old hub %q: %w", oldHub, err)
+	}
+	return nil
 }
 
 // startCmd implements: hubfuse start
