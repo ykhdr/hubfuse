@@ -156,6 +156,23 @@ func (a *Agent) TryJoinWithoutToken(t *testing.T, hubAddr string) (string, bool)
 	return a.tryRun(t, "join", hubAddr)
 }
 
+// TryJoinWithTamperedToken runs `hubfuse join <addr> --token <token>` with the
+// given nickname on stdin. It returns the combined output and whether the
+// command exited zero. It never fails the test — use it to assert the negative
+// (non-zero exit) path when testing fingerprint validation.
+func (a *Agent) TryJoinWithTamperedToken(t *testing.T, hubAddr, token, nickname string) (string, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, AgentBinaryPath, "join", hubAddr, "--token", token)
+	cmd.Env = a.env()
+	cmd.Stdin = strings.NewReader(nickname + "\n")
+	out, err := cmd.CombinedOutput()
+	_, _ = a.logBuf.Write([]byte("$ hubfuse join " + hubAddr + " --token <tampered>  (try)\n"))
+	_, _ = a.logBuf.Write(out)
+	return string(out), err == nil
+}
+
 // StartDaemon launches the hubfuse daemon with the agent's configuration.
 // It updates config.kdl with the SSH port and exports, then starts the daemon.
 // Returns once the SSH server port is confirmed listening.

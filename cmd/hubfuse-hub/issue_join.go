@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -85,11 +88,19 @@ func issueJoinCmd() *cobra.Command {
 				return fmt.Errorf("create join token: %w", err)
 			}
 
-			if _, err := fmt.Fprintln(cmd.OutOrStdout(), tok.Token); err != nil {
+			// Load the server cert and compute the fingerprint to embed in the token.
+			fp, err := loadServerCertFingerprint(dir)
+			if err != nil {
+				return fmt.Errorf("load server cert fingerprint: %w", err)
+			}
+
+			dottedToken := tok.Token + "." + fp
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), dottedToken); err != nil {
 				return fmt.Errorf("write token: %w", err)
 			}
 			if _, err := fmt.Fprintf(cmd.ErrOrStderr(),
-				"Share this token with the joining device. Expires at %s.\n",
+				"Share this token with the joining device. Expires at %s.\n"+
+					"The suffix after '.' is the hub TLS fingerprint — do not shorten the token.\n",
 				tok.ExpiresAt.UTC().Format(time.RFC3339)); err != nil {
 				return fmt.Errorf("write expiry notice: %w", err)
 			}
@@ -100,4 +111,23 @@ func issueJoinCmd() *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", "", "path to hub config file (defaults to <data-dir>/config.kdl)")
 	cmd.Flags().DurationVar(&ttlOverride, "ttl", 0, "override token TTL (0 = use config/default)")
 	return cmd
+}
+
+// loadServerCertFingerprint reads the hub's server leaf certificate from
+// <dataDir>/tls/server.crt and returns its agent-pinning fingerprint.
+func loadServerCertFingerprint(dataDir string) (string, error) {
+	serverCertPath := filepath.Join(dataDir, common.TLSDir, common.ServerCertFile)
+	raw, err := os.ReadFile(serverCertPath)
+	if err != nil {
+		return "", fmt.Errorf("read server cert %q: %w", serverCertPath, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return "", fmt.Errorf("no PEM block found in %q", serverCertPath)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse server cert: %w", err)
+	}
+	return common.FingerprintFromCertDER(cert.Raw), nil
 }

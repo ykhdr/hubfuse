@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ykhdr/hubfuse/internal/common"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 )
@@ -57,6 +58,14 @@ func Format(err error, defaultCtx *Context) string {
 		if withCtx.Ctx != nil {
 			ctx = *withCtx.Ctx
 		}
+	}
+
+	// Translate well-known sentinel errors to friendly messages.
+	if errors.Is(err, common.ErrJoinTokenMissingFingerprint) {
+		return "error: join token must include hub fingerprint — regenerate with 'hubfuse-hub issue-join'"
+	}
+	if errors.Is(err, common.ErrHubFingerprintMismatch) {
+		return "error: hub TLS fingerprint does not match the token — possible MITM attack; regenerate the token"
 	}
 
 	if msg, ok := translateStatus(err, ctx); ok {

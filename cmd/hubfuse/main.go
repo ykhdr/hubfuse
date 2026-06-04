@@ -107,12 +107,19 @@ func joinCmd() *cobra.Command {
 				}
 			}
 
-			deviceID := agent.GenerateDeviceID()
 			cliCtx := &clierrors.Context{HubAddr: hubAddr}
 
-			// Dial hub insecurely (no client cert yet).
+			// Split the dotted token into the DB prefix and the hub fingerprint.
+			prefix, fp, err := common.ParseJoinToken(joinToken)
+			if err != nil {
+				return clierrors.Wrap(err, cliCtx)
+			}
+
+			deviceID := agent.GenerateDeviceID()
+
+			// Dial the hub with cert pinning — no client cert exists yet.
 			logger := slog.New(common.NewConsoleHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			hubClient, err := agent.DialInsecure(hubAddr, logger)
+			hubClient, err := agent.DialPinned(hubAddr, fp, logger)
 			if err != nil {
 				return clierrors.Wrap(fmt.Errorf("dial hub: %w", err), cliCtx)
 			}
@@ -140,8 +147,8 @@ func joinCmd() *cobra.Command {
 					continue
 				}
 
-				// Call Join.
-				resp, err = hubClient.Join(context.Background(), deviceID, nickname, joinToken)
+				// Call Join using only the prefix — the hub never sees the fingerprint suffix.
+				resp, err = hubClient.Join(context.Background(), deviceID, nickname, prefix)
 				if err != nil {
 					if clierrors.IsNicknameTaken(err) {
 						printNicknameTaken(err)

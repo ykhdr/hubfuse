@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 
@@ -19,17 +21,30 @@ type HubClient struct {
 	logger *slog.Logger
 }
 
-// DialInsecure creates a HubClient that skips server certificate verification.
-// This is used for the Join RPC only, before the device has its client cert.
-func DialInsecure(hubAddr string, logger *slog.Logger) (*HubClient, error) {
+// DialPinned creates a HubClient for the Join bootstrap using TLS with
+// certificate pinning. InsecureSkipVerify is set but the VerifyPeerCertificate
+// callback enforces the expected fingerprint, so the connection is not
+// actually insecure — the pin is the security control.
+func DialPinned(hubAddr, expectedFP string, logger *slog.Logger) (*HubClient, error) {
 	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true, //nolint:gosec // intentional for Join bootstrap
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true, //nolint:gosec // pinning via VerifyPeerCertificate callback below
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return common.ErrHubFingerprintMismatch
+			}
+			actual := common.FingerprintFromCertDER(rawCerts[0])
+			if subtle.ConstantTimeCompare([]byte(actual), []byte(expectedFP)) != 1 {
+				return common.ErrHubFingerprintMismatch
+			}
+			return nil
+		},
 	}
 	creds := credentials.NewTLS(tlsCfg)
 
 	conn, err := grpc.NewClient(hubAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		return nil, fmt.Errorf("dial hub %q (insecure): %w", hubAddr, err)
+		return nil, fmt.Errorf("dial hub %q (pinned): %w", hubAddr, err)
 	}
 
 	return &HubClient{

@@ -1,0 +1,5 @@
+# A token without a '.' must be rejected immediately with a helpful error message.
+# No hub connection should be attempted.
+! exec hubfuse join localhost:9090 --token NOPE-NO-DOT
+stderr 'must include hub fingerprint'
+! stderr 'Usage:'

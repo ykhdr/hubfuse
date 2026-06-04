@@ -1,7 +1,8 @@
 # Hub at port 1 is unreachable. CLI must produce a connection error
 # without dumping the usage block (this is a runtime error, not malformed input).
+# The token must include a fingerprint suffix — use a syntactically valid form.
 stdin nick.txt
-! exec hubfuse join 127.0.0.1:1 --token HUB-XXX-YYY
+! exec hubfuse join 127.0.0.1:1 --token HUB-XXX-YYY.aaaaaaaaaaaaaaaaaaaaaaaaaa
 stderr 'error:.*connection refused|error:.*dial hub|error:.*cannot reach'
 ! stderr 'Usage:'
 
