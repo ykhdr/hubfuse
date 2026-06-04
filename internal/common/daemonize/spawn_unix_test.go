@@ -39,6 +39,19 @@ func TestMain(m *testing.M) {
 		// Never write PID file; just sleep. Parent must time out.
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	case "ignore":
+		// Writes pidfile, then ignores SIGTERM/SIGINT and only exits on
+		// SIGKILL (or after a long fallback so a runaway test cleans up).
+		if err := WritePIDFile(os.Getenv("HUBFUSE_TEST_PIDFILE")); err != nil {
+			os.Exit(3)
+		}
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		// Drain incoming signals so they don't terminate the process,
+		// but stay alive on a deadline as a safety net for a runaway test.
+		go func() { for range sigCh {} }()
+		time.Sleep(60 * time.Second)
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
