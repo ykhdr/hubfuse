@@ -51,7 +51,7 @@ func TestFingerprintFromCertDER_StableAcrossEncodings(t *testing.T) {
 
 	// Verify all chars are lowercase base32 (a-z, 2-7).
 	for _, c := range fp1 {
-		if !((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7')) {
+		if (c < 'a' || c > 'z') && (c < '2' || c > '7') {
 			t.Errorf("fingerprint contains non-base32 char %q in %q", c, fp1)
 			break
 		}
