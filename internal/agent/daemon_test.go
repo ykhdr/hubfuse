@@ -631,11 +631,12 @@ func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
 		called = true
 		return "", errors.New("not found")
 	}
+	fileExists := func(string) bool { return true } // runtime markers present, no extra warn
 
 	// Must not panic; warn-and-continue is the contract (no error to assert on
 	// since the helper returns nothing). fuse-t is macOS-only, so the hint stays
 	// the fuse-t tap+cask regardless of the goos we pass here.
-	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, logger)
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
 
 	assert.True(t, called, "lookPath should be invoked when mounts are configured")
 	out := buf.String()
@@ -648,10 +649,11 @@ func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
 	lookPath := func(string) (string, error) {
 		return "", errors.New("not found")
 	}
+	fileExists := func(string) bool { return true }
 
 	t.Run("sshfs on linux suggests distro package", func(t *testing.T) {
 		var buf bytes.Buffer
-		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "linux", lookPath, captureLogger(&buf))
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "linux", lookPath, fileExists, captureLogger(&buf))
 		out := buf.String()
 		assert.Contains(t, out, "sshfs package", "linux sshfs hint should point at the distro package")
 		assert.NotContains(t, out, "brew", "linux sshfs hint must not mention brew")
@@ -659,7 +661,7 @@ func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
 
 	t.Run("sshfs on darwin does not claim fuse-t", func(t *testing.T) {
 		var buf bytes.Buffer
-		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "darwin", lookPath, captureLogger(&buf))
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "darwin", lookPath, fileExists, captureLogger(&buf))
 		out := buf.String()
 		assert.NotContains(t, out, "fuse-t", "sshfs-on-darwin hint must not recommend fuse-t when sshfs was chosen")
 		assert.Contains(t, out, "sshfs", "sshfs-on-darwin hint should still point at an sshfs binary")
@@ -667,7 +669,7 @@ func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
 
 	t.Run("fuse-t taps the third-party cask first", func(t *testing.T) {
 		var buf bytes.Buffer
-		preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, captureLogger(&buf))
+		preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, captureLogger(&buf))
 		assert.Contains(t, buf.String(), "brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs", "fuse-t hint must tap before installing")
 	})
 }
@@ -680,8 +682,12 @@ func TestPreflightMountBinary_NoMountsSkipsLookPath(t *testing.T) {
 		t.Fatal("lookPath must not be called when no mounts are configured")
 		return "", nil
 	}
+	fileExists := func(string) bool {
+		t.Fatal("fileExists must not be called when no mounts are configured")
+		return false
+	}
 
-	preflightMountBinary("sshfs", resolveBackend("sshfs"), false, runtime.GOOS, lookPath, logger)
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), false, runtime.GOOS, lookPath, fileExists, logger)
 
 	assert.Empty(t, buf.String(), "no warning should be logged when there are no mounts")
 }
@@ -693,8 +699,64 @@ func TestPreflightMountBinary_BinaryPresentNoWarning(t *testing.T) {
 	lookPath := func(string) (string, error) {
 		return "/usr/bin/sshfs", nil
 	}
+	fileExists := func(string) bool { return true }
 
-	preflightMountBinary("sshfs", resolveBackend("sshfs"), true, runtime.GOOS, lookPath, logger)
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), true, runtime.GOOS, lookPath, fileExists, logger)
 
 	assert.Empty(t, buf.String(), "no warning should be logged when the binary is found")
+}
+
+// ─── preflightMountBinary: FUSE-T runtime checks ─────────────────────────────
+
+// TestPreflightMountBinary_FuseTRuntimeMissingWarns verifies that when fuse-t
+// is selected on darwin and none of the runtime markers exist, a WARN is logged.
+func TestPreflightMountBinary_FuseTRuntimeMissingWarns(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/local/bin/sshfs", nil }
+	// Stub: no runtime markers present.
+	fileExists := func(string) bool { return false }
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
+
+	out := buf.String()
+	assert.Contains(t, out, "level=WARN", "must log at WARN level")
+	assert.Contains(t, out, "FUSE-T runtime not found", "must mention runtime not found")
+	assert.Contains(t, out, "fuse-t-sshfs", "must include the install hint")
+}
+
+// TestPreflightMountBinary_FuseTRuntimePresentNoWarn verifies that when at
+// least one runtime marker exists, no runtime warning is emitted.
+func TestPreflightMountBinary_FuseTRuntimePresentNoWarn(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/local/bin/sshfs", nil }
+	// Stub: first marker found.
+	fileExists := func(path string) bool {
+		return path == fuseTRuntimeMarkers[0]
+	}
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
+
+	out := buf.String()
+	assert.NotContains(t, out, "FUSE-T runtime not found", "must not warn when a runtime marker is present")
+}
+
+// TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux verifies that the
+// fuse-t runtime check is not performed on non-darwin hosts.
+func TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/bin/sshfs", nil }
+	fileExists := func(string) bool {
+		t.Fatal("fileExists must not be called for fuse-t on non-darwin")
+		return false
+	}
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "linux", lookPath, fileExists, logger)
+
+	assert.NotContains(t, buf.String(), "FUSE-T runtime not found", "runtime check must be skipped on linux")
 }

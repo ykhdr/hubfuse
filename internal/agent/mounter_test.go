@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,6 +58,13 @@ func newTestMounterWithTool(t *testing.T, knownDevicesDir, keyPath, mountTool st
 	} else {
 		m.unmount = func(_ string) error { return nil }
 	}
+
+	// Stub checkMountpoint so existing Mount tests do not wait for a real
+	// filesystem mountpoint that the stub command ("true") never creates.
+	m.checkMountpoint = func(string) (bool, error) { return true, nil }
+	// Use tiny timeouts so any test that exercises the verification path completes quickly.
+	m.mountVerifyTimeout = 500 * time.Millisecond
+	m.mountVerifyInterval = 10 * time.Millisecond
 
 	return m
 }
@@ -553,4 +561,88 @@ func TestActiveMounts_ReturnsSnapshot(t *testing.T) {
 
 	mounts = m.ActiveMounts()
 	assert.Len(t, mounts, 1)
+}
+
+// ─── Mountpoint verification ──────────────────────────────────────────────────
+
+// TestMount_VerifySuccess ensures Mount records an active entry and logs
+// success when checkMountpoint returns true.
+func TestMount_VerifySuccess(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	// checkMountpoint already returns true from newTestMounter.
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount() must succeed when mountpoint check passes")
+	assert.True(t, m.IsActive("device-a", "docs"), "IsActive() must be true after successful Mount()")
+}
+
+// TestMount_VerifyTimeout ensures Mount returns an error and does not record
+// the mount when checkMountpoint never returns true within the timeout.
+func TestMount_VerifyTimeout(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	// Override check to always fail.
+	m.checkMountpoint = func(string) (bool, error) { return false, nil }
+	m.mountVerifyTimeout = 50 * time.Millisecond
+	m.mountVerifyInterval = 10 * time.Millisecond
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "Mount() must return an error when mountpoint never appears")
+	assert.Contains(t, err.Error(), "did not appear", "error should mention that mountpoint did not appear")
+	assert.False(t, m.IsActive("device-a", "docs"), "IsActive() must be false when mountpoint verification failed")
+}
+
+// TestMount_VerifyCtxCancelled ensures Mount returns a context error and does
+// not record the mount when the context is cancelled before the mountpoint appears.
+func TestMount_VerifyCtxCancelled(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	// Never returns true; context will be cancelled first.
+	m.checkMountpoint = func(string) (bool, error) { return false, nil }
+	m.mountVerifyTimeout = 10 * time.Second // long timeout, ctx cancels first
+	m.mountVerifyInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel after a brief moment so the poll loop sees it.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	err := m.Mount(ctx, mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "Mount() must return an error when context is cancelled")
+	assert.False(t, m.IsActive("device-a", "docs"), "IsActive() must be false after ctx cancel")
+}
+
+// TestIsMountpoint_TempDirIsNotMountpoint verifies that a plain temp directory
+// (same device as its parent) is NOT reported as a mountpoint.
+func TestIsMountpoint_TempDirIsNotMountpoint(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	require.NoError(t, os.MkdirAll(sub, 0755), "MkdirAll")
+
+	ok, err := isMountpoint(sub)
+	require.NoError(t, err, "isMountpoint() must not error on an accessible directory")
+	assert.False(t, ok, "a plain subdirectory must not be reported as a mountpoint")
 }

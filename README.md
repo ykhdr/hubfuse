@@ -130,6 +130,14 @@ startup and require a daemon restart to take effect.
 Unlike `shares` and `mounts`, changing `mount-tool` requires a daemon restart —
 the backend is selected once at startup and is not picked up by hot-reload.
 
+Both values run the `sshfs` binary found on `PATH`; `mount-tool` does not pick a
+binary by itself. If both macFUSE's and FUSE-T's `sshfs` are installed, whichever
+comes first on `PATH` is the engine that actually serves the mount — so keep only
+one installed (e.g. `brew uninstall sshfs-mac` to let FUSE-T win). As a safety
+net, with `mount-tool "fuse-t"` the agent warns at startup when the FUSE-T runtime
+isn't detected, and a mount that never materializes is reported as an error rather
+than logged as a (false) success.
+
 ### Share access control
 
 `permissions` and `allowed-devices` are enforced by the agent's SFTP

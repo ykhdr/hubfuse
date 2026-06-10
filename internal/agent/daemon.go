@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -91,9 +92,14 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	knownHostsDir := filepath.Join(dir, common.KnownHostsDir)
 	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, cfg.Agent.MountTool, logger)
 
-	// Warn (but do not abort) if the mount binary is missing while mounts are
-	// configured — sharing must still work even without a mount tool installed.
-	preflightMountBinary(cfg.Agent.MountTool, resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, runtime.GOOS, exec.LookPath, logger)
+	// Warn (but do not abort) if the mount binary is missing or the FUSE-T
+	// runtime is absent while mounts are configured — sharing must still work
+	// even without a mount tool installed.
+	fileExists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+	preflightMountBinary(cfg.Agent.MountTool, resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, runtime.GOOS, exec.LookPath, fileExists, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
@@ -133,17 +139,30 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	return d, nil
 }
 
+// fuseTRuntimeMarkers lists the filesystem paths that indicate a FUSE-T
+// runtime installation. At least one of these must exist for FUSE-T to work.
+var fuseTRuntimeMarkers = []string{
+	"/usr/local/lib/libfuse-t.dylib",
+	"/opt/homebrew/lib/libfuse-t.dylib",
+	"/Library/Application Support/fuse-t",
+}
+
 // preflightMountBinary checks that the mount backend's binary is present on
 // PATH when at least one mount is configured. On a miss it logs an actionable
 // warning and returns — it never aborts startup, because a device with no
 // mount tool can still export (share) its own directories. When no mounts are
 // configured, the check is skipped entirely (lookPath is not invoked).
 //
+// Additionally, when tool is "fuse-t" on darwin, it checks for the FUSE-T
+// runtime libraries. If none of the known markers exist, it logs a WARN that
+// the sshfs on PATH may be macFUSE's drop-in rather than fuse-t-sshfs.
+//
 // tool is the configured mount-tool value (used only for the message and the
-// install hint). It is a pure helper: goos and lookPath are injected
-// (runtime.GOOS and exec.LookPath in production) so both the platform and the
-// PATH dependency can be stubbed in tests without a Daemon instance.
-func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goos string, lookPath func(string) (string, error), logger *slog.Logger) {
+// install hint). It is a pure helper: goos, lookPath, and fileExists are
+// injected (runtime.GOOS, exec.LookPath, and an os.Stat wrapper in
+// production) so the platform, PATH, and filesystem dependencies can all be
+// stubbed in tests without a Daemon instance.
+func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goos string, lookPath func(string) (string, error), fileExists func(string) bool, logger *slog.Logger) {
 	if !hasMounts {
 		return
 	}
@@ -153,6 +172,27 @@ func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goo
 				tool, backend.binary, mountInstallHint(tool, goos)),
 			"error", err,
 		)
+	}
+
+	// FUSE-T runtime check: if fuse-t is selected on macOS but none of the
+	// known runtime markers are present, the "sshfs" on PATH is likely the
+	// macFUSE version and mounts will fail at runtime without an obvious error.
+	if tool == "fuse-t" && goos == "darwin" {
+		runtimeFound := false
+		for _, marker := range fuseTRuntimeMarkers {
+			if fileExists(marker) {
+				runtimeFound = true
+				break
+			}
+		}
+		if !runtimeFound {
+			logger.Warn(fmt.Sprintf(
+				"mount-tool %q selected but FUSE-T runtime not found; "+
+					"the sshfs on PATH may be macFUSE's (checked: %s) — "+
+					"install with: brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs",
+				tool, strings.Join(fuseTRuntimeMarkers, ", ")),
+			)
+		}
 	}
 }
 

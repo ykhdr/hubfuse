@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 )
@@ -88,6 +90,24 @@ func validateMountTool(tool, goos string) error {
 	}
 }
 
+// isMountpoint reports whether path is a mountpoint: it stats both path and
+// its parent directory and returns true when their device IDs differ — a FUSE
+// (or any other) mount overlays path with a new filesystem whose st_dev is
+// distinct from the parent's. Uses only stdlib syscall; adds no dependencies.
+// This is unix-only; the mounter already depends on UNIX-specific unmount
+// helpers (umount / fusermount).
+func isMountpoint(path string) (bool, error) {
+	var st, parentSt syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return false, err
+	}
+	parent := filepath.Dir(path)
+	if err := syscall.Stat(parent, &parentSt); err != nil {
+		return false, err
+	}
+	return st.Dev != parentSt.Dev, nil
+}
+
 // mountKey is the map key for an active mount, uniquely identifying a
 // device+share pair without string concatenation.
 type mountKey struct {
@@ -119,21 +139,44 @@ type Mounter struct {
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
 	// unmount is used to unmount a path; override in tests.
 	unmount func(path string) error
+	// checkMountpoint reports whether path is currently a mountpoint. Defaults to
+	// isMountpoint; override in tests (or when stub-sshfs is in use) to skip the
+	// real filesystem check.
+	checkMountpoint func(path string) (bool, error)
+	// mountVerifyTimeout is the maximum time to wait for the mountpoint to appear
+	// after cmd.Start() returns. Defaults to 10 seconds.
+	mountVerifyTimeout time.Duration
+	// mountVerifyInterval is the polling interval for mountpoint checks.
+	// Defaults to 200ms.
+	mountVerifyInterval time.Duration
 }
 
 // NewMounter creates a new Mounter. mountTool selects the mount backend
 // ("sshfs" default, or "fuse-t"); an empty or unknown value falls back to the
 // "sshfs" profile (see resolveBackend).
+//
+// When HUBFUSE_STUB_MOUNT_DIR is set (the scenario-test harness that uses
+// stub-sshfs, which never creates a real FUSE mountpoint), mountpoint
+// verification is bypassed so that scenario tests do not time out waiting for
+// a filesystem that the stub intentionally never creates.
 func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logger *slog.Logger) *Mounter {
+	check := isMountpoint
+	if os.Getenv("HUBFUSE_STUB_MOUNT_DIR") != "" {
+		// Stub harness: skip real mountpoint verification.
+		check = func(string) (bool, error) { return true, nil }
+	}
 	return &Mounter{
-		keyPath:         keyPath,
-		knownDevicesDir: knownDevicesDir,
-		knownHostsDir:   knownHostsDir,
-		backend:         resolveBackend(mountTool),
-		logger:          logger,
-		activeMounts:    make(map[mountKey]*Mount),
-		execCommand:     exec.CommandContext,
-		unmount:         unmountPath,
+		keyPath:             keyPath,
+		knownDevicesDir:     knownDevicesDir,
+		knownHostsDir:       knownHostsDir,
+		backend:             resolveBackend(mountTool),
+		logger:              logger,
+		activeMounts:        make(map[mountKey]*Mount),
+		execCommand:         exec.CommandContext,
+		unmount:             unmountPath,
+		checkMountpoint:     check,
+		mountVerifyTimeout:  10 * time.Second,
+		mountVerifyInterval: 200 * time.Millisecond,
 	}
 }
 
@@ -170,6 +213,43 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s for %q from device %q: %w", m.backend.binary, mc.Share, mc.Device, err)
+	}
+
+	// Poll until the mountpoint appears (or timeout/ctx cancellation). The lock
+	// is held throughout — mounts are serialised by the daemon event loop so a
+	// worst-case mountVerifyTimeout hold is acceptable and avoids races between
+	// concurrent Mount calls on the same key.
+	deadline := time.Now().Add(m.mountVerifyTimeout)
+	var lastCheckErr error
+	for {
+		if ctx.Err() != nil {
+			// Context cancelled while waiting — kill and reap the backend.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("mount %q from device %q at %q: %w", mc.Share, mc.Device, mc.To, ctx.Err())
+		}
+
+		ok, checkErr := m.checkMountpoint(mc.To)
+		if checkErr != nil {
+			lastCheckErr = checkErr
+		}
+		if ok {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			// Timed out — kill and reap the backend process.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			reason := "mountpoint did not appear"
+			if lastCheckErr != nil {
+				reason = lastCheckErr.Error()
+			}
+			return fmt.Errorf("mount %q from device %q did not appear at %q within %s: %s",
+				mc.Share, mc.Device, mc.To, m.mountVerifyTimeout, reason)
+		}
+
+		time.Sleep(m.mountVerifyInterval)
 	}
 
 	m.activeMounts[key] = &Mount{
@@ -350,4 +430,12 @@ func (m *Mounter) SetUnmountForTests(fn func(path string) error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.unmount = fn
+}
+
+// SetMountpointCheckForTests overrides the mountpoint check (used in tests and
+// in the stub-sshfs scenario harness where a real FUSE mount is never created).
+func (m *Mounter) SetMountpointCheckForTests(fn func(string) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkMountpoint = fn
 }

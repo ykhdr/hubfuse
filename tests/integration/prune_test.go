@@ -91,6 +91,9 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 	mounter.SetExecCommandForTests(func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "true")
 	})
+	// The exec stub ("true") never creates a real mountpoint, so stub the check
+	// to return immediately without touching the filesystem.
+	mounter.SetMountpointCheckForTests(func(string) (bool, error) { return true, nil })
 	unmounted := make(chan struct{})
 	mounter.SetUnmountForTests(func(string) error {
 		close(unmounted)
