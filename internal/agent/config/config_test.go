@@ -189,6 +189,19 @@ agent {
 	assert.Equal(t, "sshfs", cfg.Agent.MountTool)
 }
 
+func TestLoad_MountTool_NonStringArgRejected(t *testing.T) {
+	// A present-but-non-string argument (e.g. a number) must be rejected rather
+	// than silently coerced to "" and normalised to "sshfs".
+	path := writeTemp(t, `
+agent {
+    mount-tool 5
+}
+`)
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mount-tool must be a string")
+}
+
 func TestLoad_NormalizePermissions(t *testing.T) {
 	path := writeTemp(t, `
 shares {

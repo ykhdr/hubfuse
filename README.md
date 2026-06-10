@@ -22,9 +22,11 @@ All communication is secured with mTLS. Devices pair using short-lived invite co
 Agents mount remote shares with `sshfs`. The FUSE implementation behind it
 depends on the platform.
 
-**macOS** — FUSE-T is the recommended, kext-free path:
+**macOS** — FUSE-T is the recommended, kext-free path. Its casks live in a
+third-party tap, so tap it first:
 
 ```bash
+brew tap macos-fuse-t/homebrew-cask
 brew install --cask fuse-t fuse-t-sshfs
 ```
 
@@ -117,7 +119,8 @@ Changes to `config.kdl` are hot-reloaded — no restart needed.
 - `"sshfs"` (default) — the distribution `sshfs` (macFUSE on macOS, `fusermount`
   on Linux).
 - `"fuse-t"` — macOS only; requires `fuse-t-sshfs`
-  (`brew install --cask fuse-t fuse-t-sshfs`). The kext-free path described in
+  (`brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs`).
+  The kext-free path described in
   [Installing the mount tool](#installing-the-mount-tool). Selecting `"fuse-t"`
   on a non-macOS host is a configuration error.
 

@@ -89,7 +89,9 @@ func Load(path string) (*Config, error) {
 		case "hub":
 			cfg.Hub = parseHubConfig(node)
 		case "agent":
-			parseAgentConfig(node, &cfg.Agent)
+			if err := parseAgentConfig(node, &cfg.Agent); err != nil {
+				return nil, fmt.Errorf("load config %q: %w", path, err)
+			}
 		case "shares":
 			cfg.Shares = parseSharesBlock(node)
 		case "mounts":
@@ -146,7 +148,10 @@ func parseHubConfig(node *document.Node) HubConfig {
 
 // parseAgentConfig fills ac from an "agent { ... }" node.
 // Existing values in ac are only overwritten when the field is explicitly set.
-func parseAgentConfig(node *document.Node, ac *AgentConfig) {
+// A "mount-tool" node whose argument is present but not a string (e.g.
+// "mount-tool 5") is rejected; an absent argument leaves the default in place,
+// and an empty string "" is normalised to "sshfs" later in Load.
+func parseAgentConfig(node *document.Node, ac *AgentConfig) error {
 	for _, child := range node.Children {
 		switch nodeName(child) {
 		case "ssh-port":
@@ -154,9 +159,16 @@ func parseAgentConfig(node *document.Node, ac *AgentConfig) {
 				ac.SSHPort = v
 			}
 		case "mount-tool":
-			ac.MountTool = firstArgString(child)
+			if len(child.Arguments) > 0 {
+				s, ok := child.Arguments[0].Value.(string)
+				if !ok {
+					return fmt.Errorf("mount-tool must be a string (allowed: \"sshfs\", \"fuse-t\")")
+				}
+				ac.MountTool = s
+			}
 		}
 	}
+	return nil
 }
 
 // parseSharesBlock extracts []ShareConfig from a "shares { share ... }" node.

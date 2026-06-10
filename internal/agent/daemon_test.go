@@ -634,13 +634,13 @@ func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
 
 	// Must not panic; warn-and-continue is the contract (no error to assert on
 	// since the helper returns nothing). fuse-t is macOS-only, so the hint stays
-	// the brew cask regardless of the goos we pass here.
+	// the fuse-t tap+cask regardless of the goos we pass here.
 	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, logger)
 
 	assert.True(t, called, "lookPath should be invoked when mounts are configured")
 	out := buf.String()
 	assert.Contains(t, out, "not found on PATH", "expected an actionable warning to be logged")
-	assert.Contains(t, out, "brew install --cask fuse-t fuse-t-sshfs", "warning should include the install hint")
+	assert.Contains(t, out, "brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs", "fuse-t hint must tap the third-party cask before installing")
 	assert.Contains(t, out, "level=WARN", "message must be logged at WARN level, never an error/abort")
 }
 
@@ -657,10 +657,18 @@ func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
 		assert.NotContains(t, out, "brew", "linux sshfs hint must not mention brew")
 	})
 
-	t.Run("sshfs on darwin keeps brew hint", func(t *testing.T) {
+	t.Run("sshfs on darwin does not claim fuse-t", func(t *testing.T) {
 		var buf bytes.Buffer
 		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "darwin", lookPath, captureLogger(&buf))
-		assert.Contains(t, buf.String(), "brew install --cask fuse-t fuse-t-sshfs", "darwin hint should use brew")
+		out := buf.String()
+		assert.NotContains(t, out, "fuse-t", "sshfs-on-darwin hint must not recommend fuse-t when sshfs was chosen")
+		assert.Contains(t, out, "sshfs", "sshfs-on-darwin hint should still point at an sshfs binary")
+	})
+
+	t.Run("fuse-t taps the third-party cask first", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, captureLogger(&buf))
+		assert.Contains(t, buf.String(), "brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs", "fuse-t hint must tap before installing")
 	})
 }
 

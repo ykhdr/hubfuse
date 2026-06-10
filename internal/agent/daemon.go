@@ -156,12 +156,17 @@ func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goo
 	}
 }
 
-// mountInstallHint returns an OS- and backend-appropriate install suggestion
-// for a missing mount binary. The FUSE-T cask is macOS-only; elsewhere we point
-// at the distribution's sshfs package.
+// mountInstallHint returns an OS- and tool-appropriate install suggestion for a
+// missing mount binary. FUSE-T is macOS-only and its casks live in a third-party
+// tap, so the hint taps it first. When sshfs is selected on macOS we point at
+// macFUSE (no fuse-t claim); on Linux we point at the distribution's sshfs
+// package.
 func mountInstallHint(tool, goos string) string {
-	if tool == "fuse-t" || goos == "darwin" {
-		return "install with: brew install --cask fuse-t fuse-t-sshfs"
+	if tool == "fuse-t" {
+		return "install with: brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs"
+	}
+	if goos == "darwin" {
+		return "install an sshfs binary (e.g. brew install --cask macfuse, then a macFUSE sshfs build)"
 	}
 	return "install your distribution's sshfs package (e.g. apt install sshfs)"
 }
