@@ -35,6 +35,10 @@ type HubConfig struct {
 type AgentConfig struct {
 	// SSHPort is the port the agent's SSH server listens on (default: 2222).
 	SSHPort int
+	// MountTool selects the mount backend: "sshfs" (default) or "fuse-t".
+	// "fuse-t" is only supported on macOS. An empty value is normalised to
+	// "sshfs" during Load.
+	MountTool string
 }
 
 // ShareConfig describes a directory shared by this device.
@@ -56,7 +60,8 @@ type MountConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Agent: AgentConfig{
-			SSHPort: 2222,
+			SSHPort:   2222,
+			MountTool: "sshfs",
 		},
 	}
 }
@@ -90,6 +95,17 @@ func Load(path string) (*Config, error) {
 		case "mounts":
 			cfg.Mounts = parseMountsBlock(node)
 		}
+	}
+
+	// Validate and normalise the mount tool. OS gating is intentionally not
+	// applied here — it is platform-specific and lives in the daemon layer.
+	switch cfg.Agent.MountTool {
+	case "":
+		cfg.Agent.MountTool = "sshfs"
+	case "sshfs", "fuse-t":
+		// valid
+	default:
+		return nil, fmt.Errorf("load config %q: invalid mount-tool %q (allowed: \"sshfs\", \"fuse-t\")", path, cfg.Agent.MountTool)
 	}
 
 	// Normalise permissions and expand tildes.
@@ -137,6 +153,8 @@ func parseAgentConfig(node *document.Node, ac *AgentConfig) {
 			if v := firstArgInt(child); v != 0 {
 				ac.SSHPort = v
 			}
+		case "mount-tool":
+			ac.MountTool = firstArgString(child)
 		}
 	}
 }
@@ -267,6 +285,7 @@ func Save(path string, cfg *Config) error {
 	// agent block.
 	fmt.Fprintf(&sb, "agent {\n")
 	fmt.Fprintf(&sb, "    ssh-port %d\n", cfg.Agent.SSHPort)
+	fmt.Fprintf(&sb, "    mount-tool %q\n", cfg.Agent.MountTool)
 	fmt.Fprintf(&sb, "}\n\n")
 
 	// shares block.

@@ -71,6 +71,7 @@ func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	require.NotNil(t, cfg)
 	assert.Equal(t, 2222, cfg.Agent.SSHPort)
+	assert.Equal(t, "sshfs", cfg.Agent.MountTool)
 }
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
@@ -127,6 +128,51 @@ device {
 	cfg, err := Load(path)
 	require.NoError(t, err)
 	assert.Equal(t, 2222, cfg.Agent.SSHPort)
+}
+
+func TestLoad_MountTool_FuseT(t *testing.T) {
+	path := writeTemp(t, `
+agent {
+    mount-tool "fuse-t"
+}
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "fuse-t", cfg.Agent.MountTool)
+}
+
+func TestLoad_MountTool_Sshfs(t *testing.T) {
+	path := writeTemp(t, `
+agent {
+    mount-tool "sshfs"
+}
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "sshfs", cfg.Agent.MountTool)
+}
+
+func TestLoad_MountTool_DefaultsToSshfs(t *testing.T) {
+	// When mount-tool is omitted, it should default to "sshfs".
+	path := writeTemp(t, `
+agent {
+    ssh-port 2222
+}
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "sshfs", cfg.Agent.MountTool)
+}
+
+func TestLoad_MountTool_Invalid(t *testing.T) {
+	path := writeTemp(t, `
+agent {
+    mount-tool "nfs"
+}
+`)
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid mount-tool")
 }
 
 func TestLoad_NormalizePermissions(t *testing.T) {
@@ -248,5 +294,25 @@ func TestLoad_InvalidKDL(t *testing.T) {
 	path := writeTemp(t, `this is not { valid kdl syntax !!!`)
 	_, err := Load(path)
 	assert.Error(t, err)
+}
+
+// ─── Save ─────────────────────────────────────────────────────────────────────
+
+func TestSaveLoad_MountToolRoundTrip(t *testing.T) {
+	for _, tool := range []string{"sshfs", "fuse-t"} {
+		t.Run(tool, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.kdl")
+
+			cfg := DefaultConfig()
+			cfg.Agent.MountTool = tool
+			require.NoError(t, Save(path, cfg))
+
+			loaded, err := Load(path)
+			require.NoError(t, err)
+			assert.Equal(t, tool, loaded.Agent.MountTool)
+			assert.Equal(t, cfg.Agent.SSHPort, loaded.Agent.SSHPort)
+		})
+	}
 }
 

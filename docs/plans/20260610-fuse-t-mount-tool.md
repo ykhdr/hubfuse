@@ -162,13 +162,13 @@ operands last.
 - Modify: `internal/agent/config/config.go`
 - Modify: `internal/agent/config/config_test.go`
 
-- [ ] add `MountTool string` field to `AgentConfig` (after the `SSHPort` field, ~line 38) with a doc comment listing allowed values and the default
-- [ ] set `MountTool: "sshfs"` in `DefaultConfig()` (~line 58)
-- [ ] add `case "mount-tool":` to `parseAgentConfig` (~line 133) reading `firstArgString(child)` into `ac.MountTool`
-- [ ] in `Load` (after parsing, ~line 95), validate `cfg.Agent.MountTool`: accept `""`/`"sshfs"`/`"fuse-t"`; normalise `""` → `"sshfs"`; otherwise return a clear error listing allowed values (do **not** apply OS gating here — that is platform-specific and lives in the daemon layer)
-- [ ] write the `mount-tool` line inside the agent block in `Save()` (~line 269): `fmt.Fprintf(&sb, "    mount-tool %q\n", cfg.Agent.MountTool)`
-- [ ] write tests: `mount-tool "fuse-t"` parses to `MountTool == "fuse-t"`; omitted → default `"sshfs"`; invalid value → `Load` returns error; Save/Load round-trip preserves the value
-- [ ] run tests: `go test ./internal/agent/config/...` — must pass before next task
+- [x] add `MountTool string` field to `AgentConfig` (after the `SSHPort` field, ~line 38) with a doc comment listing allowed values and the default
+- [x] set `MountTool: "sshfs"` in `DefaultConfig()` (~line 58)
+- [x] add `case "mount-tool":` to `parseAgentConfig` (~line 133) reading `firstArgString(child)` into `ac.MountTool`
+- [x] in `Load` (after parsing, ~line 95), validate `cfg.Agent.MountTool`: accept `""`/`"sshfs"`/`"fuse-t"`; normalise `""` → `"sshfs"`; otherwise return a clear error listing allowed values (do **not** apply OS gating here — that is platform-specific and lives in the daemon layer)
+- [x] write the `mount-tool` line inside the agent block in `Save()` (~line 269): `fmt.Fprintf(&sb, "    mount-tool %q\n", cfg.Agent.MountTool)`
+- [x] write tests: `mount-tool "fuse-t"` parses to `MountTool == "fuse-t"`; omitted → default `"sshfs"`; invalid value → `Load` returns error; Save/Load round-trip preserves the value
+- [x] run tests: `go test ./internal/agent/config/...` — must pass before next task
 
 ### Task 2: Add backend profile table and pure helpers in the mounter
 
