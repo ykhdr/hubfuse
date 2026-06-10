@@ -8,11 +8,105 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 )
+
+// mountBackend describes what a selected mount tool needs to run a mount.
+// It is the single source of truth for the binary to exec and any
+// backend-specific -o options to append to the command. The configured tool
+// name is the map key in mountBackends, so it is not duplicated here.
+type mountBackend struct {
+	binary    string   // executable to run
+	extraOpts []string // backend-specific -o options appended to the command
+}
+
+// mountBackends maps a configured mount-tool value to its backend profile.
+//
+// Both profiles use the "sshfs" binary: macFUSE-sshfs and fuse-t-sshfs install
+// to the same path and collide, so a device has exactly one "sshfs" on PATH.
+// Every flag the mounter passes (-p, -o IdentityFile, -o StrictHostKeyChecking,
+// -o UserKnownHostsFile) is an SSH option that sshfs forwards to ssh, not a
+// FUSE option, so the same invocation works for either FUSE implementation.
+// extraOpts is empty for both today; the field exists so a backend can inject
+// FUSE-specific options later without touching the call site.
+var mountBackends = map[string]mountBackend{
+	"sshfs":  {binary: "sshfs", extraOpts: nil},
+	"fuse-t": {binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
+}
+
+// resolveBackend returns the backend profile for the configured mount tool.
+// An empty value defaults to "sshfs"; an unknown value also falls back to the
+// "sshfs" profile as a defensive default (config Load already rejects unknown
+// values, so this only guards against programmer error).
+func resolveBackend(tool string) mountBackend {
+	if tool == "" {
+		return mountBackends["sshfs"]
+	}
+	if b, ok := mountBackends[tool]; ok {
+		return b
+	}
+	return mountBackends["sshfs"]
+}
+
+// buildMountArgs builds the argument list for the mount command. It emits the
+// base SSH options, then any backend-specific extraOpts as ordered "-o <opt>"
+// pairs, and finally the "hubfuse@<ip>:<share>" source and "<to>" target
+// operands last (their position is significant to sshfs).
+func buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string {
+	args := []string{
+		"-p", strconv.Itoa(sshPort),
+		"-o", "IdentityFile=" + keyPath,
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHosts,
+	}
+	for _, opt := range b.extraOpts {
+		args = append(args, "-o", opt)
+	}
+	args = append(args, "hubfuse@"+deviceIP+":"+share, to)
+	return args
+}
+
+// validateMountTool validates a configured mount-tool value against the target
+// OS. Unknown values are rejected on any OS. "fuse-t" is rejected unless goos
+// is "darwin", since FUSE-T is macOS-only. An empty value is treated as the
+// default "sshfs" and accepted.
+func validateMountTool(tool, goos string) error {
+	switch tool {
+	case "", "sshfs":
+		return nil
+	case "fuse-t":
+		if goos != "darwin" {
+			return fmt.Errorf("mount-tool %q is only supported on macOS", "fuse-t")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid mount-tool %q: must be \"sshfs\" or \"fuse-t\"", tool)
+	}
+}
+
+// isMountpoint reports whether path is a mountpoint: it stats both path and
+// its parent directory and returns true when their device IDs differ — a FUSE
+// (or any other) mount overlays path with a new filesystem whose st_dev is
+// distinct from the parent's. Uses only stdlib syscall; adds no dependencies.
+// This is unix-only; the mounter already depends on UNIX-specific unmount
+// helpers (umount / fusermount).
+func isMountpoint(path string) (bool, error) {
+	var st, parentSt syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return false, err
+	}
+	parent := filepath.Dir(path)
+	if err := syscall.Stat(parent, &parentSt); err != nil {
+		return false, err
+	}
+	return st.Dev != parentSt.Dev, nil
+}
 
 // mountKey is the map key for an active mount, uniquely identifying a
 // device+share pair without string concatenation.
@@ -33,9 +127,10 @@ type Mount struct {
 
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
-	keyPath         string // path to agent's SSH private key
-	knownDevicesDir string // dir containing paired-peer public keys (<device_id>.pub)
-	knownHostsDir   string // dir where per-mount SSH known_hosts files are written
+	keyPath         string       // path to agent's SSH private key
+	knownDevicesDir string       // dir containing paired-peer public keys (<device_id>.pub)
+	knownHostsDir   string       // dir where per-mount SSH known_hosts files are written
+	backend         mountBackend // selected mount tool profile (binary + extra opts)
 	logger          *slog.Logger
 	activeMounts    map[mountKey]*Mount
 	mu              sync.Mutex
@@ -44,18 +139,44 @@ type Mounter struct {
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
 	// unmount is used to unmount a path; override in tests.
 	unmount func(path string) error
+	// checkMountpoint reports whether path is currently a mountpoint. Defaults to
+	// isMountpoint; override in tests (or when stub-sshfs is in use) to skip the
+	// real filesystem check.
+	checkMountpoint func(path string) (bool, error)
+	// mountVerifyTimeout is the maximum time to wait for the mountpoint to appear
+	// after cmd.Start() returns. Defaults to 10 seconds.
+	mountVerifyTimeout time.Duration
+	// mountVerifyInterval is the polling interval for mountpoint checks.
+	// Defaults to 200ms.
+	mountVerifyInterval time.Duration
 }
 
-// NewMounter creates a new Mounter.
-func NewMounter(keyPath, knownDevicesDir, knownHostsDir string, logger *slog.Logger) *Mounter {
+// NewMounter creates a new Mounter. mountTool selects the mount backend
+// ("sshfs" default, or "fuse-t"); an empty or unknown value falls back to the
+// "sshfs" profile (see resolveBackend).
+//
+// When HUBFUSE_STUB_MOUNT_DIR is set (the scenario-test harness that uses
+// stub-sshfs, which never creates a real FUSE mountpoint), mountpoint
+// verification is bypassed so that scenario tests do not time out waiting for
+// a filesystem that the stub intentionally never creates.
+func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logger *slog.Logger) *Mounter {
+	check := isMountpoint
+	if os.Getenv("HUBFUSE_STUB_MOUNT_DIR") != "" {
+		// Stub harness: skip real mountpoint verification.
+		check = func(string) (bool, error) { return true, nil }
+	}
 	return &Mounter{
-		keyPath:         keyPath,
-		knownDevicesDir: knownDevicesDir,
-		knownHostsDir:   knownHostsDir,
-		logger:          logger,
-		activeMounts:    make(map[mountKey]*Mount),
-		execCommand:     exec.CommandContext,
-		unmount:         unmountPath,
+		keyPath:             keyPath,
+		knownDevicesDir:     knownDevicesDir,
+		knownHostsDir:       knownHostsDir,
+		backend:             resolveBackend(mountTool),
+		logger:              logger,
+		activeMounts:        make(map[mountKey]*Mount),
+		execCommand:         exec.CommandContext,
+		unmount:             unmountPath,
+		checkMountpoint:     check,
+		mountVerifyTimeout:  10 * time.Second,
+		mountVerifyInterval: 200 * time.Millisecond,
 	}
 }
 
@@ -87,17 +208,48 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	}
 
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
-	cmd := m.execCommand(ctx, "sshfs",
-		"-p", fmt.Sprintf("%d", sshPort),
-		"-o", fmt.Sprintf("IdentityFile=%s", m.keyPath),
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", fmt.Sprintf("UserKnownHostsFile=%s", knownHostsPath),
-		fmt.Sprintf("hubfuse@%s:%s", deviceIP, mc.Share),
-		mc.To,
-	)
+	args := buildMountArgs(m.backend, sshPort, m.keyPath, knownHostsPath, deviceIP, mc.Share, mc.To)
+	cmd := m.execCommand(ctx, m.backend.binary, args...)
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start sshfs for %q from device %q: %w", mc.Share, mc.Device, err)
+		return fmt.Errorf("start %s for %q from device %q: %w", m.backend.binary, mc.Share, mc.Device, err)
+	}
+
+	// Poll until the mountpoint appears (or timeout/ctx cancellation). The lock
+	// is held throughout — mounts are serialised by the daemon event loop so a
+	// worst-case mountVerifyTimeout hold is acceptable and avoids races between
+	// concurrent Mount calls on the same key.
+	deadline := time.Now().Add(m.mountVerifyTimeout)
+	var lastCheckErr error
+	for {
+		if ctx.Err() != nil {
+			// Context cancelled while waiting — kill and reap the backend.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("mount %q from device %q at %q: %w", mc.Share, mc.Device, mc.To, ctx.Err())
+		}
+
+		ok, checkErr := m.checkMountpoint(mc.To)
+		if checkErr != nil {
+			lastCheckErr = checkErr
+		}
+		if ok {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			// Timed out — kill and reap the backend process.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			reason := "mountpoint did not appear"
+			if lastCheckErr != nil {
+				reason = lastCheckErr.Error()
+			}
+			return fmt.Errorf("mount %q from device %q did not appear at %q within %s: %s",
+				mc.Share, mc.Device, mc.To, m.mountVerifyTimeout, reason)
+		}
+
+		time.Sleep(m.mountVerifyInterval)
 	}
 
 	m.activeMounts[key] = &Mount{
@@ -278,4 +430,12 @@ func (m *Mounter) SetUnmountForTests(fn func(path string) error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.unmount = fn
+}
+
+// SetMountpointCheckForTests overrides the mountpoint check (used in tests and
+// in the stub-sshfs scenario harness where a real FUSE mount is never created).
+func (m *Mounter) SetMountpointCheckForTests(fn func(string) (bool, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkMountpoint = fn
 }

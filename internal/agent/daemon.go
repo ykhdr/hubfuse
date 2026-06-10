@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -78,9 +81,25 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	keysDir := filepath.Join(dir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 
+	// Fail fast if the configured mount tool is not supported on this OS
+	// (e.g. "fuse-t" on Linux). Value validation happened at config load;
+	// this adds the platform-specific gating the config layer deliberately omits.
+	if err := validateMountTool(cfg.Agent.MountTool, runtime.GOOS); err != nil {
+		return nil, fmt.Errorf("validate mount tool: %w", err)
+	}
+
 	knownDevicesDir := filepath.Join(dir, common.KnownDevicesDir)
 	knownHostsDir := filepath.Join(dir, common.KnownHostsDir)
-	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, logger)
+	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, cfg.Agent.MountTool, logger)
+
+	// Warn (but do not abort) if the mount binary is missing or the FUSE-T
+	// runtime is absent while mounts are configured — sharing must still work
+	// even without a mount tool installed.
+	fileExists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+	preflightMountBinary(cfg.Agent.MountTool, resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, runtime.GOOS, exec.LookPath, fileExists, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
@@ -118,6 +137,78 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	sshServer.SetDeviceResolver(d)
 
 	return d, nil
+}
+
+// fuseTRuntimeMarkers lists the filesystem paths that indicate a FUSE-T
+// runtime installation. At least one of these must exist for FUSE-T to work.
+var fuseTRuntimeMarkers = []string{
+	"/usr/local/lib/libfuse-t.dylib",
+	"/opt/homebrew/lib/libfuse-t.dylib",
+	"/Library/Application Support/fuse-t",
+}
+
+// preflightMountBinary checks that the mount backend's binary is present on
+// PATH when at least one mount is configured. On a miss it logs an actionable
+// warning and returns — it never aborts startup, because a device with no
+// mount tool can still export (share) its own directories. When no mounts are
+// configured, the check is skipped entirely (lookPath is not invoked).
+//
+// Additionally, when tool is "fuse-t" on darwin, it checks for the FUSE-T
+// runtime libraries. If none of the known markers exist, it logs a WARN that
+// the sshfs on PATH may be macFUSE's drop-in rather than fuse-t-sshfs.
+//
+// tool is the configured mount-tool value (used only for the message and the
+// install hint). It is a pure helper: goos, lookPath, and fileExists are
+// injected (runtime.GOOS, exec.LookPath, and an os.Stat wrapper in
+// production) so the platform, PATH, and filesystem dependencies can all be
+// stubbed in tests without a Daemon instance.
+func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goos string, lookPath func(string) (string, error), fileExists func(string) bool, logger *slog.Logger) {
+	if !hasMounts {
+		return
+	}
+	if _, err := lookPath(backend.binary); err != nil {
+		logger.Warn(
+			fmt.Sprintf("mount-tool %q selected but %q not found on PATH — %s",
+				tool, backend.binary, mountInstallHint(tool, goos)),
+			"error", err,
+		)
+	}
+
+	// FUSE-T runtime check: if fuse-t is selected on macOS but none of the
+	// known runtime markers are present, the "sshfs" on PATH is likely the
+	// macFUSE version and mounts will fail at runtime without an obvious error.
+	if tool == "fuse-t" && goos == "darwin" {
+		runtimeFound := false
+		for _, marker := range fuseTRuntimeMarkers {
+			if fileExists(marker) {
+				runtimeFound = true
+				break
+			}
+		}
+		if !runtimeFound {
+			logger.Warn(fmt.Sprintf(
+				"mount-tool %q selected but FUSE-T runtime not found; "+
+					"the sshfs on PATH may be macFUSE's (checked: %s) — "+
+					"install with: brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs",
+				tool, strings.Join(fuseTRuntimeMarkers, ", ")),
+			)
+		}
+	}
+}
+
+// mountInstallHint returns an OS- and tool-appropriate install suggestion for a
+// missing mount binary. FUSE-T is macOS-only and its casks live in a third-party
+// tap, so the hint taps it first. When sshfs is selected on macOS we point at
+// macFUSE (no fuse-t claim); on Linux we point at the distribution's sshfs
+// package.
+func mountInstallHint(tool, goos string) string {
+	if tool == "fuse-t" {
+		return "install with: brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs"
+	}
+	if goos == "darwin" {
+		return "install an sshfs binary (e.g. brew install --cask macfuse, then a macFUSE sshfs build)"
+	}
+	return "install your distribution's sshfs package (e.g. apt install sshfs)"
 }
 
 // NicknameForDeviceID implements DeviceResolver. Used by the SFTP handler to

@@ -35,6 +35,10 @@ type HubConfig struct {
 type AgentConfig struct {
 	// SSHPort is the port the agent's SSH server listens on (default: 2222).
 	SSHPort int
+	// MountTool selects the mount backend: "sshfs" (default) or "fuse-t".
+	// "fuse-t" is only supported on macOS. An empty value is normalised to
+	// "sshfs" during Load.
+	MountTool string
 }
 
 // ShareConfig describes a directory shared by this device.
@@ -56,7 +60,8 @@ type MountConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Agent: AgentConfig{
-			SSHPort: 2222,
+			SSHPort:   2222,
+			MountTool: "sshfs",
 		},
 	}
 }
@@ -84,12 +89,25 @@ func Load(path string) (*Config, error) {
 		case "hub":
 			cfg.Hub = parseHubConfig(node)
 		case "agent":
-			parseAgentConfig(node, &cfg.Agent)
+			if err := parseAgentConfig(node, &cfg.Agent); err != nil {
+				return nil, fmt.Errorf("load config %q: %w", path, err)
+			}
 		case "shares":
 			cfg.Shares = parseSharesBlock(node)
 		case "mounts":
 			cfg.Mounts = parseMountsBlock(node)
 		}
+	}
+
+	// Validate and normalise the mount tool. OS gating is intentionally not
+	// applied here — it is platform-specific and lives in the daemon layer.
+	switch cfg.Agent.MountTool {
+	case "":
+		cfg.Agent.MountTool = "sshfs"
+	case "sshfs", "fuse-t":
+		// valid
+	default:
+		return nil, fmt.Errorf("load config %q: invalid mount-tool %q (allowed: \"sshfs\", \"fuse-t\")", path, cfg.Agent.MountTool)
 	}
 
 	// Normalise permissions and expand tildes.
@@ -130,15 +148,27 @@ func parseHubConfig(node *document.Node) HubConfig {
 
 // parseAgentConfig fills ac from an "agent { ... }" node.
 // Existing values in ac are only overwritten when the field is explicitly set.
-func parseAgentConfig(node *document.Node, ac *AgentConfig) {
+// A "mount-tool" node whose argument is present but not a string (e.g.
+// "mount-tool 5") is rejected; an absent argument leaves the default in place,
+// and an empty string "" is normalised to "sshfs" later in Load.
+func parseAgentConfig(node *document.Node, ac *AgentConfig) error {
 	for _, child := range node.Children {
 		switch nodeName(child) {
 		case "ssh-port":
 			if v := firstArgInt(child); v != 0 {
 				ac.SSHPort = v
 			}
+		case "mount-tool":
+			if len(child.Arguments) > 0 {
+				s, ok := child.Arguments[0].Value.(string)
+				if !ok {
+					return fmt.Errorf("mount-tool must be a string (allowed: \"sshfs\", \"fuse-t\")")
+				}
+				ac.MountTool = s
+			}
 		}
 	}
+	return nil
 }
 
 // parseSharesBlock extracts []ShareConfig from a "shares { share ... }" node.
@@ -267,6 +297,7 @@ func Save(path string, cfg *Config) error {
 	// agent block.
 	fmt.Fprintf(&sb, "agent {\n")
 	fmt.Fprintf(&sb, "    ssh-port %d\n", cfg.Agent.SSHPort)
+	fmt.Fprintf(&sb, "    mount-tool %q\n", cfg.Agent.MountTool)
 	fmt.Fprintf(&sb, "}\n\n")
 
 	// shares block.

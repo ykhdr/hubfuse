@@ -1,9 +1,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -140,6 +144,89 @@ func TestNewDaemon_MissingIdentityReturnsError(t *testing.T) {
 
 	_, err = NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
 	assert.Error(t, err, "NewDaemon() expected error for missing identity")
+}
+
+// writeDaemonFixture lays out the on-disk files NewDaemon needs (config,
+// identity, TLS placeholders, SSH keys) under a fresh temp dir and returns the
+// config path. cfgContent is the KDL written to config.kdl.
+func writeDaemonFixture(t *testing.T, cfgContent string) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	keysDir := filepath.Join(dir, "keys")
+	_, err := GenerateSSHKeyPair(keysDir)
+	require.NoError(t, err, "GenerateSSHKeyPair")
+
+	cfgPath := filepath.Join(dir, "config.kdl")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0644), "write config")
+
+	identityPath := filepath.Join(dir, "device.json")
+	identity := &DeviceIdentity{DeviceID: "abc123", Nickname: "my-device"}
+	require.NoError(t, SaveIdentity(identityPath, identity), "SaveIdentity")
+
+	tlsDir := filepath.Join(dir, "tls")
+	require.NoError(t, os.MkdirAll(tlsDir, 0700), "MkdirAll tls")
+	for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
+		require.NoError(t, os.WriteFile(filepath.Join(tlsDir, name), []byte("placeholder"), 0600), "write %s", name)
+	}
+
+	return cfgPath
+}
+
+// TestNewDaemon_FuseTOnLinuxFailsFast verifies the OS-gating wired into
+// NewDaemon: a config selecting mount-tool "fuse-t" on a non-macOS host must
+// abort construction with the wrapped "only supported on macOS" error. Value
+// validation (config Load) accepts "fuse-t" on any OS; the platform gate lives
+// in the daemon layer, so this exercises the wiring, not the pure helper.
+func TestNewDaemon_FuseTOnLinuxFailsFast(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("fuse-t is supported on macOS; this asserts the non-macOS rejection")
+	}
+
+	cfgPath := writeDaemonFixture(t, `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    mount-tool "fuse-t"
+}
+`)
+
+	_, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
+	require.Error(t, err, "NewDaemon() must reject fuse-t on a non-macOS host")
+	assert.Contains(t, err.Error(), "only supported on macOS", "error must explain the platform gate")
+	assert.Contains(t, err.Error(), "validate mount tool", "error must be wrapped at the daemon layer")
+}
+
+// TestNewDaemon_MissingMountBinaryWarnsButSucceeds verifies the production
+// preflight call site: when a mount is configured but the backend binary is not
+// installed, NewDaemon must still succeed (warn-and-continue), because a device
+// with no mount tool can still export its own shares.
+func TestNewDaemon_MissingMountBinaryWarnsButSucceeds(t *testing.T) {
+	// Make the preflight lookup miss deterministically regardless of whether
+	// sshfs happens to be installed on the test host.
+	t.Setenv("PATH", t.TempDir())
+
+	cfgPath := writeDaemonFixture(t, `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    ssh-port 2222
+}
+mounts {
+    mount device="peer" share="docs" to="/tmp/hubfuse-test-mnt"
+}
+`)
+
+	daemon, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
+	require.NoError(t, err, "NewDaemon() must succeed even when the mount binary is missing")
+	require.NotNil(t, daemon, "daemon should be constructed")
+	assert.NotNil(t, daemon.mounter, "mounter should still be wired")
 }
 
 // ─── handleDeviceOnline ────────────────────────────────────────────────────────
@@ -525,4 +612,151 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
 	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
 	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
+}
+
+// ─── preflightMountBinary ──────────────────────────────────────────────────────
+
+// captureLogger returns a logger that writes warnings (and above) into buf so a
+// test can assert on the emitted message.
+func captureLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	called := false
+	lookPath := func(string) (string, error) {
+		called = true
+		return "", errors.New("not found")
+	}
+	fileExists := func(string) bool { return true } // runtime markers present, no extra warn
+
+	// Must not panic; warn-and-continue is the contract (no error to assert on
+	// since the helper returns nothing). fuse-t is macOS-only, so the hint stays
+	// the fuse-t tap+cask regardless of the goos we pass here.
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
+
+	assert.True(t, called, "lookPath should be invoked when mounts are configured")
+	out := buf.String()
+	assert.Contains(t, out, "not found on PATH", "expected an actionable warning to be logged")
+	assert.Contains(t, out, "brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs", "fuse-t hint must tap the third-party cask before installing")
+	assert.Contains(t, out, "level=WARN", "message must be logged at WARN level, never an error/abort")
+}
+
+func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
+	lookPath := func(string) (string, error) {
+		return "", errors.New("not found")
+	}
+	fileExists := func(string) bool { return true }
+
+	t.Run("sshfs on linux suggests distro package", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "linux", lookPath, fileExists, captureLogger(&buf))
+		out := buf.String()
+		assert.Contains(t, out, "sshfs package", "linux sshfs hint should point at the distro package")
+		assert.NotContains(t, out, "brew", "linux sshfs hint must not mention brew")
+	})
+
+	t.Run("sshfs on darwin does not claim fuse-t", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "darwin", lookPath, fileExists, captureLogger(&buf))
+		out := buf.String()
+		assert.NotContains(t, out, "fuse-t", "sshfs-on-darwin hint must not recommend fuse-t when sshfs was chosen")
+		assert.Contains(t, out, "sshfs", "sshfs-on-darwin hint should still point at an sshfs binary")
+	})
+
+	t.Run("fuse-t taps the third-party cask first", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, captureLogger(&buf))
+		assert.Contains(t, buf.String(), "brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs", "fuse-t hint must tap before installing")
+	})
+}
+
+func TestPreflightMountBinary_NoMountsSkipsLookPath(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) {
+		t.Fatal("lookPath must not be called when no mounts are configured")
+		return "", nil
+	}
+	fileExists := func(string) bool {
+		t.Fatal("fileExists must not be called when no mounts are configured")
+		return false
+	}
+
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), false, runtime.GOOS, lookPath, fileExists, logger)
+
+	assert.Empty(t, buf.String(), "no warning should be logged when there are no mounts")
+}
+
+func TestPreflightMountBinary_BinaryPresentNoWarning(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) {
+		return "/usr/bin/sshfs", nil
+	}
+	fileExists := func(string) bool { return true }
+
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), true, runtime.GOOS, lookPath, fileExists, logger)
+
+	assert.Empty(t, buf.String(), "no warning should be logged when the binary is found")
+}
+
+// ─── preflightMountBinary: FUSE-T runtime checks ─────────────────────────────
+
+// TestPreflightMountBinary_FuseTRuntimeMissingWarns verifies that when fuse-t
+// is selected on darwin and none of the runtime markers exist, a WARN is logged.
+func TestPreflightMountBinary_FuseTRuntimeMissingWarns(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/local/bin/sshfs", nil }
+	// Stub: no runtime markers present.
+	fileExists := func(string) bool { return false }
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
+
+	out := buf.String()
+	assert.Contains(t, out, "level=WARN", "must log at WARN level")
+	assert.Contains(t, out, "FUSE-T runtime not found", "must mention runtime not found")
+	assert.Contains(t, out, "fuse-t-sshfs", "must include the install hint")
+}
+
+// TestPreflightMountBinary_FuseTRuntimePresentNoWarn verifies that when at
+// least one runtime marker exists, no runtime warning is emitted.
+func TestPreflightMountBinary_FuseTRuntimePresentNoWarn(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/local/bin/sshfs", nil }
+	// Stub: first marker found.
+	fileExists := func(path string) bool {
+		return path == fuseTRuntimeMarkers[0]
+	}
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, fileExists, logger)
+
+	out := buf.String()
+	assert.NotContains(t, out, "FUSE-T runtime not found", "must not warn when a runtime marker is present")
+}
+
+// TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux verifies that the
+// fuse-t runtime check is not performed on non-darwin hosts.
+func TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) { return "/usr/bin/sshfs", nil }
+	fileExists := func(string) bool {
+		t.Fatal("fileExists must not be called for fuse-t on non-darwin")
+		return false
+	}
+
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "linux", lookPath, fileExists, logger)
+
+	assert.NotContains(t, buf.String(), "FUSE-T runtime not found", "runtime check must be skipped on linux")
 }

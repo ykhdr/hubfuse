@@ -87,10 +87,13 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 			[]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n"), 0644),
 		"write stale-dev.pub")
 
-	mounter := agent.NewMounter(filepath.Join(agentDir, "id_ed25519"), knownDevicesDir, knownHostsDir, mtLogger)
+	mounter := agent.NewMounter(filepath.Join(agentDir, "id_ed25519"), knownDevicesDir, knownHostsDir, "", mtLogger)
 	mounter.SetExecCommandForTests(func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "true")
 	})
+	// The exec stub ("true") never creates a real mountpoint, so stub the check
+	// to return immediately without touching the filesystem.
+	mounter.SetMountpointCheckForTests(func(string) (bool, error) { return true, nil })
 	unmounted := make(chan struct{})
 	mounter.SetUnmountForTests(func(string) error {
 		close(unmounted)

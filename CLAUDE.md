@@ -56,7 +56,7 @@ Device identity is extracted from the mTLS certificate CN field via a gRPC inter
 - `daemon.go` — Orchestrator
 - `client.go` — gRPC client wrapper
 - `connector.go` — Hub connection with backoff retry
-- `mounter.go` — SSHFS mount/unmount lifecycle
+- `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table)
 - `sshserver.go` — Embedded SSH server (default port 2222) for incoming SSHFS
 - `config/` — KDL format config parser (`config.go`), diff detection (`diff.go`), hot-reload via fsnotify (`watcher.go`)
 

@@ -15,7 +15,32 @@ All communication is secured with mTLS. Devices pair using short-lived invite co
 
 - Go 1.25+
 - `protoc` with `protoc-gen-go` and `protoc-gen-go-grpc` (for proto regeneration only)
-- `sshfs` installed on agent machines
+- `sshfs` installed on agent machines (see [Installing the mount tool](#installing-the-mount-tool))
+
+### Installing the mount tool
+
+Agents mount remote shares with `sshfs`. The FUSE implementation behind it
+depends on the platform.
+
+**macOS** — FUSE-T is the recommended, kext-free path. Its casks live in a
+third-party tap, so tap it first:
+
+```bash
+brew tap macos-fuse-t/homebrew-cask
+brew install --cask fuse-t fuse-t-sshfs
+```
+
+FUSE-T runs a local NFS server instead of a kernel extension, so there is
+nothing to approve and no reboot. The alternative, macFUSE, installs a kernel
+extension that requires System Settings approval plus a reboot, and on Apple
+Silicon also forces enabling reduced-security mode. To use FUSE-T set
+`mount-tool "fuse-t"` in the agent config (see [Configuration](#configuration));
+FUSE-T is macOS-only. Note: FUSE-T is free for personal use; commercial use
+requires a license (see fuse-t.org).
+
+**Linux** — install the distribution's `sshfs` package (which uses `fusermount`),
+e.g. `apt install sshfs` or `dnf install fuse-sshfs`. The default
+`mount-tool "sshfs"` applies; `"fuse-t"` is not available on Linux.
 
 ## Quick start
 
@@ -61,9 +86,18 @@ all outstanding join tokens; issue fresh ones after rotation.
 Agent configuration lives in `~/.hubfuse/config.kdl` (KDL format). Example:
 
 ```kdl
-nickname "my-laptop"
-hub "192.168.1.10:9090"
-ssh-port 2222
+device {
+    nickname "my-laptop"
+}
+
+hub {
+    address "192.168.1.10:9090"
+}
+
+agent {
+    ssh-port 2222
+    mount-tool "sshfs"   // "sshfs" (default) | "fuse-t"
+}
 
 shares {
     share "/home/user/projects" alias="projects" permissions="rw" {
@@ -76,7 +110,33 @@ mounts {
 }
 ```
 
-Changes to `config.kdl` are hot-reloaded — no restart needed.
+Changes to `shares` and `mounts` in `config.kdl` are hot-reloaded — no restart
+needed. Settings in the `agent` block (`ssh-port`, `mount-tool`) are read once at
+startup and require a daemon restart to take effect.
+
+### Mount tool
+
+`agent { mount-tool "..." }` selects the mount backend for this device
+(device-global; it applies to every mount). Allowed values:
+
+- `"sshfs"` (default) — the distribution `sshfs` (macFUSE on macOS, `fusermount`
+  on Linux).
+- `"fuse-t"` — macOS only; requires `fuse-t-sshfs`
+  (`brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs`).
+  The kext-free path described in
+  [Installing the mount tool](#installing-the-mount-tool). Selecting `"fuse-t"`
+  on a non-macOS host is a configuration error.
+
+Unlike `shares` and `mounts`, changing `mount-tool` requires a daemon restart —
+the backend is selected once at startup and is not picked up by hot-reload.
+
+Both values run the `sshfs` binary found on `PATH`; `mount-tool` does not pick a
+binary by itself. If both macFUSE's and FUSE-T's `sshfs` are installed, whichever
+comes first on `PATH` is the engine that actually serves the mount — so keep only
+one installed (e.g. `brew uninstall sshfs-mac` to let FUSE-T win). As a safety
+net, with `mount-tool "fuse-t"` the agent warns at startup when the FUSE-T runtime
+isn't detected, and a mount that never materializes is reported as an error rather
+than logged as a (false) success.
 
 ### Share access control
 
