@@ -8,11 +8,85 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 )
+
+// mountBackend describes what a selected mount tool needs to run a mount.
+// It is the single source of truth for the binary to exec and any
+// backend-specific -o options to append to the command.
+type mountBackend struct {
+	name      string   // "sshfs" | "fuse-t"
+	binary    string   // executable to run
+	extraOpts []string // backend-specific -o options appended to the command
+}
+
+// mountBackends maps a configured mount-tool value to its backend profile.
+//
+// Both profiles use the "sshfs" binary: macFUSE-sshfs and fuse-t-sshfs install
+// to the same path and collide, so a device has exactly one "sshfs" on PATH.
+// Every flag the mounter passes (-p, -o IdentityFile, -o StrictHostKeyChecking,
+// -o UserKnownHostsFile) is an SSH option that sshfs forwards to ssh, not a
+// FUSE option, so the same invocation works for either FUSE implementation.
+// extraOpts is empty for both today; the field exists so a backend can inject
+// FUSE-specific options later without touching the call site.
+var mountBackends = map[string]mountBackend{
+	"sshfs":  {name: "sshfs", binary: "sshfs", extraOpts: nil},
+	"fuse-t": {name: "fuse-t", binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
+}
+
+// resolveBackend returns the backend profile for the configured mount tool.
+// An empty value defaults to "sshfs"; an unknown value also falls back to the
+// "sshfs" profile as a defensive default (config Load already rejects unknown
+// values, so this only guards against programmer error).
+func resolveBackend(tool string) mountBackend {
+	if tool == "" {
+		return mountBackends["sshfs"]
+	}
+	if b, ok := mountBackends[tool]; ok {
+		return b
+	}
+	return mountBackends["sshfs"]
+}
+
+// buildMountArgs builds the argument list for the mount command. It emits the
+// base SSH options, then any backend-specific extraOpts as ordered "-o <opt>"
+// pairs, and finally the "hubfuse@<ip>:<share>" source and "<to>" target
+// operands last (their position is significant to sshfs).
+func buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string {
+	args := []string{
+		"-p", strconv.Itoa(sshPort),
+		"-o", "IdentityFile=" + keyPath,
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHosts,
+	}
+	for _, opt := range b.extraOpts {
+		args = append(args, "-o", opt)
+	}
+	args = append(args, "hubfuse@"+deviceIP+":"+share, to)
+	return args
+}
+
+// validateMountTool validates a configured mount-tool value against the target
+// OS. Unknown values are rejected on any OS. "fuse-t" is rejected unless goos
+// is "darwin", since FUSE-T is macOS-only. An empty value is treated as the
+// default "sshfs" and accepted.
+func validateMountTool(tool, goos string) error {
+	switch tool {
+	case "", "sshfs":
+		return nil
+	case "fuse-t":
+		if goos != "darwin" {
+			return fmt.Errorf("mount-tool %q is only supported on macOS", "fuse-t")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid mount-tool %q: must be \"sshfs\" or \"fuse-t\"", tool)
+	}
+}
 
 // mountKey is the map key for an active mount, uniquely identifying a
 // device+share pair without string concatenation.

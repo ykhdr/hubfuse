@@ -176,14 +176,14 @@ operands last.
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
 
-- [ ] add `mountBackend` struct and the `mountBackends` lookup map (`"sshfs"`, `"fuse-t"`, both `binary: "sshfs"`, `extraOpts: nil`) with comments explaining the same-binary/collision rationale
-- [ ] add `resolveBackend(tool string) mountBackend` — map lookup, empty → `"sshfs"`, unknown → fall back to `"sshfs"` profile (config `Load` already rejects unknowns; this is a defensive default)
-- [ ] add `buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string` — base args (`-p`, `-o IdentityFile=`, `-o StrictHostKeyChecking=yes`, `-o UserKnownHostsFile=`), then `extraOpts` as ordered `-o <opt>` pairs, then `hubfuse@<ip>:<share>` and `<to>` operands last (use `strconv.Itoa` for the port)
-- [ ] add `validateMountTool(tool, goos string) error` — unknown value → error on any OS; `"fuse-t"` && `goos != "darwin"` → `mount-tool "fuse-t" is only supported on macOS`; otherwise nil
-- [ ] write tests for `resolveBackend` (`"sshfs"`, `"fuse-t"`, `""`→sshfs, unknown→sshfs)
-- [ ] write tests for `buildMountArgs` (base args correct; non-empty `extraOpts` injected as ordered `-o` pairs *before* the `user@host:share`/`to` operands)
-- [ ] write tests for `validateMountTool` (`("fuse-t","linux")`→error, `("fuse-t","darwin")`→ok, `("sshfs","linux")`→ok, bad value→error on any OS)
-- [ ] run tests: `go test ./internal/agent/...` — must pass before next task
+- [x] add `mountBackend` struct and the `mountBackends` lookup map (`"sshfs"`, `"fuse-t"`, both `binary: "sshfs"`, `extraOpts: nil`) with comments explaining the same-binary/collision rationale
+- [x] add `resolveBackend(tool string) mountBackend` — map lookup, empty → `"sshfs"`, unknown → fall back to `"sshfs"` profile (config `Load` already rejects unknowns; this is a defensive default)
+- [x] add `buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string` — base args (`-p`, `-o IdentityFile=`, `-o StrictHostKeyChecking=yes`, `-o UserKnownHostsFile=`), then `extraOpts` as ordered `-o <opt>` pairs, then `hubfuse@<ip>:<share>` and `<to>` operands last (use `strconv.Itoa` for the port)
+- [x] add `validateMountTool(tool, goos string) error` — unknown value → error on any OS; `"fuse-t"` && `goos != "darwin"` → `mount-tool "fuse-t" is only supported on macOS`; otherwise nil
+- [x] write tests for `resolveBackend` (`"sshfs"`, `"fuse-t"`, `""`→sshfs, unknown→sshfs)
+- [x] write tests for `buildMountArgs` (base args correct; non-empty `extraOpts` injected as ordered `-o` pairs *before* the `user@host:share`/`to` operands)
+- [x] write tests for `validateMountTool` (`("fuse-t","linux")`→error, `("fuse-t","darwin")`→ok, `("sshfs","linux")`→ok, bad value→error on any OS)
+- [x] run tests: `go test ./internal/agent/...` — must pass before next task
 
 ### Task 3: Wire the backend into the Mounter and refactor `Mount()`
 

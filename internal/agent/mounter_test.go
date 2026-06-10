@@ -62,6 +62,91 @@ func writePubKeyFile(t *testing.T, dir, deviceID string) {
 	require.NoError(t, os.WriteFile(path, []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n"), 0644), "WriteFile(%q)", path)
 }
 
+// ─── Backend profiles & pure helpers ────────────────────────────────────────
+
+func TestResolveBackend(t *testing.T) {
+	tests := []struct {
+		name       string
+		tool       string
+		wantName   string
+		wantBinary string
+	}{
+		{name: "sshfs", tool: "sshfs", wantName: "sshfs", wantBinary: "sshfs"},
+		{name: "fuse-t", tool: "fuse-t", wantName: "fuse-t", wantBinary: "sshfs"},
+		{name: "empty defaults to sshfs", tool: "", wantName: "sshfs", wantBinary: "sshfs"},
+		{name: "unknown defaults to sshfs", tool: "bogus", wantName: "sshfs", wantBinary: "sshfs"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := resolveBackend(tt.tool)
+			assert.Equal(t, tt.wantName, b.name, "backend name")
+			assert.Equal(t, tt.wantBinary, b.binary, "backend binary")
+		})
+	}
+}
+
+func TestBuildMountArgs_BaseArgs(t *testing.T) {
+	b := resolveBackend("sshfs")
+	args := buildMountArgs(b, 2222, "/key/path", "/known/hosts", "192.168.1.10", "documents", "/mnt/docs")
+
+	want := []string{
+		"-p", "2222",
+		"-o", "IdentityFile=/key/path",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=/known/hosts",
+		"hubfuse@192.168.1.10:documents",
+		"/mnt/docs",
+	}
+	assert.Equal(t, want, args, "base mount args")
+}
+
+func TestBuildMountArgs_ExtraOptsInjectedBeforeOperands(t *testing.T) {
+	// Construct a backend with non-empty extraOpts to verify ordering: the
+	// extra -o pairs must appear after the base options and before the
+	// user@host:share / target operands.
+	b := mountBackend{name: "fuse-t", binary: "sshfs", extraOpts: []string{"volname=share", "noappledouble"}}
+	args := buildMountArgs(b, 22, "/key", "/kh", "10.0.0.1", "photos", "/mnt/photos")
+
+	want := []string{
+		"-p", "22",
+		"-o", "IdentityFile=/key",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=/kh",
+		"-o", "volname=share",
+		"-o", "noappledouble",
+		"hubfuse@10.0.0.1:photos",
+		"/mnt/photos",
+	}
+	assert.Equal(t, want, args, "mount args with extraOpts")
+}
+
+func TestValidateMountTool(t *testing.T) {
+	tests := []struct {
+		name    string
+		tool    string
+		goos    string
+		wantErr bool
+	}{
+		{name: "fuse-t on linux is rejected", tool: "fuse-t", goos: "linux", wantErr: true},
+		{name: "fuse-t on darwin is ok", tool: "fuse-t", goos: "darwin", wantErr: false},
+		{name: "sshfs on linux is ok", tool: "sshfs", goos: "linux", wantErr: false},
+		{name: "sshfs on darwin is ok", tool: "sshfs", goos: "darwin", wantErr: false},
+		{name: "empty is ok", tool: "", goos: "linux", wantErr: false},
+		{name: "bad value on darwin is rejected", tool: "bogus", goos: "darwin", wantErr: true},
+		{name: "bad value on linux is rejected", tool: "bogus", goos: "linux", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMountTool(tt.tool, tt.goos)
+			if tt.wantErr {
+				assert.Error(t, err, "validateMountTool(%q, %q)", tt.tool, tt.goos)
+			} else {
+				assert.NoError(t, err, "validateMountTool(%q, %q)", tt.tool, tt.goos)
+			}
+		})
+	}
+}
+
 // ─── Mount ────────────────────────────────────────────────────────────────────
 
 func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
