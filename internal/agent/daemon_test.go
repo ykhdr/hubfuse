@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -525,4 +528,60 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
 	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
 	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
+}
+
+// ─── preflightMountBinary ──────────────────────────────────────────────────────
+
+// captureLogger returns a logger that writes warnings (and above) into buf so a
+// test can assert on the emitted message.
+func captureLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	called := false
+	lookPath := func(string) (string, error) {
+		called = true
+		return "", errors.New("not found")
+	}
+
+	// Must not panic; warn-and-continue is the contract (no error to assert on
+	// since the helper returns nothing).
+	preflightMountBinary(resolveBackend("fuse-t"), true, lookPath, logger)
+
+	assert.True(t, called, "lookPath should be invoked when mounts are configured")
+	out := buf.String()
+	assert.Contains(t, out, "not found on PATH", "expected an actionable warning to be logged")
+	assert.Contains(t, out, "brew install --cask fuse-t fuse-t-sshfs", "warning should include the install hint")
+	assert.Contains(t, out, "level=WARN", "message must be logged at WARN level, never an error/abort")
+}
+
+func TestPreflightMountBinary_NoMountsSkipsLookPath(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) {
+		t.Fatal("lookPath must not be called when no mounts are configured")
+		return "", nil
+	}
+
+	preflightMountBinary(resolveBackend("sshfs"), false, lookPath, logger)
+
+	assert.Empty(t, buf.String(), "no warning should be logged when there are no mounts")
+}
+
+func TestPreflightMountBinary_BinaryPresentNoWarning(t *testing.T) {
+	var buf bytes.Buffer
+	logger := captureLogger(&buf)
+
+	lookPath := func(string) (string, error) {
+		return "/usr/bin/sshfs", nil
+	}
+
+	preflightMountBinary(resolveBackend("sshfs"), true, lookPath, logger)
+
+	assert.Empty(t, buf.String(), "no warning should be logged when the binary is found")
 }

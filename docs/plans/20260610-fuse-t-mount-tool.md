@@ -206,12 +206,12 @@ operands last.
 - Modify: `internal/agent/daemon.go`
 - Modify: `internal/agent/daemon_test.go` (already exists — package `agent`, testify, `buildTestDaemon` helper)
 
-- [ ] add `"runtime"` to the `daemon.go` import block (it is currently imported only in `mounter.go`, not `daemon.go`)
-- [ ] at daemon startup (before/around mounter construction, ~line 83), call `validateMountTool(cfg.Agent.MountTool, runtime.GOOS)` and return the error if non-nil (fail fast on a misconfigured OS)
-- [ ] add a binary pre-flight: only when `len(cfg.Mounts) > 0`, run `exec.LookPath(resolveBackend(cfg.Agent.MountTool).binary)`; on error, **log a warning and continue** with the actionable install message (do not abort — sharing must still work)
-- [ ] make the pre-flight unit-testable: extract a small **pure** helper (e.g. `preflightMountBinary(backend mountBackend, hasMounts bool, lookPath func(string) (string, error), logger *slog.Logger)`) so the `LookPath` dependency can be stubbed and no daemon instance is needed
-- [ ] write tests (in `daemon_test.go`): pre-flight with stubbed `lookPath` returning error → warning emitted, no error returned; pre-flight with `hasMounts == false` → `lookPath` not called; (platform gating already covered by `validateMountTool` tests in Task 2)
-- [ ] run tests: `go test ./internal/agent/...` — must pass before next task
+- [x] add `"runtime"` to the `daemon.go` import block (it is currently imported only in `mounter.go`, not `daemon.go`)
+- [x] at daemon startup (before/around mounter construction, ~line 83), call `validateMountTool(cfg.Agent.MountTool, runtime.GOOS)` and return the error if non-nil (fail fast on a misconfigured OS)
+- [x] add a binary pre-flight: only when `len(cfg.Mounts) > 0`, run `exec.LookPath(resolveBackend(cfg.Agent.MountTool).binary)`; on error, **log a warning and continue** with the actionable install message (do not abort — sharing must still work)
+- [x] make the pre-flight unit-testable: extract a small **pure** helper (e.g. `preflightMountBinary(backend mountBackend, hasMounts bool, lookPath func(string) (string, error), logger *slog.Logger)`) so the `LookPath` dependency can be stubbed and no daemon instance is needed
+- [x] write tests (in `daemon_test.go`): pre-flight with stubbed `lookPath` returning error → warning emitted, no error returned; pre-flight with `hasMounts == false` → `lookPath` not called; (platform gating already covered by `validateMountTool` tests in Task 2)
+- [x] run tests: `go test ./internal/agent/...` — must pass before next task
 
 ### Task 5: Documentation
 

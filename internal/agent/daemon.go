@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -78,9 +80,20 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	keysDir := filepath.Join(dir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
 
+	// Fail fast if the configured mount tool is not supported on this OS
+	// (e.g. "fuse-t" on Linux). Value validation happened at config load;
+	// this adds the platform-specific gating the config layer deliberately omits.
+	if err := validateMountTool(cfg.Agent.MountTool, runtime.GOOS); err != nil {
+		return nil, fmt.Errorf("validate mount tool: %w", err)
+	}
+
 	knownDevicesDir := filepath.Join(dir, common.KnownDevicesDir)
 	knownHostsDir := filepath.Join(dir, common.KnownHostsDir)
 	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, cfg.Agent.MountTool, logger)
+
+	// Warn (but do not abort) if the mount binary is missing while mounts are
+	// configured — sharing must still work even without a mount tool installed.
+	preflightMountBinary(resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, exec.LookPath, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
@@ -118,6 +131,27 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	sshServer.SetDeviceResolver(d)
 
 	return d, nil
+}
+
+// preflightMountBinary checks that the mount backend's binary is present on
+// PATH when at least one mount is configured. On a miss it logs an actionable
+// warning and returns — it never aborts startup, because a device with no
+// mount tool can still export (share) its own directories. When no mounts are
+// configured, the check is skipped entirely (lookPath is not invoked).
+//
+// It is a pure helper: lookPath is injected (exec.LookPath in production) so the
+// PATH dependency can be stubbed in tests without a Daemon instance.
+func preflightMountBinary(backend mountBackend, hasMounts bool, lookPath func(string) (string, error), logger *slog.Logger) {
+	if !hasMounts {
+		return
+	}
+	if _, err := lookPath(backend.binary); err != nil {
+		logger.Warn(
+			fmt.Sprintf("mount-tool %q selected but %q not found on PATH — install with: brew install --cask fuse-t fuse-t-sshfs",
+				backend.name, backend.binary),
+			"error", err,
+		)
+	}
 }
 
 // NicknameForDeviceID implements DeviceResolver. Used by the SFTP handler to
