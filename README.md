@@ -83,11 +83,16 @@ all outstanding join tokens; issue fresh ones after rotation.
 Agent configuration lives in `~/.hubfuse/config.kdl` (KDL format). Example:
 
 ```kdl
-nickname "my-laptop"
-hub "192.168.1.10:9090"
-ssh-port 2222
+device {
+    nickname "my-laptop"
+}
+
+hub {
+    address "192.168.1.10:9090"
+}
 
 agent {
+    ssh-port 2222
     mount-tool "sshfs"   // "sshfs" (default) | "fuse-t"
 }
 
@@ -115,6 +120,9 @@ Changes to `config.kdl` are hot-reloaded — no restart needed.
   (`brew install --cask fuse-t fuse-t-sshfs`). The kext-free path described in
   [Installing the mount tool](#installing-the-mount-tool). Selecting `"fuse-t"`
   on a non-macOS host is a configuration error.
+
+Unlike `shares` and `mounts`, changing `mount-tool` requires a daemon restart —
+the backend is selected once at startup and is not picked up by hot-reload.
 
 ### Share access control
 

@@ -17,9 +17,9 @@ import (
 
 // mountBackend describes what a selected mount tool needs to run a mount.
 // It is the single source of truth for the binary to exec and any
-// backend-specific -o options to append to the command.
+// backend-specific -o options to append to the command. The configured tool
+// name is the map key in mountBackends, so it is not duplicated here.
 type mountBackend struct {
-	name      string   // "sshfs" | "fuse-t"
 	binary    string   // executable to run
 	extraOpts []string // backend-specific -o options appended to the command
 }
@@ -34,8 +34,8 @@ type mountBackend struct {
 // extraOpts is empty for both today; the field exists so a backend can inject
 // FUSE-specific options later without touching the call site.
 var mountBackends = map[string]mountBackend{
-	"sshfs":  {name: "sshfs", binary: "sshfs", extraOpts: nil},
-	"fuse-t": {name: "fuse-t", binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
+	"sshfs":  {binary: "sshfs", extraOpts: nil},
+	"fuse-t": {binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
 }
 
 // resolveBackend returns the backend profile for the configured mount tool.

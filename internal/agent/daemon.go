@@ -93,7 +93,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 
 	// Warn (but do not abort) if the mount binary is missing while mounts are
 	// configured — sharing must still work even without a mount tool installed.
-	preflightMountBinary(resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, exec.LookPath, logger)
+	preflightMountBinary(cfg.Agent.MountTool, resolveBackend(cfg.Agent.MountTool), len(cfg.Mounts) > 0, runtime.GOOS, exec.LookPath, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
@@ -139,19 +139,31 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 // mount tool can still export (share) its own directories. When no mounts are
 // configured, the check is skipped entirely (lookPath is not invoked).
 //
-// It is a pure helper: lookPath is injected (exec.LookPath in production) so the
+// tool is the configured mount-tool value (used only for the message and the
+// install hint). It is a pure helper: goos and lookPath are injected
+// (runtime.GOOS and exec.LookPath in production) so both the platform and the
 // PATH dependency can be stubbed in tests without a Daemon instance.
-func preflightMountBinary(backend mountBackend, hasMounts bool, lookPath func(string) (string, error), logger *slog.Logger) {
+func preflightMountBinary(tool string, backend mountBackend, hasMounts bool, goos string, lookPath func(string) (string, error), logger *slog.Logger) {
 	if !hasMounts {
 		return
 	}
 	if _, err := lookPath(backend.binary); err != nil {
 		logger.Warn(
-			fmt.Sprintf("mount-tool %q selected but %q not found on PATH — install with: brew install --cask fuse-t fuse-t-sshfs",
-				backend.name, backend.binary),
+			fmt.Sprintf("mount-tool %q selected but %q not found on PATH — %s",
+				tool, backend.binary, mountInstallHint(tool, goos)),
 			"error", err,
 		)
 	}
+}
+
+// mountInstallHint returns an OS- and backend-appropriate install suggestion
+// for a missing mount binary. The FUSE-T cask is macOS-only; elsewhere we point
+// at the distribution's sshfs package.
+func mountInstallHint(tool, goos string) string {
+	if tool == "fuse-t" || goos == "darwin" {
+		return "install with: brew install --cask fuse-t fuse-t-sshfs"
+	}
+	return "install your distribution's sshfs package (e.g. apt install sshfs)"
 }
 
 // NicknameForDeviceID implements DeviceResolver. Used by the SFTP handler to

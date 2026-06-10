@@ -173,6 +173,20 @@ agent {
 	_, err := Load(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid mount-tool")
+	assert.Contains(t, err.Error(), `allowed: "sshfs", "fuse-t"`, "error should list the allowed values")
+}
+
+func TestLoad_MountTool_EmptyStringNormalizesToSshfs(t *testing.T) {
+	// An explicitly-empty mount-tool in KDL must normalise to the "sshfs"
+	// default, exactly like omitting the key entirely.
+	path := writeTemp(t, `
+agent {
+    mount-tool ""
+}
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "sshfs", cfg.Agent.MountTool)
 }
 
 func TestLoad_NormalizePermissions(t *testing.T) {

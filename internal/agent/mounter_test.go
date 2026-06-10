@@ -75,18 +75,16 @@ func TestResolveBackend(t *testing.T) {
 	tests := []struct {
 		name       string
 		tool       string
-		wantName   string
 		wantBinary string
 	}{
-		{name: "sshfs", tool: "sshfs", wantName: "sshfs", wantBinary: "sshfs"},
-		{name: "fuse-t", tool: "fuse-t", wantName: "fuse-t", wantBinary: "sshfs"},
-		{name: "empty defaults to sshfs", tool: "", wantName: "sshfs", wantBinary: "sshfs"},
-		{name: "unknown defaults to sshfs", tool: "bogus", wantName: "sshfs", wantBinary: "sshfs"},
+		{name: "sshfs", tool: "sshfs", wantBinary: "sshfs"},
+		{name: "fuse-t", tool: "fuse-t", wantBinary: "sshfs"},
+		{name: "empty defaults to sshfs", tool: "", wantBinary: "sshfs"},
+		{name: "unknown defaults to sshfs", tool: "bogus", wantBinary: "sshfs"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := resolveBackend(tt.tool)
-			assert.Equal(t, tt.wantName, b.name, "backend name")
 			assert.Equal(t, tt.wantBinary, b.binary, "backend binary")
 		})
 	}
@@ -111,7 +109,7 @@ func TestBuildMountArgs_ExtraOptsInjectedBeforeOperands(t *testing.T) {
 	// Construct a backend with non-empty extraOpts to verify ordering: the
 	// extra -o pairs must appear after the base options and before the
 	// user@host:share / target operands.
-	b := mountBackend{name: "fuse-t", binary: "sshfs", extraOpts: []string{"volname=share", "noappledouble"}}
+	b := mountBackend{binary: "sshfs", extraOpts: []string{"volname=share", "noappledouble"}}
 	args := buildMountArgs(b, 22, "/key", "/kh", "10.0.0.1", "photos", "/mnt/photos")
 
 	want := []string{
@@ -129,24 +127,26 @@ func TestBuildMountArgs_ExtraOptsInjectedBeforeOperands(t *testing.T) {
 
 func TestValidateMountTool(t *testing.T) {
 	tests := []struct {
-		name    string
-		tool    string
-		goos    string
-		wantErr bool
+		name            string
+		tool            string
+		goos            string
+		wantErr         bool
+		wantErrContains string
 	}{
-		{name: "fuse-t on linux is rejected", tool: "fuse-t", goos: "linux", wantErr: true},
+		{name: "fuse-t on linux is rejected", tool: "fuse-t", goos: "linux", wantErr: true, wantErrContains: "only supported on macOS"},
 		{name: "fuse-t on darwin is ok", tool: "fuse-t", goos: "darwin", wantErr: false},
 		{name: "sshfs on linux is ok", tool: "sshfs", goos: "linux", wantErr: false},
 		{name: "sshfs on darwin is ok", tool: "sshfs", goos: "darwin", wantErr: false},
 		{name: "empty is ok", tool: "", goos: "linux", wantErr: false},
-		{name: "bad value on darwin is rejected", tool: "bogus", goos: "darwin", wantErr: true},
-		{name: "bad value on linux is rejected", tool: "bogus", goos: "linux", wantErr: true},
+		{name: "bad value on darwin is rejected", tool: "bogus", goos: "darwin", wantErr: true, wantErrContains: `must be "sshfs" or "fuse-t"`},
+		{name: "bad value on linux is rejected", tool: "bogus", goos: "linux", wantErr: true, wantErrContains: `must be "sshfs" or "fuse-t"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateMountTool(tt.tool, tt.goos)
 			if tt.wantErr {
-				assert.Error(t, err, "validateMountTool(%q, %q)", tt.tool, tt.goos)
+				require.Error(t, err, "validateMountTool(%q, %q)", tt.tool, tt.goos)
+				assert.Contains(t, err.Error(), tt.wantErrContains, "validateMountTool(%q, %q) error text", tt.tool, tt.goos)
 			} else {
 				assert.NoError(t, err, "validateMountTool(%q, %q)", tt.tool, tt.goos)
 			}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -143,6 +144,89 @@ func TestNewDaemon_MissingIdentityReturnsError(t *testing.T) {
 
 	_, err = NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
 	assert.Error(t, err, "NewDaemon() expected error for missing identity")
+}
+
+// writeDaemonFixture lays out the on-disk files NewDaemon needs (config,
+// identity, TLS placeholders, SSH keys) under a fresh temp dir and returns the
+// config path. cfgContent is the KDL written to config.kdl.
+func writeDaemonFixture(t *testing.T, cfgContent string) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	keysDir := filepath.Join(dir, "keys")
+	_, err := GenerateSSHKeyPair(keysDir)
+	require.NoError(t, err, "GenerateSSHKeyPair")
+
+	cfgPath := filepath.Join(dir, "config.kdl")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(cfgContent), 0644), "write config")
+
+	identityPath := filepath.Join(dir, "device.json")
+	identity := &DeviceIdentity{DeviceID: "abc123", Nickname: "my-device"}
+	require.NoError(t, SaveIdentity(identityPath, identity), "SaveIdentity")
+
+	tlsDir := filepath.Join(dir, "tls")
+	require.NoError(t, os.MkdirAll(tlsDir, 0700), "MkdirAll tls")
+	for _, name := range []string{"ca.crt", "client.crt", "client.key"} {
+		require.NoError(t, os.WriteFile(filepath.Join(tlsDir, name), []byte("placeholder"), 0600), "write %s", name)
+	}
+
+	return cfgPath
+}
+
+// TestNewDaemon_FuseTOnLinuxFailsFast verifies the OS-gating wired into
+// NewDaemon: a config selecting mount-tool "fuse-t" on a non-macOS host must
+// abort construction with the wrapped "only supported on macOS" error. Value
+// validation (config Load) accepts "fuse-t" on any OS; the platform gate lives
+// in the daemon layer, so this exercises the wiring, not the pure helper.
+func TestNewDaemon_FuseTOnLinuxFailsFast(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("fuse-t is supported on macOS; this asserts the non-macOS rejection")
+	}
+
+	cfgPath := writeDaemonFixture(t, `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    mount-tool "fuse-t"
+}
+`)
+
+	_, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
+	require.Error(t, err, "NewDaemon() must reject fuse-t on a non-macOS host")
+	assert.Contains(t, err.Error(), "only supported on macOS", "error must explain the platform gate")
+	assert.Contains(t, err.Error(), "validate mount tool", "error must be wrapped at the daemon layer")
+}
+
+// TestNewDaemon_MissingMountBinaryWarnsButSucceeds verifies the production
+// preflight call site: when a mount is configured but the backend binary is not
+// installed, NewDaemon must still succeed (warn-and-continue), because a device
+// with no mount tool can still export its own shares.
+func TestNewDaemon_MissingMountBinaryWarnsButSucceeds(t *testing.T) {
+	// Make the preflight lookup miss deterministically regardless of whether
+	// sshfs happens to be installed on the test host.
+	t.Setenv("PATH", t.TempDir())
+
+	cfgPath := writeDaemonFixture(t, `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    ssh-port 2222
+}
+mounts {
+    mount device="peer" share="docs" to="/tmp/hubfuse-test-mnt"
+}
+`)
+
+	daemon, err := NewDaemon(cfgPath, discardLogger(), DaemonOptions{})
+	require.NoError(t, err, "NewDaemon() must succeed even when the mount binary is missing")
+	require.NotNil(t, daemon, "daemon should be constructed")
+	assert.NotNil(t, daemon.mounter, "mounter should still be wired")
 }
 
 // ─── handleDeviceOnline ────────────────────────────────────────────────────────
@@ -549,14 +633,35 @@ func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
 	}
 
 	// Must not panic; warn-and-continue is the contract (no error to assert on
-	// since the helper returns nothing).
-	preflightMountBinary(resolveBackend("fuse-t"), true, lookPath, logger)
+	// since the helper returns nothing). fuse-t is macOS-only, so the hint stays
+	// the brew cask regardless of the goos we pass here.
+	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "darwin", lookPath, logger)
 
 	assert.True(t, called, "lookPath should be invoked when mounts are configured")
 	out := buf.String()
 	assert.Contains(t, out, "not found on PATH", "expected an actionable warning to be logged")
 	assert.Contains(t, out, "brew install --cask fuse-t fuse-t-sshfs", "warning should include the install hint")
 	assert.Contains(t, out, "level=WARN", "message must be logged at WARN level, never an error/abort")
+}
+
+func TestPreflightMountBinary_InstallHintIsOSAware(t *testing.T) {
+	lookPath := func(string) (string, error) {
+		return "", errors.New("not found")
+	}
+
+	t.Run("sshfs on linux suggests distro package", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "linux", lookPath, captureLogger(&buf))
+		out := buf.String()
+		assert.Contains(t, out, "sshfs package", "linux sshfs hint should point at the distro package")
+		assert.NotContains(t, out, "brew", "linux sshfs hint must not mention brew")
+	})
+
+	t.Run("sshfs on darwin keeps brew hint", func(t *testing.T) {
+		var buf bytes.Buffer
+		preflightMountBinary("sshfs", resolveBackend("sshfs"), true, "darwin", lookPath, captureLogger(&buf))
+		assert.Contains(t, buf.String(), "brew install --cask fuse-t fuse-t-sshfs", "darwin hint should use brew")
+	})
 }
 
 func TestPreflightMountBinary_NoMountsSkipsLookPath(t *testing.T) {
@@ -568,7 +673,7 @@ func TestPreflightMountBinary_NoMountsSkipsLookPath(t *testing.T) {
 		return "", nil
 	}
 
-	preflightMountBinary(resolveBackend("sshfs"), false, lookPath, logger)
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), false, runtime.GOOS, lookPath, logger)
 
 	assert.Empty(t, buf.String(), "no warning should be logged when there are no mounts")
 }
@@ -581,7 +686,7 @@ func TestPreflightMountBinary_BinaryPresentNoWarning(t *testing.T) {
 		return "/usr/bin/sshfs", nil
 	}
 
-	preflightMountBinary(resolveBackend("sshfs"), true, lookPath, logger)
+	preflightMountBinary("sshfs", resolveBackend("sshfs"), true, runtime.GOOS, lookPath, logger)
 
 	assert.Empty(t, buf.String(), "no warning should be logged when the binary is found")
 }
