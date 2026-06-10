@@ -110,7 +110,9 @@ mounts {
 }
 ```
 
-Changes to `config.kdl` are hot-reloaded — no restart needed.
+Changes to `shares` and `mounts` in `config.kdl` are hot-reloaded — no restart
+needed. Settings in the `agent` block (`ssh-port`, `mount-tool`) are read once at
+startup and require a daemon restart to take effect.
 
 ### Mount tool
 
