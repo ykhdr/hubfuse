@@ -107,14 +107,13 @@ agent {
 
 ```go
 type mountBackend struct {
-    name      string   // "sshfs" | "fuse-t"
     binary    string   // executable to run
     extraOpts []string // backend-specific -o options appended to the command
 }
 
 var mountBackends = map[string]mountBackend{
-    "sshfs":  {name: "sshfs",  binary: "sshfs", extraOpts: nil},
-    "fuse-t": {name: "fuse-t", binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
+    "sshfs":  {binary: "sshfs", extraOpts: nil},
+    "fuse-t": {binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
 }
 ```
 
@@ -136,7 +135,7 @@ operands last.
   `mount-tool "fuse-t" is only supported on macOS`.
 - Startup binary pre-flight (only when `len(cfg.Mounts) > 0`): `exec.LookPath(backend.binary)`;
   on miss, **log a warning and continue** with an actionable message:
-  `fuse-t selected but "sshfs" not found on PATH — install with: brew install --cask fuse-t fuse-t-sshfs`.
+  `fuse-t selected but "sshfs" not found on PATH — install with: brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs`.
 
 ### Non-goals (YAGNI)
 
@@ -243,7 +242,7 @@ operands last.
 *Manual / external verification — informational only, no checkboxes.*
 
 **Manual verification on a real Mac:**
-- Install FUSE-T: `brew install --cask fuse-t fuse-t-sshfs`.
+- Install FUSE-T: `brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t fuse-t-sshfs`.
 - Set `mount-tool "fuse-t"` in the agent config and confirm a remote share mounts
   and is browsable without any macFUSE kernel extension installed.
 - Confirm unmount works via the existing `umount` path.

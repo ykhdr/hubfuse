@@ -35,7 +35,8 @@ nothing to approve and no reboot. The alternative, macFUSE, installs a kernel
 extension that requires System Settings approval plus a reboot, and on Apple
 Silicon also forces enabling reduced-security mode. To use FUSE-T set
 `mount-tool "fuse-t"` in the agent config (see [Configuration](#configuration));
-FUSE-T is macOS-only.
+FUSE-T is macOS-only. Note: FUSE-T is free for personal use; commercial use
+requires a license (see fuse-t.org).
 
 **Linux** — install the distribution's `sshfs` package (which uses `fusermount`),
 e.g. `apt install sshfs` or `dnf install fuse-sshfs`. The default
