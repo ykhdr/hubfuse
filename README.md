@@ -15,7 +15,29 @@ All communication is secured with mTLS. Devices pair using short-lived invite co
 
 - Go 1.25+
 - `protoc` with `protoc-gen-go` and `protoc-gen-go-grpc` (for proto regeneration only)
-- `sshfs` installed on agent machines
+- `sshfs` installed on agent machines (see [Installing the mount tool](#installing-the-mount-tool))
+
+### Installing the mount tool
+
+Agents mount remote shares with `sshfs`. The FUSE implementation behind it
+depends on the platform.
+
+**macOS** — FUSE-T is the recommended, kext-free path:
+
+```bash
+brew install --cask fuse-t fuse-t-sshfs
+```
+
+FUSE-T runs a local NFS server instead of a kernel extension, so there is
+nothing to approve and no reboot. The alternative, macFUSE, installs a kernel
+extension that requires System Settings approval plus a reboot, and on Apple
+Silicon also forces enabling reduced-security mode. To use FUSE-T set
+`mount-tool "fuse-t"` in the agent config (see [Configuration](#configuration));
+FUSE-T is macOS-only.
+
+**Linux** — install the distribution's `sshfs` package (which uses `fusermount`),
+e.g. `apt install sshfs` or `dnf install fuse-sshfs`. The default
+`mount-tool "sshfs"` applies; `"fuse-t"` is not available on Linux.
 
 ## Quick start
 
@@ -65,6 +87,10 @@ nickname "my-laptop"
 hub "192.168.1.10:9090"
 ssh-port 2222
 
+agent {
+    mount-tool "sshfs"   // "sshfs" (default) | "fuse-t"
+}
+
 shares {
     share "/home/user/projects" alias="projects" permissions="rw" {
         allowed-devices "all"
@@ -77,6 +103,18 @@ mounts {
 ```
 
 Changes to `config.kdl` are hot-reloaded — no restart needed.
+
+### Mount tool
+
+`agent { mount-tool "..." }` selects the mount backend for this device
+(device-global; it applies to every mount). Allowed values:
+
+- `"sshfs"` (default) — the distribution `sshfs` (macFUSE on macOS, `fusermount`
+  on Linux).
+- `"fuse-t"` — macOS only; requires `fuse-t-sshfs`
+  (`brew install --cask fuse-t fuse-t-sshfs`). The kext-free path described in
+  [Installing the mount tool](#installing-the-mount-tool). Selecting `"fuse-t"`
+  on a non-macOS host is a configuration error.
 
 ### Share access control
 

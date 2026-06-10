@@ -220,10 +220,10 @@ operands last.
 - Modify: `CLAUDE.md`
 - Modify: config example / reference (whichever file documents the KDL config; e.g. README config section or a sample `.kdl`)
 
-- [ ] README macOS install section: recommend FUSE-T as the kext-free path (`brew install --cask fuse-t fuse-t-sshfs`), contrast with macFUSE (kext approval + reboot, reduced-security on Apple Silicon); note FUSE-T is macOS-only and Linux uses distro `sshfs` + `fusermount`
-- [ ] document `agent { mount-tool "..." }`: values `"sshfs"` (default) / `"fuse-t"`, device-global, `"fuse-t"` requires macOS + `fuse-t-sshfs`
-- [ ] CLAUDE.md: one line under the mounter description noting the mount tool is selectable via `mount-tool`, pointing to the `mountBackends` table
-- [ ] (docs-only task — no new code tests; verify examples are valid KDL by loading one in an existing config test if convenient)
+- [x] README macOS install section: recommend FUSE-T as the kext-free path (`brew install --cask fuse-t fuse-t-sshfs`), contrast with macFUSE (kext approval + reboot, reduced-security on Apple Silicon); note FUSE-T is macOS-only and Linux uses distro `sshfs` + `fusermount`
+- [x] document `agent { mount-tool "..." }`: values `"sshfs"` (default) / `"fuse-t"`, device-global, `"fuse-t"` requires macOS + `fuse-t-sshfs`
+- [x] CLAUDE.md: one line under the mounter description noting the mount tool is selectable via `mount-tool`, pointing to the `mountBackends` table
+- [x] (docs-only task — no new code tests; verify examples are valid KDL by loading one in an existing config test if convenient) — the documented `agent { mount-tool "..." }` KDL form is already exercised by existing config tests (`TestLoad_MountTool_FuseT`, `TestLoad_MountTool_Sshfs`, `TestLoad_MountTool_DefaultsToSshfs`, `TestSaveLoad_MountToolRoundTrip`); no new test needed
 
 ### Task 6: Verify acceptance criteria
 
