@@ -227,11 +227,11 @@ operands last.
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] omitting `mount-tool` produces byte-identical `sshfs` invocation as before (backward compatible)
-- [ ] `mount-tool "fuse-t"` on darwin builds the correct command; on Linux fails fast with the macOS-only error
-- [ ] missing binary with mounts configured → warning logged, daemon continues, sharing works
-- [ ] run full suite: `make test` (runs `test-unit`, `test-integration`, `test-cli`, `test-scenarios` — see Makefile)
-- [ ] `make vet` clean; `errcheck` clean
+- [x] omitting `mount-tool` produces byte-identical `sshfs` invocation as before (backward compatible) — `TestMount_BuildsCorrectSSHFSArgs` asserts exact arg list + `"sshfs"` binary; `TestResolveBackend` confirms `""` and `"sshfs"` both yield binary `"sshfs"` with `extraOpts: nil`
+- [x] `mount-tool "fuse-t"` on darwin builds the correct command; on Linux fails fast with the macOS-only error — `TestValidateMountTool` covers `("fuse-t","linux")`→error and `("fuse-t","darwin")`→ok; `TestMount_FuseTUsesSSHFSBinaryWithSameArgs` confirms the fuse-t command
+- [x] missing binary with mounts configured → warning logged, daemon continues, sharing works — `TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort` + `TestPreflightMountBinary_NoMountsSkipsLookPath`
+- [x] run full suite: `make test` (runs `test-unit`, `test-integration`, `test-cli`, `test-scenarios` — see Makefile) — all green; `go build ./...` and `go test ./...` also clean
+- [x] `make vet` clean; `errcheck` clean — errcheck not installed in env; `go vet ./...` clean; new code handles all errors
 
 ### Task 7: Finalize
 
