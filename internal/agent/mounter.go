@@ -107,9 +107,10 @@ type Mount struct {
 
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
-	keyPath         string // path to agent's SSH private key
-	knownDevicesDir string // dir containing paired-peer public keys (<device_id>.pub)
-	knownHostsDir   string // dir where per-mount SSH known_hosts files are written
+	keyPath         string       // path to agent's SSH private key
+	knownDevicesDir string       // dir containing paired-peer public keys (<device_id>.pub)
+	knownHostsDir   string       // dir where per-mount SSH known_hosts files are written
+	backend         mountBackend // selected mount tool profile (binary + extra opts)
 	logger          *slog.Logger
 	activeMounts    map[mountKey]*Mount
 	mu              sync.Mutex
@@ -120,12 +121,15 @@ type Mounter struct {
 	unmount func(path string) error
 }
 
-// NewMounter creates a new Mounter.
-func NewMounter(keyPath, knownDevicesDir, knownHostsDir string, logger *slog.Logger) *Mounter {
+// NewMounter creates a new Mounter. mountTool selects the mount backend
+// ("sshfs" default, or "fuse-t"); an empty or unknown value falls back to the
+// "sshfs" profile (see resolveBackend).
+func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logger *slog.Logger) *Mounter {
 	return &Mounter{
 		keyPath:         keyPath,
 		knownDevicesDir: knownDevicesDir,
 		knownHostsDir:   knownHostsDir,
+		backend:         resolveBackend(mountTool),
 		logger:          logger,
 		activeMounts:    make(map[mountKey]*Mount),
 		execCommand:     exec.CommandContext,
@@ -161,17 +165,11 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	}
 
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
-	cmd := m.execCommand(ctx, "sshfs",
-		"-p", fmt.Sprintf("%d", sshPort),
-		"-o", fmt.Sprintf("IdentityFile=%s", m.keyPath),
-		"-o", "StrictHostKeyChecking=yes",
-		"-o", fmt.Sprintf("UserKnownHostsFile=%s", knownHostsPath),
-		fmt.Sprintf("hubfuse@%s:%s", deviceIP, mc.Share),
-		mc.To,
-	)
+	args := buildMountArgs(m.backend, sshPort, m.keyPath, knownHostsPath, deviceIP, mc.Share, mc.To)
+	cmd := m.execCommand(ctx, m.backend.binary, args...)
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start sshfs for %q from device %q: %w", mc.Share, mc.Device, err)
+		return fmt.Errorf("start %s for %q from device %q: %w", m.backend.binary, mc.Share, mc.Device, err)
 	}
 
 	m.activeMounts[key] = &Mount{

@@ -28,8 +28,15 @@ func discardLogger() *slog.Logger {
 // unmountFn is called when Unmount is invoked; if nil, a no-op is used.
 func newTestMounter(t *testing.T, knownDevicesDir, keyPath string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
 	t.Helper()
+	return newTestMounterWithTool(t, knownDevicesDir, keyPath, "", capturedArgs, unmountFn)
+}
+
+// newTestMounterWithTool is like newTestMounter but lets a test select the
+// mount tool (e.g. "fuse-t") so the resolved backend can be exercised.
+func newTestMounterWithTool(t *testing.T, knownDevicesDir, keyPath, mountTool string, capturedArgs *[]string, unmountFn func(string) error) *Mounter {
+	t.Helper()
 	knownHostsDir := filepath.Join(filepath.Dir(knownDevicesDir), common.KnownHostsDir)
-	m := NewMounter(keyPath, knownDevicesDir, knownHostsDir, discardLogger())
+	m := NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool, discardLogger())
 
 	m.execCommand = func(_ context.Context, name string, args ...string) *exec.Cmd {
 		if capturedArgs != nil {
@@ -187,6 +194,43 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		"[192.168.1.10]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n",
 		string(data),
 		"known_hosts contents")
+}
+
+func TestMount_FuseTUsesSSHFSBinaryWithSameArgs(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var capturedArgs []string
+	m := newTestMounterWithTool(t, knownDir, keyPath, "fuse-t", &capturedArgs, nil)
+
+	mc := agentconfig.MountConfig{
+		Device: "device-a",
+		Share:  "documents",
+		To:     mountTo,
+	}
+
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "192.168.1.10", 2222), "Mount()")
+
+	knownHostsPath := filepath.Join(dir, common.KnownHostsDir, "device-a")
+	// fuse-t ships a drop-in sshfs binary, so the invocation is byte-identical
+	// to the default sshfs backend (extraOpts is empty for both today).
+	want := []string{
+		"sshfs",
+		"-p", "2222",
+		"-o", "IdentityFile=" + keyPath,
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "UserKnownHostsFile=" + knownHostsPath,
+		"hubfuse@192.168.1.10:documents",
+		mountTo,
+	}
+
+	require.NotEmpty(t, capturedArgs, "captured args")
+	assert.Equal(t, "sshfs", capturedArgs[0], "fuse-t backend binary")
+	assert.Equal(t, want, capturedArgs, "fuse-t mount args")
 }
 
 func TestMount_FailsWhenPeerPublicKeyMissing(t *testing.T) {

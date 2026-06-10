@@ -192,13 +192,13 @@ operands last.
 - Modify: `internal/agent/mounter_test.go`
 - Modify: `internal/agent/daemon.go`
 
-- [ ] add a `backend mountBackend` field to the `Mounter` struct
-- [ ] change `NewMounter` to accept a `mountTool string` parameter and set `backend: resolveBackend(mountTool)`
-- [ ] refactor `Mount()` (lines 90–97) to call `buildMountArgs(...)` and `m.execCommand(ctx, m.backend.binary, args...)` — behavior for the default `sshfs` tool must be byte-identical to today
-- [ ] update the `NewMounter(...)` call in `daemon.go` (~line 83) to pass `cfg.Agent.MountTool`
-- [ ] update the two other `NewMounter` callers for the new signature: `internal/agent/mounter_test.go:32` and `tests/integration/prune_test.go:90` (the latter lives outside `internal/agent/...`, so `go test ./internal/agent/...` will NOT catch it — `go build ./...` and the integration suite will)
-- [ ] extend the existing `Mount` test to assert the selected `binary` and full arg list flow through `SetExecCommandForTests` (line 270); add a `"fuse-t"` case confirming the captured binary
-- [ ] run tests: `go build ./...`, `go test ./internal/agent/...`, and `go test ./tests/integration/...` — must pass before next task
+- [x] add a `backend mountBackend` field to the `Mounter` struct
+- [x] change `NewMounter` to accept a `mountTool string` parameter and set `backend: resolveBackend(mountTool)`
+- [x] refactor `Mount()` (lines 90–97) to call `buildMountArgs(...)` and `m.execCommand(ctx, m.backend.binary, args...)` — behavior for the default `sshfs` tool must be byte-identical to today
+- [x] update the `NewMounter(...)` call in `daemon.go` (~line 83) to pass `cfg.Agent.MountTool`
+- [x] update the two other `NewMounter` callers for the new signature: `internal/agent/mounter_test.go:32` and `tests/integration/prune_test.go:90` (the latter lives outside `internal/agent/...`, so `go test ./internal/agent/...` will NOT catch it — `go build ./...` and the integration suite will)
+- [x] extend the existing `Mount` test to assert the selected `binary` and full arg list flow through `SetExecCommandForTests` (line 270); add a `"fuse-t"` case confirming the captured binary
+- [x] run tests: `go build ./...`, `go test ./internal/agent/...`, and `go test ./tests/integration/...` — must pass before next task
 
 ### Task 4: Daemon startup platform gating + binary pre-flight
 

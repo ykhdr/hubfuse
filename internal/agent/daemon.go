@@ -80,7 +80,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 
 	knownDevicesDir := filepath.Join(dir, common.KnownDevicesDir)
 	knownHostsDir := filepath.Join(dir, common.KnownHostsDir)
-	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, logger)
+	mounter := NewMounter(keyPath, knownDevicesDir, knownHostsDir, cfg.Agent.MountTool, logger)
 
 	sshPort := cfg.Agent.SSHPort
 
