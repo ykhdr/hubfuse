@@ -234,8 +234,8 @@ operands last.
 
 ### Task 7: Finalize
 
-- [ ] move this plan to `docs/plans/completed/`
-- [ ] commit + push on the feature branch
+- [x] move this plan to `docs/plans/completed/`
+- [x] commit + push on the feature branch
 
 ## Post-Completion
 
