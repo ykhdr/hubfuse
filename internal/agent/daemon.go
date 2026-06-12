@@ -223,6 +223,22 @@ func (d *Daemon) NicknameForDeviceID(id string) (string, bool) {
 	return "", false
 }
 
+// guardConfiguredTargets restricts every configured mount target to guardMode
+// so that targets which are not yet mounted (offline peer, unpaired device) do
+// not silently absorb local writes. Called early in Run, before registerAndSubscribe,
+// to cover the startup window. (#49 guard-target)
+func (d *Daemon) guardConfiguredTargets() {
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+
+	for _, mc := range cfg.Mounts {
+		if err := d.mounter.guardTarget(mc.To); err != nil {
+			d.logger.Warn("guard configured mount target", "to", mc.To, "error", err)
+		}
+	}
+}
+
 // Run is the main daemon loop. It connects to the hub, starts all subsystems,
 // and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
@@ -238,6 +254,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// was restarted after previous pairings). Keep this after startSSH so the
 	// running SSH service has the persisted authorized keys loaded immediately.
 	d.reloadSSHAllowedKeys()
+
+	// Guard all configured mount targets before connecting to the hub so that
+	// any target not yet mounted (offline peer, unpaired device) is restricted
+	// immediately. (#49 guard-target)
+	d.guardConfiguredTargets()
 
 	if err := d.registerAndSubscribe(ctx); err != nil {
 		return err
