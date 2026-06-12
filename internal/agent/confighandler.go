@@ -39,6 +39,16 @@ func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 				"error", err,
 			)
 		}
+		// Restore the target to a normal mode now that it has been removed from
+		// config — a 0o500 dir lingering after mount remove would surprise the
+		// user. Run outside the error check so a failed unmount does not skip
+		// the perm restore. (#49 guard-target)
+		if err := d.mounter.unguardTarget(mc.To); err != nil {
+			d.logger.Warn("restore mount target perms after config removal",
+				"to", mc.To,
+				"error", err,
+			)
+		}
 	}
 
 	d.mu.Lock()
@@ -103,6 +113,11 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 			"device", mc.Device,
 			"share", mc.Share,
 		)
+		// Guard the target so it cannot accept stray local writes while the
+		// device is offline. (#49 guard-target)
+		if err := d.mounter.guardTarget(mc.To); err != nil {
+			d.logger.Warn("guard mount target (device offline)", "to", mc.To, "error", err)
+		}
 		return
 	}
 
@@ -111,6 +126,11 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 			"device", mc.Device,
 			"share", mc.Share,
 		)
+		// Guard the target so it cannot accept stray local writes while the
+		// device is unpaired. (#49 guard-target)
+		if err := d.mounter.guardTarget(mc.To); err != nil {
+			d.logger.Warn("guard mount target (device unpaired)", "to", mc.To, "error", err)
+		}
 		return
 	}
 

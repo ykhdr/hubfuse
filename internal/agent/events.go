@@ -192,6 +192,27 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 	d.mu.RUnlock()
 
 	if !online {
+		// Peer is offline — the PairingCompletedEvent does not carry a nickname,
+		// so we cannot look up a specific mount config. Guard all configured mount
+		// targets conservatively: guardTarget is idempotent and cheap, and at least
+		// one of them may belong to this newly-paired peer. The startup sweep and
+		// tryMount also cover this gap. Symmetric with tryMount's not-mounted branch.
+		// (#49 guard-target)
+		d.mu.RLock()
+		cfg := d.config
+		d.mu.RUnlock()
+		for _, mc := range cfg.Mounts {
+			// Never chmod a target that is currently mounted: guardTarget would
+			// hit the live FUSE mount root, not the underlying dir. A cheap
+			// activeMounts lookup (no syscall) avoids that. The underlying dir
+			// stays restricted while the mount is live anyway. (#49 guard-target)
+			if d.mounter.IsActive(mc.Device, mc.Share) {
+				continue
+			}
+			if err := d.mounter.guardTarget(mc.To); err != nil {
+				d.logger.Warn("guard mount target (peer offline after pairing)", "to", mc.To, "error", err)
+			}
+		}
 		return
 	}
 

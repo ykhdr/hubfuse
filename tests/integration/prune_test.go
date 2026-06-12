@@ -94,9 +94,16 @@ func TestIntegration_PruneDeviceBroadcastsRemovalAndUnmount(t *testing.T) {
 	// The exec stub ("true") never creates a real mountpoint, so stub the check
 	// to return immediately without touching the filesystem.
 	mounter.SetMountpointCheckForTests(func(string) (bool, error) { return true, nil })
-	unmounted := make(chan struct{})
-	mounter.SetUnmountForTests(func(string) error {
-		close(unmounted)
+	// Buffered size 1: the send from the unmount seam does not need a receiver
+	// ready — the value is buffered and read by the select below. If the reap
+	// path triggers a second call the default branch silently discards it
+	// (no double-close panic possible). (#50 bounded/force seam signature update)
+	unmounted := make(chan struct{}, 1)
+	mounter.SetUnmountForTests(func(_ context.Context, _ string, _ bool) error {
+		select {
+		case unmounted <- struct{}{}:
+		default:
+		}
 		return nil
 	})
 

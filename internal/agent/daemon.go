@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -246,6 +247,22 @@ func (d *Daemon) NicknameForDeviceID(id string) (string, bool) {
 	return "", false
 }
 
+// guardConfiguredTargets restricts every configured mount target to guardMode
+// so that targets which are not yet mounted (offline peer, unpaired device) do
+// not silently absorb local writes. Called early in Run, before registerAndSubscribe,
+// to cover the startup window. (#49 guard-target)
+func (d *Daemon) guardConfiguredTargets() {
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+
+	for _, mc := range cfg.Mounts {
+		if err := d.mounter.guardTarget(mc.To); err != nil {
+			d.logger.Warn("guard configured mount target", "to", mc.To, "error", err)
+		}
+	}
+}
+
 // rememberNickname records the device_id → nickname mapping in the in-memory
 // cache under the lock, then flushes the whole map to disk outside the lock
 // (atomic temp+rename).  It is a no-op when nickname is empty or unchanged.
@@ -326,6 +343,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// was restarted after previous pairings). Keep this after startSSH so the
 	// running SSH service has the persisted authorized keys loaded immediately.
 	d.reloadSSHAllowedKeys()
+
+	// Guard all configured mount targets before connecting to the hub so that
+	// any target not yet mounted (offline peer, unpaired device) is restricted
+	// immediately. (#49 guard-target)
+	d.guardConfiguredTargets()
 
 	if err := d.registerAndSubscribe(ctx); err != nil {
 		return err
@@ -433,10 +455,14 @@ func (d *Daemon) runServices(ctx context.Context) error {
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
 // server, stops the config watcher, and closes the hub client.
+// UnmountAllForce runs under a 5s timeout so a wedged mount cannot prevent
+// clean shutdown — comfortably under the daemonize 10s SIGKILL deadline. (#50 bounded/force)
 func (d *Daemon) Shutdown() error {
 	var errs []string
 
-	if err := d.mounter.UnmountAll(); err != nil {
+	uctx, ucancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ucancel()
+	if err := d.mounter.UnmountAllForce(uctx); err != nil {
 		errs = append(errs, fmt.Sprintf("unmount all: %v", err))
 	}
 
