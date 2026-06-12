@@ -82,7 +82,7 @@ rewrite disproportionate to the bug.
 - Modify: `internal/agent/sftphandler.go`
 - Modify: `internal/agent/sftphandler_test.go`
 
-- [ ] write failing tests (TDD red):
+- [x] write failing tests (TDD red):
   - `Filelist` `Lstat` of nonexistent leaf in an allowed share →
     `sftp.ErrSSHFxNoSuchFile`
   - `Filelist` `Stat` of nonexistent leaf → `sftp.ErrSSHFxNoSuchFile`
@@ -97,30 +97,31 @@ rewrite disproportionate to the bug.
     to an **existing** outside file still `ErrSSHFxPermissionDenied`; unknown
     alias still denied (already covered, keep passing); RO-share write still
     denied (already covered, keep passing)
-- [ ] run `go test ./internal/agent/ -run TestACLHandlers` — new tests must
+- [x] run `go test ./internal/agent/ -run TestACLHandlers` — new tests must
   fail with `ErrSSHFxPermissionDenied` (red)
-- [ ] add `resolveErr(err error) error` helper next to `denied()` in
+- [x] add `resolveErr(err error) error` helper next to `denied()` in
   `sftphandler.go`: `errors.Is(err, fs.ErrNotExist)` →
   `sftp.ErrSSHFxNoSuchFile`, otherwise `denied()`; document why alias/ACL
-  failures must stay denied
-- [ ] replace `return "", denied()` with `return "", resolveErr(err)` at the
+  failures must stay denied (requires new imports `errors` and `io/fs` in
+  `sftphandler.go` — currently only `io` is imported)
+- [x] replace `return "", denied()` with `return "", resolveErr(err)` at the
   `containedReal` branch of `resolveReadReal` and the `containedWritePath`
   branch of `resolveWriteReal` (only these two call sites)
-- [ ] run `go test ./internal/agent/ -run TestACLHandlers` — all green
+- [x] run `go test ./internal/agent/ -run TestACLHandlers` — all green
 
 ### Task 2: verify acceptance criteria
 
-- [ ] `make build` passes
-- [ ] `make vet` passes
-- [ ] `make test` (unit + integration) passes
-- [ ] re-read issue #46 symptom list and confirm each maps to a covered code
+- [x] `make build` passes
+- [x] `make vet` passes
+- [x] `make test` (unit + integration) passes
+- [x] re-read issue #46 symptom list and confirm each maps to a covered code
   path (create new file, mkdir, in-place writes unaffected, ACL still
   enforced)
 
 ### Task 3: documentation and plan archival
 
-- [ ] no README/CLAUDE.md changes expected (internal bug fix); confirm
-- [ ] move this plan to `docs/plans/completed/`
+- [x] no README/CLAUDE.md changes expected (internal bug fix); confirmed
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

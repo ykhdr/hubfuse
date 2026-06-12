@@ -125,3 +125,96 @@ func TestACLHandlers_Filecmd_SymlinkAlwaysDenied(t *testing.T) {
 	err := h.Filecmd(req)
 	assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
 }
+
+// TestACLHandlers_Filelist_Lstat_NonexistentLeaf checks that stat of a path
+// that does not exist inside an allowed share returns SSH_FX_NO_SUCH_FILE, not
+// PERMISSION_DENIED. sshfs relies on this to cache negative dentries before
+// create/mkdir (issue #46).
+func TestACLHandlers_Filelist_Lstat_NonexistentLeaf(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.Filelist(newRequest("Lstat", "/docs/nonexistent.txt"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Filelist_Stat_NonexistentLeaf is the Stat variant of the
+// above (sshfs uses both Lstat and Stat during kernel lookups).
+func TestACLHandlers_Filelist_Stat_NonexistentLeaf(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.Filelist(newRequest("Stat", "/docs/nonexistent.txt"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Filelist_Stat_NonexistentIntermediateDir verifies that a path
+// with a nonexistent intermediate directory also returns SSH_FX_NO_SUCH_FILE.
+// filepath.EvalSymlinks fails at the first missing component, so both leaf and
+// intermediate missing cases go through the same code path.
+func TestACLHandlers_Filelist_Stat_NonexistentIntermediateDir(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.Filelist(newRequest("Stat", "/docs/sub/x"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Fileread_NonexistentFile checks that reading a file that does
+// not exist inside an allowed share returns SSH_FX_NO_SUCH_FILE (issue #46).
+func TestACLHandlers_Fileread_NonexistentFile(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.Fileread(newRequest("Get", "/docs/missing.txt"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Filecmd_Mkdir_NonexistentParent verifies that mkdir under a
+// nonexistent parent directory returns SSH_FX_NO_SUCH_FILE so the client knows
+// to create the parent first rather than receiving PERMISSION_DENIED (issue #46).
+func TestACLHandlers_Filecmd_Mkdir_NonexistentParent(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: false}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	err := h.Filecmd(newRequest("Mkdir", "/docs/missing/newdir"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Filelist_Stat_DanglingSymlink documents the accepted trade-off:
+// a dangling symlink (symlink whose target does not exist) reports
+// SSH_FX_NO_SUCH_FILE. This is POSIX-honest — POSIX stat(2) of a dangling
+// symlink returns ENOENT — and safe because peers cannot plant symlinks
+// (Filecmd rejects the Symlink method unconditionally).
+func TestACLHandlers_Filelist_Stat_DanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	// Create a symlink inside the share pointing to a nonexistent target.
+	require.NoError(t, os.Symlink(filepath.Join(dir, "ghost.txt"),
+		filepath.Join(dir, "dangling")))
+
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	// Stat (follows symlinks) of a dangling symlink → ENOENT → SSH_FX_NO_SUCH_FILE.
+	_, err := h.Filelist(newRequest("Stat", "/docs/dangling"))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxNoSuchFile)
+}
+
+// TestACLHandlers_Filelist_Stat_ExistingFile is a regression guard: stat of an
+// existing file in an allowed share must still succeed.
+func TestACLHandlers_Filelist_Stat_ExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hi"), 0o644))
+
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	lister, err := h.Filelist(newRequest("Stat", "/docs/hello.txt"))
+	require.NoError(t, err)
+	require.NotNil(t, lister)
+}
