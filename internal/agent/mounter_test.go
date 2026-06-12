@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1017,4 +1019,364 @@ func TestUnmountDevice_PassesForceTrueToSeam(t *testing.T) {
 
 	require.NoError(t, m.UnmountDevice("device-a"), "UnmountDevice()")
 	assert.True(t, capturedForce.Load(), "UnmountDevice must call unmount with force=true")
+}
+
+// ─── Guard-target (#49) ───────────────────────────────────────────────────────
+
+// captureWarnLogger returns a logger that captures WARN+ output into buf.
+func captureWarnLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// newTestMounterWithLogger is like newTestMounter but uses a caller-supplied logger
+// so tests can assert on logged warnings.
+func newTestMounterWithLogger(t *testing.T, knownDevicesDir, keyPath string, logger *slog.Logger, capturedArgs *[]string, unmountFn func(context.Context, string, bool) error) *Mounter {
+	t.Helper()
+	knownHostsDir := filepath.Join(filepath.Dir(knownDevicesDir), common.KnownHostsDir)
+	m := NewMounter(keyPath, knownDevicesDir, knownHostsDir, "", logger)
+
+	m.execCommand = func(_ context.Context, name string, args ...string) *exec.Cmd {
+		if capturedArgs != nil {
+			*capturedArgs = append([]string{name}, args...)
+		}
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", "exit 0")
+		} else {
+			cmd = exec.Command("true")
+		}
+		return cmd
+	}
+
+	if unmountFn != nil {
+		m.unmount = unmountFn
+	} else {
+		m.unmount = func(_ context.Context, _ string, _ bool) error { return nil }
+	}
+
+	m.checkMountpoint = func(string) (bool, error) { return true, nil }
+	m.mountVerifyTimeout = 500 * time.Millisecond
+	m.mountVerifyInterval = 10 * time.Millisecond
+	return m
+}
+
+// TestGuardTarget_MountRestrictsOnCreation verifies that Mount creates the target
+// and makes it mountable (mountableMode) just before attaching the backend — a
+// real FUSE mount then masks this mode, and unmount re-applies guardMode (covered
+// by TestGuardTarget_Reguard*). The test mounter never creates a real mount, so
+// the underlying mountableMode is directly observable. fusermount3 (Linux)
+// requires the write bit at mount time, which is why this is not guardMode. (#49)
+func TestGuardTarget_MountRestrictsOnCreation(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
+
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err, "mount target must exist")
+	assert.Equal(t, mountableMode, info.Mode().Perm(), "mount target must be made mountable (owner-writable) for the backend to attach")
+}
+
+// TestGuardTarget_RemountActiveKeyDoesNotChmod verifies that Mount for a key that
+// is already active is rejected as "already mounted" WITHOUT running guardTarget.
+// guardTarget runs only after the already-mounted check, so it can never chmod a
+// path that is currently a live mount of ours. (#49 guard ordering)
+func TestGuardTarget_RemountActiveKeyDoesNotChmod(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
+
+	// Simulate a live FUSE mount root exposing a distinct mode that a re-mount
+	// must not clobber.
+	const sentinel os.FileMode = 0o755
+	require.NoError(t, os.Chmod(mountTo, sentinel))
+
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already mounted")
+
+	info, statErr := os.Stat(mountTo)
+	require.NoError(t, statErr)
+	assert.Equal(t, sentinel, info.Mode().Perm(), "re-mount of an active key must not chmod the (live) mount target")
+}
+
+// TestGuardTarget_FailedMountLeavesTargetRestricted verifies that when Mount
+// fails the verify loop (mountpoint never appears), the target dir is at
+// guardMode — not a writable local dir. This is the #49 core regression test.
+// (#49 test 2)
+func TestGuardTarget_FailedMountLeavesTargetRestricted(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	// checkMountpoint always returns false → verify loop times out.
+	m.checkMountpoint = func(string) (bool, error) { return false, nil }
+	m.mountVerifyTimeout = 30 * time.Millisecond
+	m.mountVerifyInterval = 5 * time.Millisecond
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "Mount() must fail when mountpoint never appears")
+	assert.False(t, m.IsActive("device-a", "docs"), "mount must not be recorded on failure")
+
+	info, statErr := os.Stat(mountTo)
+	require.NoError(t, statErr, "target dir must still exist after failed mount")
+	assert.Equal(t, guardMode, info.Mode().Perm(), "target must be restricted to guardMode after failed mount (#49 core)")
+
+	// Bonus: touch into the dir must be denied for non-root users.
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — mode bits are not enforced, skipping write-denied assertion")
+	}
+	f, touchErr := os.Create(filepath.Join(mountTo, "canary.txt"))
+	if f != nil {
+		_ = f.Close()
+	}
+	assert.Error(t, touchErr, "write into a 0o500 dir must be denied (EACCES)")
+}
+
+// TestGuardTarget_NonEmptyTargetRefused verifies that Mount refuses to mount
+// over a non-empty local directory, with an actionable WARN naming the path.
+// The unmount/exec seam must never be invoked. (#49 test 3)
+func TestGuardTarget_NonEmptyTargetRefused(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	// Pre-create the target with a file inside (chmod to writable first so we
+	// can plant the file, then we leave it writable — the guard logic must detect
+	// the file and refuse regardless of dir mode).
+	require.NoError(t, os.MkdirAll(mountTo, 0o755))
+	plantedFile := filepath.Join(mountTo, "planted.txt")
+	require.NoError(t, os.WriteFile(plantedFile, []byte("local content"), 0644))
+
+	// Restore the dir to writable before test cleanup so t.TempDir can remove it.
+	t.Cleanup(func() {
+		_ = os.Chmod(mountTo, 0o755)
+	})
+
+	var logBuf bytes.Buffer
+	logger := captureWarnLogger(&logBuf)
+
+	var execCalled atomic.Bool
+	m := newTestMounterWithLogger(t, knownDir, keyPath, logger, nil, nil)
+	m.execCommand = func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalled.Store(true)
+		return exec.Command("true")
+	}
+	// checkMountpoint returns false so the dir is NOT seen as a mountpoint.
+	m.checkMountpoint = func(string) (bool, error) { return false, nil }
+	m.mountVerifyTimeout = 30 * time.Millisecond
+	m.mountVerifyInterval = 5 * time.Millisecond
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "Mount() must refuse to mount over a non-empty target")
+
+	// The error message should mention the local content.
+	assert.Contains(t, err.Error(), "local file", "error must mention local files")
+
+	// The WARN must name the path.
+	logOutput := logBuf.String()
+	assert.True(t, strings.Contains(logOutput, mountTo), "WARN must name the target path")
+
+	// The exec seam must never be invoked — no sshfs process was started.
+	assert.False(t, execCalled.Load(), "exec seam must not be invoked when refusing non-empty target")
+
+	// The planted file must be untouched.
+	data, readErr := os.ReadFile(plantedFile)
+	require.NoError(t, readErr, "planted file must still exist")
+	assert.Equal(t, "local content", string(data), "planted file must be untouched")
+}
+
+// TestGuardTarget_EmptyTargetProceeds verifies that Mount accepts an empty
+// pre-existing target directory (no non-empty refusal). (#49 test 4)
+func TestGuardTarget_EmptyTargetProceeds(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	require.NoError(t, os.MkdirAll(mountTo, 0o755))
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount() must accept an empty target dir")
+	assert.True(t, m.IsActive("device-a", "docs"), "mount must be active after empty-target Mount")
+}
+
+// TestGuardTarget_ReguardAfterSuccessfulUnmount verifies that after a clean
+// Unmount the target dir is re-restricted to guardMode. (#49 test 5)
+func TestGuardTarget_ReguardAfterSuccessfulUnmount(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
+	require.NoError(t, m.Unmount("device-a", "docs"))
+
+	assert.False(t, m.IsActive("device-a", "docs"), "mount must be inactive after Unmount")
+
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err, "target must still exist after Unmount")
+	assert.Equal(t, guardMode, info.Mode().Perm(), "target must be re-restricted to guardMode after unmount (#49 test 5)")
+}
+
+// TestGuardTarget_ReguardAfterReap verifies that after a reap (unmount cmd
+// fails but the mount is gone), the target is re-restricted to guardMode.
+// (#49 test 6)
+func TestGuardTarget_ReguardAfterReap(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	unmountFn := func(_ context.Context, _ string, _ bool) error {
+		return errors.New("not in mtab")
+	}
+	m := newTestMounter(t, knownDir, keyPath, nil, unmountFn)
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
+
+	// Switch checkMountpoint to false → triggers the reap path.
+	m.checkMountpoint = func(string) (bool, error) { return false, nil }
+
+	require.NoError(t, m.Unmount("device-a", "docs"), "reap path must return nil")
+	assert.False(t, m.IsActive("device-a", "docs"), "entry must be reaped")
+
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err, "target must still exist after reap")
+	assert.Equal(t, guardMode, info.Mode().Perm(), "target must be re-restricted to guardMode after reap (#49 test 6)")
+}
+
+// TestGuardTarget_ShutdownDoesNotReguard verifies that UnmountAllForce (shutdown)
+// does NOT re-guard the target (reguard=false). (#49 test 7)
+func TestGuardTarget_ShutdownDoesNotReguard(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
+
+	// Chmod the target to a sentinel mode (0o700) to detect any re-guard.
+	require.NoError(t, os.Chmod(mountTo, 0o700), "set sentinel mode")
+
+	ctx := context.Background()
+	require.NoError(t, m.UnmountAllForce(ctx))
+
+	assert.False(t, m.IsActive("device-a", "docs"), "entry must be gone after UnmountAllForce")
+
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err, "target must still exist")
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "shutdown must NOT re-guard (sentinel mode unchanged, reguard=false)")
+}
+
+// TestTargetHasLocalContents_Table is a unit test covering the four cases
+// described in test 11 of the plan. (#49 test 11)
+func TestTargetHasLocalContents_Table(t *testing.T) {
+	dir := t.TempDir()
+	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
+
+	t.Run("absent dir returns 0", func(t *testing.T) {
+		absent := filepath.Join(dir, "nonexistent")
+		count, err := m.targetHasLocalContents(absent)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count)
+	})
+
+	t.Run("empty dir returns 0", func(t *testing.T) {
+		empty := filepath.Join(dir, "empty")
+		require.NoError(t, os.MkdirAll(empty, 0o755))
+		count, err := m.targetHasLocalContents(empty)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count)
+	})
+
+	t.Run("dir with two files returns 2", func(t *testing.T) {
+		withFiles := filepath.Join(dir, "nonempty")
+		require.NoError(t, os.MkdirAll(withFiles, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(withFiles, "x.txt"), []byte("hi"), 0644))
+		require.NoError(t, os.WriteFile(filepath.Join(withFiles, "y.txt"), []byte("yo"), 0644))
+		count, err := m.targetHasLocalContents(withFiles)
+		require.NoError(t, err)
+		assert.Equal(t, 2, count)
+	})
+
+	// Note: the plan mentions "checkMountpoint says is a mountpoint → (false, nil)"
+	// but per the final plan-review fix (item 1), targetHasLocalContents does NOT
+	// call checkMountpoint. Enumerating a pre-existing foreign mountpoint and
+	// refusing to mount over it is the correct, desired behavior. So we do not add
+	// a mountpoint sub-case here.
+}
+
+// TestGuardTarget_StubNoOp verifies that guardTarget and targetHasLocalContents
+// are no-ops when the Mounter's stub field is true. (#49 test — stub no-op)
+func TestGuardTarget_StubNoOp(t *testing.T) {
+	dir := t.TempDir()
+	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
+	m.stub = true // simulate HUBFUSE_STUB_MOUNT_DIR
+
+	target := filepath.Join(dir, "stubdir")
+	require.NoError(t, os.MkdirAll(target, 0o755))
+
+	// guardTarget must leave the mode unchanged.
+	before, err := os.Stat(target)
+	require.NoError(t, err)
+	require.NoError(t, m.guardTarget(target), "guardTarget must not error under stub")
+
+	after, err := os.Stat(target)
+	require.NoError(t, err)
+	assert.Equal(t, before.Mode().Perm(), after.Mode().Perm(), "guardTarget must be a no-op under stub")
+
+	// targetHasLocalContents must return 0 even when the dir has a file.
+	require.NoError(t, os.WriteFile(filepath.Join(target, "x.txt"), []byte("hi"), 0644))
+	count, err := m.targetHasLocalContents(target)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "targetHasLocalContents must return 0 under stub")
 }

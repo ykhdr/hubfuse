@@ -184,6 +184,23 @@ type Mount struct {
 	cmd       *exec.Cmd
 }
 
+// guardMode is the restricted mode applied to an unmounted mount target:
+// r-x for owner, nothing for group/other. The cleared write bit blocks entry
+// creation/deletion (so stray local writes fail with EACCES); the set execute
+// bit still lets the agent traverse the path. A live FUSE mount masks this mode
+// while active, and it is re-applied on unmount/reap.
+const guardMode os.FileMode = 0o500
+
+// mountableMode is applied to the mount point immediately before invoking the
+// mount backend. fusermount3 (Linux) refuses to mount onto a directory the user
+// cannot write to — and guardMode (0o500) clears the write bit — so the point is
+// briefly made owner-writable for the mount to attach. A successful mount masks
+// this mode; every failure path (and a later unmount) re-applies guardMode, so
+// the target is only this permissive during the bounded mount-establishment
+// window. (macFUSE/FUSE-T tolerate 0o500, but Linux fusermount3 does not, so we
+// chmod unconditionally for cross-platform correctness.)
+const mountableMode os.FileMode = 0o700
+
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
 	keyPath         string       // path to agent's SSH private key
@@ -193,6 +210,14 @@ type Mounter struct {
 	logger          *slog.Logger
 	activeMounts    map[mountKey]*Mount
 	mu              sync.Mutex
+
+	// stub is true when HUBFUSE_STUB_MOUNT_DIR is set (scenario-test harness).
+	// guardTarget/unguardTarget/targetHasLocalContents are no-ops under the stub:
+	// stub-sshfs never creates a real FUSE mount to mask the 0o500 mode, so a
+	// lingering restricted dir would be pointless and confuse scenario tests.
+	// (Note: stub-sshfs writes to HUBFUSE_STUB_MOUNT_DIR, never through the target
+	// path, so no scenario test writes to the raw target dir.)
+	stub bool
 
 	// execCommand is used to build commands; override in tests.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
@@ -219,8 +244,9 @@ type Mounter struct {
 // verification is bypassed so that scenario tests do not time out waiting for
 // a filesystem that the stub intentionally never creates.
 func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logger *slog.Logger) *Mounter {
+	stubMode := os.Getenv("HUBFUSE_STUB_MOUNT_DIR") != ""
 	check := isMountpoint
-	if os.Getenv("HUBFUSE_STUB_MOUNT_DIR") != "" {
+	if stubMode {
 		// Stub harness: skip real mountpoint verification.
 		check = func(string) (bool, error) { return true, nil }
 	}
@@ -231,6 +257,7 @@ func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logge
 		backend:             resolveBackend(mountTool),
 		logger:              logger,
 		activeMounts:        make(map[mountKey]*Mount),
+		stub:                stubMode,
 		execCommand:         exec.CommandContext,
 		unmount:             unmountPath,
 		checkMountpoint:     check,
@@ -244,11 +271,6 @@ func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logge
 // the peer's public key stored at <knownDevicesDir>/<deviceID>.pub is pinned as
 // the only accepted SSH host key for the connection.
 func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceID, deviceIP string, sshPort int) error {
-	// Create mount point directory if needed.
-	if err := os.MkdirAll(mc.To, 0755); err != nil {
-		return fmt.Errorf("create mount point %q: %w", mc.To, err)
-	}
-
 	key := mountKey{Device: mc.Device, Share: mc.Share}
 
 	m.mu.Lock()
@@ -256,6 +278,30 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 
 	if _, exists := m.activeMounts[key]; exists {
 		return fmt.Errorf("share %q from device %q is already mounted", mc.Share, mc.Device)
+	}
+
+	// Create the mount point directory (if needed) and restrict it immediately so
+	// even the create→mount window is guarded. This runs only AFTER the
+	// already-mounted check above, so we never chmod a path that is currently a
+	// live mount of ours. (#49 guard-target)
+	if err := m.guardTarget(mc.To); err != nil {
+		return fmt.Errorf("guard mount point %q: %w", mc.To, err)
+	}
+
+	// Refuse to mount over a non-empty local directory — doing so would silently
+	// shadow the local contents, which is the #49 failure mode in reverse and
+	// risks data loss. (#49 non-empty refusal)
+	entryCount, contentsErr := m.targetHasLocalContents(mc.To)
+	if contentsErr != nil {
+		return fmt.Errorf("check mount target %q for local contents: %w", mc.To, contentsErr)
+	}
+	if entryCount > 0 {
+		m.logger.Warn("refusing to mount over a non-empty local directory — local files would be shadowed",
+			"path", mc.To,
+			"entry_count", entryCount,
+			"remedy", fmt.Sprintf("move or remove the local files in %q, or change the 'to' path in your config, then retry", mc.To),
+		)
+		return fmt.Errorf("mount target %q contains %d local file(s); move/remove them or choose a different 'to' path", mc.To, entryCount)
 	}
 
 	// Materialise known_hosts under the lock so concurrent Mounts for the same
@@ -266,11 +312,24 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		return err
 	}
 
+	// Make the point writable so the mount backend can attach (fusermount3 on
+	// Linux requires it). The live mount masks this; every failure path below and
+	// a later unmount re-apply guardMode. (#49 guard-target)
+	if err := m.makeMountable(mc.To); err != nil {
+		// Still guarded at guardMode (chmod failed) — safe; just report.
+		return fmt.Errorf("mount %q from device %q: %w", mc.Share, mc.Device, err)
+	}
+
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
 	args := buildMountArgs(m.backend, sshPort, m.keyPath, knownHostsPath, deviceIP, mc.Share, mc.To)
 	cmd := m.execCommand(ctx, m.backend.binary, args...)
 
 	if err := cmd.Start(); err != nil {
+		// The point was made mountable above; re-restrict it so the failed mount
+		// does not leave a writable target. (#49 guard-target)
+		if guardErr := m.guardTarget(mc.To); guardErr != nil {
+			m.logger.Warn("re-guard mount target after start failure", "path", mc.To, "error", guardErr)
+		}
 		return fmt.Errorf("start %s for %q from device %q: %w", m.backend.binary, mc.Share, mc.Device, err)
 	}
 
@@ -285,6 +344,11 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 			// Context cancelled while waiting — kill and reap the backend.
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
+			// Re-restrict the target: the failed mount may have left the dir
+			// traversable; re-guard so stray writes are blocked. (#49 guard-target)
+			if guardErr := m.guardTarget(mc.To); guardErr != nil {
+				m.logger.Warn("re-guard mount target after ctx-cancel", "path", mc.To, "error", guardErr)
+			}
 			return fmt.Errorf("mount %q from device %q at %q: %w", mc.Share, mc.Device, mc.To, ctx.Err())
 		}
 
@@ -300,6 +364,10 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 			// Timed out — kill and reap the backend process.
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
+			// Re-restrict the target after a failed mount. (#49 guard-target)
+			if guardErr := m.guardTarget(mc.To); guardErr != nil {
+				m.logger.Warn("re-guard mount target after verify timeout", "path", mc.To, "error", guardErr)
+			}
 			reason := "mountpoint did not appear"
 			if lastCheckErr != nil {
 				reason = lastCheckErr.Error()
@@ -425,8 +493,16 @@ const unmountOpTimeout = 5 * time.Second
 // returned, so a bounded caller never hangs (#50) yet a still-live mount is never
 // silently dropped.
 //
+// reguard controls whether to re-restrict the target dir to guardMode after the
+// entry is removed (#49 guard-target). Pass reguard=true for all interactive and
+// device-offline paths (the target stays in config and must be re-restricted so
+// stray writes are blocked until the next mount); pass reguard=false only for
+// shutdown (UnmountAllForce), where the process is exiting and the chmod is
+// pointless. reguard failures are logged at WARN and never returned — a re-guard
+// error must not turn a successful unmount into a failure.
+//
 // The caller must hold m.mu.
-func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) error {
+func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard bool) error {
 	mnt, exists := m.activeMounts[key]
 	if !exists {
 		return fmt.Errorf("no active mount for device %q share %q", key.Device, key.Share)
@@ -457,6 +533,11 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) erro
 				"local_path", mnt.LocalPath,
 				"unmount_err", cmdErr,
 			)
+			if reguard {
+				if err := m.guardTarget(mnt.LocalPath); err != nil {
+					m.logger.Warn("re-guard mount target after reap", "path", mnt.LocalPath, "error", err)
+				}
+			}
 			return nil
 		}
 		// Path is still a mountpoint, or the re-check could not confirm it is gone
@@ -473,14 +554,19 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) erro
 		"share", key.Share,
 		"local_path", mnt.LocalPath,
 	)
+	if reguard {
+		if err := m.guardTarget(mnt.LocalPath); err != nil {
+			m.logger.Warn("re-guard mount target after unmount", "path", mnt.LocalPath, "error", err)
+		}
+	}
 	return nil
 }
 
 // Unmount unmounts the share identified by device and share name.
-// This is the back-compat interactive path: force=false. The 3s timeout bounds
-// the unmount command itself; unmountKey gives the post-failure re-check its own
-// independent window, so the interactive call can never hang indefinitely.
-// (#47 reap, back-compat; #50 bounded)
+// This is the back-compat interactive path: force=false, reguard=true. The 3s
+// timeout bounds the unmount command itself; unmountKey gives the post-failure
+// re-check its own independent window, so the interactive call can never hang
+// indefinitely. (#47 reap, back-compat; #50 bounded; #49 guard-target)
 func (m *Mounter) Unmount(device, share string) error {
 	key := mountKey{Device: device, Share: share}
 
@@ -492,7 +578,7 @@ func (m *Mounter) Unmount(device, share string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.unmountKey(ctx, key, false)
+	return m.unmountKey(ctx, key, false, true) // force=false, reguard=true
 }
 
 // unmountAll is the core loop: iterates over all active mounts (snapshot taken
@@ -503,7 +589,10 @@ func (m *Mounter) Unmount(device, share string) error {
 // interactive UnmountAll, which passes context.Background()), each mount is given
 // its own unmountOpTimeout so one wedged mount can never hang the whole sweep
 // indefinitely. (#50 bounded)
-func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
+//
+// reguard is threaded through to unmountKey — see unmountKey for semantics.
+// (#49 guard-target)
+func (m *Mounter) unmountAll(ctx context.Context, force, reguard bool) error {
 	m.mu.Lock()
 	keys := make([]mountKey, 0, len(m.activeMounts))
 	for k := range m.activeMounts {
@@ -522,7 +611,7 @@ func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 		}
 
 		m.mu.Lock()
-		err := m.unmountKey(opCtx, key, force)
+		err := m.unmountKey(opCtx, key, force, reguard)
 		m.mu.Unlock()
 
 		if cancel != nil {
@@ -539,21 +628,25 @@ func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 	return nil
 }
 
-// UnmountAll unmounts all active mounts (interactive, force=false). Each mount is
-// bounded by unmountOpTimeout (unmountAll adds a per-mount deadline because the
-// background ctx has none) so a wedged mount cannot hang the sweep. (#50 bounded)
+// UnmountAll unmounts all active mounts (interactive, force=false, reguard=true).
+// Each mount is bounded by unmountOpTimeout (unmountAll adds a per-mount deadline
+// because the background ctx has none) so a wedged mount cannot hang the sweep.
+// (#50 bounded; #49 guard-target)
 func (m *Mounter) UnmountAll() error {
-	return m.unmountAll(context.Background(), false)
+	return m.unmountAll(context.Background(), false, true)
 }
 
 // UnmountAllForce unmounts all active mounts with force=true under the provided
-// context. Used by daemon.Shutdown to guarantee a bounded teardown. (#50 bounded/force)
+// context. Used by daemon.Shutdown to guarantee a bounded teardown. reguard=false
+// because the process is exiting and there is no benefit to chmoding the dirs.
+// (#50 bounded/force; #49 guard-target)
 func (m *Mounter) UnmountAllForce(ctx context.Context) error {
-	return m.unmountAll(ctx, true)
+	return m.unmountAll(ctx, true, false)
 }
 
-// UnmountDevice unmounts all shares from the named device (force=true, because
-// device-offline/-removed teardown should never leave wedged mounts behind).
+// UnmountDevice unmounts all shares from the named device (force=true, reguard=true,
+// because device-offline/-removed teardown should never leave wedged mounts behind,
+// and the target stays in config so it must be re-restricted). (#50 force; #49 guard-target)
 func (m *Mounter) UnmountDevice(deviceNickname string) error {
 	m.mu.Lock()
 	var keys []mountKey
@@ -571,7 +664,7 @@ func (m *Mounter) UnmountDevice(deviceNickname string) error {
 	var errs []string
 	for _, key := range keys {
 		m.mu.Lock()
-		err := m.unmountKey(ctx, key, true) // force=true: device is gone (#50 force)
+		err := m.unmountKey(ctx, key, true, true) // force=true: device is gone (#50 force); reguard=true (#49)
 		m.mu.Unlock()
 		if err != nil {
 			errs = append(errs, err.Error())
@@ -601,6 +694,98 @@ func (m *Mounter) ActiveMounts() []*Mount {
 		result = append(result, mnt)
 	}
 	return result
+}
+
+// guardTarget creates the target directory if absent and chmods it to guardMode
+// so an unmounted target cannot silently absorb local writes (EACCES on entry
+// creation/deletion). It is idempotent. (#49 guard-target)
+//
+// guardTarget is only ever called on paths the caller has confirmed are currently
+// unmounted (pre-mount before cmd.Start, on Mount failure, after delete in
+// unmountKey, in the startup sweep, in tryMount's not-mounted branch). Relying on
+// call-site ordering avoids an extra checkMountpoint call here, which could hang
+// on a wedged FUSE stat. As a result, guardTarget does NOT call checkMountpoint.
+//
+// No-op when m.stub is true (scenario-test harness — see Mounter.stub).
+func (m *Mounter) guardTarget(path string) error {
+	if m.stub {
+		return nil
+	}
+	// Create parent dirs at a normal mode so siblings are not affected.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create parent of mount target %q: %w", path, err)
+	}
+	// Ensure the leaf exists at a normal mode first, then restrict it.
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("create mount target %q: %w", path, err)
+	}
+	if err := os.Chmod(path, guardMode); err != nil {
+		return fmt.Errorf("restrict mount target %q: %w", path, err)
+	}
+	return nil
+}
+
+// makeMountable chmods the mount point to mountableMode immediately before the
+// mount backend attaches, because fusermount3 (Linux) refuses to mount onto a
+// directory the user cannot write. A successful mount masks this mode; the
+// caller re-applies guardMode on every failure path and on unmount. No-op when
+// m.stub is true (scenario-test harness — the stub never creates a real mount).
+// (#49 guard-target)
+func (m *Mounter) makeMountable(path string) error {
+	if m.stub {
+		return nil
+	}
+	if err := os.Chmod(path, mountableMode); err != nil {
+		return fmt.Errorf("prepare mount point %q for mounting: %w", path, err)
+	}
+	return nil
+}
+
+// unguardTarget restores the target directory to a normal mode (0o755) so a path
+// the user has removed from config behaves like an ordinary directory again.
+// (#49 guard-target)
+//
+// No-op when m.stub is true (scenario-test harness — see Mounter.stub).
+func (m *Mounter) unguardTarget(path string) error {
+	if m.stub {
+		return nil
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		// Ignore ENOENT — if the directory does not exist there is nothing to restore.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("restore mount target %q: %w", path, err)
+	}
+	return nil
+}
+
+// targetHasLocalContents returns the number of entries in path — i.e. the count
+// of real local files that a mount would shadow. (#49 non-empty refusal)
+//
+// Returns 0 when the directory does not exist or exists but is empty, and the
+// entry count otherwise. Returning the count (rather than a bool) lets the
+// caller log/report it without a second os.ReadDir.
+//
+// targetHasLocalContents does NOT call checkMountpoint. It is only called
+// pre-mount in Mount, before our mount exists, so os.ReadDir reflects the real
+// local contents. Enumerating a pre-existing foreign mountpoint and refusing to
+// mount over it is the correct, desired behavior.
+//
+// Returns 0 when m.stub is true so the non-empty refusal never trips in scenario
+// tests (see Mounter.stub).
+func (m *Mounter) targetHasLocalContents(path string) (int, error) {
+	if m.stub {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read mount target %q: %w", path, err)
+	}
+	return len(entries), nil
 }
 
 // SetExecCommandForTests overrides the command builder (used in tests).

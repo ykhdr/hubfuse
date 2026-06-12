@@ -844,3 +844,99 @@ func TestShutdown_BoundedUnmount_EmptyMountsReturnsImmediately(t *testing.T) {
 		t.Fatal("Shutdown() with no mounts should return immediately")
 	}
 }
+
+// ─── Guard-target daemon-level tests (#49) ────────────────────────────────────
+
+// TestGuardTarget_MountRemoveRestoresPerms verifies that when a mount is removed
+// from config via onConfigChange (MountsRemoved), the target directory is restored
+// to 0o755 after unmount. (#49 test 8)
+func TestGuardTarget_MountRemoveRestoresPerms(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "music")
+	writePubKey(t, dir, "device-abc")
+
+	// Pre-mount the target (this will guard it to 0o500).
+	mc := agentconfig.MountConfig{Device: "remote", Share: "music", To: mountTo}
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-abc", "10.0.0.9", 2222), "pre-mount")
+
+	// After a successful Mount the point is left at mountableMode (a real FUSE
+	// mount would mask it); guardMode is re-applied on unmount, asserted below.
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err)
+	assert.Equal(t, mountableMode, info.Mode().Perm(), "target must be mountable (owner-writable) after Mount")
+
+	// Now drive onConfigChange with the mount removed.
+	oldCfg := &agentconfig.Config{
+		Mounts: []agentconfig.MountConfig{mc},
+	}
+	newCfg := &agentconfig.Config{
+		Mounts: []agentconfig.MountConfig{},
+	}
+
+	// hubClient is nil in buildTestDaemon; SharesChanged is false so no hubClient
+	// call is made.
+	d.onConfigChange(oldCfg, newCfg)
+
+	// Target should be back to 0o755.
+	info, err = os.Stat(mountTo)
+	require.NoError(t, err, "target must still exist after mount remove")
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm(), "target must be restored to 0o755 after mount remove (#49 test 8)")
+}
+
+// TestGuardTarget_TryMountGuardsOfflineTarget verifies that when tryMount is
+// called for a device that is not online, the target dir is restricted to
+// guardMode. (#49 test 9)
+func TestGuardTarget_TryMountGuardsOfflineTarget(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "photos")
+	mc := agentconfig.MountConfig{Device: "offline-device", Share: "photos", To: mountTo}
+
+	// Ensure the target dir exists at a normal mode first.
+	require.NoError(t, os.MkdirAll(mountTo, 0o755))
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	// tryMount — device is not in onlineDevices, so it early-returns and must guard.
+	d.tryMount(mc)
+
+	info, err := os.Stat(mountTo)
+	require.NoError(t, err, "target must exist")
+	assert.Equal(t, guardMode, info.Mode().Perm(), "tryMount must guard target when device is offline (#49 test 9)")
+}
+
+// TestGuardTarget_GuardConfiguredTargets verifies that guardConfiguredTargets
+// restricts all configured mount target dirs to guardMode. (#49 test 10)
+func TestGuardTarget_GuardConfiguredTargets(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo1 := filepath.Join(dir, "mnt", "share1")
+	mountTo2 := filepath.Join(dir, "mnt", "share2")
+
+	// Pre-create both dirs at 0o755.
+	require.NoError(t, os.MkdirAll(mountTo1, 0o755))
+	require.NoError(t, os.MkdirAll(mountTo2, 0o755))
+
+	// Restore dir perms before t.TempDir cleanup.
+	t.Cleanup(func() {
+		_ = os.Chmod(mountTo1, 0o755)
+		_ = os.Chmod(mountTo2, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "alpha", Share: "share1", To: mountTo1},
+		{Device: "beta", Share: "share2", To: mountTo2},
+	}
+
+	d.guardConfiguredTargets()
+
+	info1, err := os.Stat(mountTo1)
+	require.NoError(t, err)
+	assert.Equal(t, guardMode, info1.Mode().Perm(), "first target must be restricted to guardMode (#49 test 10)")
+
+	info2, err := os.Stat(mountTo2)
+	require.NoError(t, err)
+	assert.Equal(t, guardMode, info2.Mode().Perm(), "second target must be restricted to guardMode (#49 test 10)")
+}
