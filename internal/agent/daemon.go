@@ -48,7 +48,11 @@ type Daemon struct {
 	watcher       *agentconfig.Watcher
 	logger        *slog.Logger
 	onlineDevices map[string]*OnlineDevice // online devices from hub (device_id -> info)
-	mu            sync.RWMutex
+	// nicknames is a persisted device_id → nickname fallback so paired peers
+	// resolve even before their DeviceOnline event arrives (e.g. right after a
+	// daemon restart).  It is guarded by mu; disk I/O happens outside the lock.
+	nicknames map[string]string
+	mu        sync.RWMutex
 
 	// dataDir is the base data directory (~/.hubfuse by default).
 	dataDir string
@@ -115,6 +119,17 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		return nil, fmt.Errorf("create SSH server: %w", err)
 	}
 
+	// Load the persisted device_id → nickname map before the SSH server starts
+	// serving so the DeviceResolver is warm on the very first SFTP request.
+	// This is a best-effort load: a missing file is normal (first run, never
+	// paired), and any I/O or parse error is logged but does not abort startup.
+	cachedNicknames := make(map[string]string)
+	if nn, loadErr := LoadNicknames(filepath.Join(dir, common.KnownDevicesDir)); loadErr != nil {
+		logger.Warn("could not load persisted nicknames; starting with empty cache", "error", loadErr)
+	} else {
+		cachedNicknames = nn
+	}
+
 	d := &Daemon{
 		config:        cfg,
 		configPath:    cfgPath,
@@ -124,6 +139,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		sshServer:     sshServer,
 		logger:        logger,
 		onlineDevices: make(map[string]*OnlineDevice),
+		nicknames:     cachedNicknames,
 		dataDir:       dir,
 		onReady:       opts.OnReady,
 	}
@@ -214,11 +230,19 @@ func mountInstallHint(tool, goos string) string {
 
 // NicknameForDeviceID implements DeviceResolver. Used by the SFTP handler to
 // match ACL tokens that reference human-readable nicknames.
+//
+// Resolution is two-tier:
+//  1. Live onlineDevices (authoritative when the peer is currently online).
+//  2. Persisted nicknames map (covers the restart / pre-online window for
+//     already-paired peers — this is the fix for the ACL race in issue #48).
 func (d *Daemon) NicknameForDeviceID(id string) (string, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if dev, ok := d.onlineDevices[id]; ok && dev.Nickname != "" {
 		return dev.Nickname, true
+	}
+	if n, ok := d.nicknames[id]; ok && n != "" {
+		return n, true
 	}
 	return "", false
 }
@@ -239,12 +263,77 @@ func (d *Daemon) guardConfiguredTargets() {
 	}
 }
 
+// rememberNickname records the device_id → nickname mapping in the in-memory
+// cache under the lock, then flushes the whole map to disk outside the lock
+// (atomic temp+rename).  It is a no-op when nickname is empty or unchanged.
+// Disk errors are logged but never fatal — the in-memory cache is the primary
+// authority for the running process.
+func (d *Daemon) rememberNickname(deviceID, nickname string) {
+	if nickname == "" {
+		return
+	}
+
+	d.mu.Lock()
+	if d.nicknames == nil {
+		d.nicknames = make(map[string]string)
+	}
+	if d.nicknames[deviceID] == nickname {
+		d.mu.Unlock()
+		return
+	}
+	d.nicknames[deviceID] = nickname
+	// Snapshot under the lock so no concurrent update is missed.
+	snapshot := make(map[string]string, len(d.nicknames))
+	for k, v := range d.nicknames {
+		snapshot[k] = v
+	}
+	d.mu.Unlock()
+
+	// Disk I/O happens outside the lock.
+	knownDevicesDir := filepath.Join(d.dataDir, common.KnownDevicesDir)
+	if err := SaveNicknames(knownDevicesDir, snapshot); err != nil {
+		d.logger.Warn("could not persist nickname", "device_id", deviceID, "error", err)
+	}
+}
+
+// seedNicknamesFromHub calls ListDevices once after connecting and merges
+// the hub-reported nicknames for every device this agent has paired with.
+// This covers peers paired by the other side (where our handlePairingCompleted
+// received no nickname) and self-heals stale nicknames after a peer is renamed.
+// It is best-effort: hub unreachability is logged but not fatal.
+func (d *Daemon) seedNicknamesFromHub(ctx context.Context) {
+	if d.hubClient == nil {
+		return
+	}
+	resp, err := d.hubClient.ListDevices(ctx)
+	if err != nil {
+		d.logger.Warn("seedNicknamesFromHub: ListDevices failed; relying on persisted cache", "error", err)
+		return
+	}
+
+	for _, dev := range resp.Devices {
+		if dev.Nickname == "" {
+			continue
+		}
+		if !d.isPaired(dev.DeviceId) {
+			continue
+		}
+		d.rememberNickname(dev.DeviceId, dev.Nickname)
+	}
+}
+
 // Run is the main daemon loop. It connects to the hub, starts all subsystems,
 // and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.connect(ctx); err != nil {
 		return err
 	}
+
+	// The persisted nickname cache was loaded in NewDaemon (before startSSH),
+	// so the DeviceResolver is already warm.  The hub seed below is additive:
+	// it merges any updated or newly-paired nicknames after we have a live
+	// connection, covering peers whose nickname changed since last run.
+	d.seedNicknamesFromHub(ctx)
 
 	if err := d.startSSH(ctx); err != nil {
 		return err
@@ -414,6 +503,10 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 		d.mu.Lock()
 		d.onlineDevices[dev.DeviceId] = info
 		d.mu.Unlock()
+
+		// Opportunistically persist the freshest nickname so it survives the
+		// next restart (closes the online-gap window for this peer).
+		d.rememberNickname(dev.DeviceId, dev.Nickname)
 
 		mc, shouldMount := d.shouldMount(dev.Nickname)
 		if !shouldMount {

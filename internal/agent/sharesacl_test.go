@@ -75,6 +75,42 @@ func TestFromShareConfigs_Defaults(t *testing.T) {
 	assert.Equal(t, []string{"bob", "carol"}, got[2].AllowedDevices)
 }
 
+// ─── Regression tests for issue #48 (nickname ACL race) ──────────────────────
+
+// TestShareACL_Decide_NicknameResolvedFromPairedState verifies the fix:
+// once the resolver knows the paired peer's nickname (from the persisted
+// cache loaded at startup), an allowed-by-nickname peer is permitted even
+// when it has not yet appeared in onlineDevices.
+func TestShareACL_Decide_NicknameResolvedFromPairedState(t *testing.T) {
+	acl := ShareACL{Alias: "macshare", Path: "/tmp/m", AllowedDevices: []string{"server"}}
+	// Fixed state: resolver knows the paired peer's nickname even though the
+	// peer was not in onlineDevices (here modelled by the persisted-fallback
+	// stub returning ok=true).
+	r := stubResolver{"dev-server": "server"}
+	d := acl.Decide("dev-server", r)
+	assert.True(t, d.Allow, "authorized peer must be allowed once nickname resolves from paired state")
+}
+
+// TestShareACL_Decide_UnresolvedNicknameStillDeniesUnlisted verifies the
+// security guarantee: an unlisted peer that cannot be resolved must be denied
+// (no fail-open) — the fix must not widen the allow set for unauthorized peers.
+func TestShareACL_Decide_UnresolvedNicknameStillDeniesUnlisted(t *testing.T) {
+	acl := ShareACL{Alias: "macshare", Path: "/tmp/m", AllowedDevices: []string{"server"}}
+	// Unlisted peer; resolver reports ok=false (unresolved window). Must DENY.
+	d := acl.Decide("dev-attacker", stubResolver{})
+	assert.False(t, d.Allow, "unlisted peer with unresolved nickname must stay denied (no fail-open)")
+}
+
+// TestShareACL_Decide_WrongNicknameDenies verifies that a connecting device
+// that resolves to a different nickname (not listed in allowed-devices) is
+// still denied — the resolver entry alone does not grant access.
+func TestShareACL_Decide_WrongNicknameDenies(t *testing.T) {
+	acl := ShareACL{Alias: "macshare", Path: "/tmp/m", AllowedDevices: []string{"server"}}
+	// Resolver resolves the connecting device to a DIFFERENT nickname → deny.
+	d := acl.Decide("dev-x", stubResolver{"dev-x": "laptop"})
+	assert.False(t, d.Allow)
+}
+
 func TestResolveSharePath_Basic(t *testing.T) {
 	got, err := ResolveSharePath("/srv/docs", "/docs/a/b.txt", "docs")
 	assert.NoError(t, err)

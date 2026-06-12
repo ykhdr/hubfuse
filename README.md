@@ -146,8 +146,13 @@ server for every incoming request:
 - `permissions="ro"` rejects every SFTP write (create, write, rename,
   remove, mkdir, chmod, symlink, link).
 - `allowed-devices` lists the peers that may see and access the share.
-  Tokens match the peer's nickname or device_id. Use the literal token
-  `"all"` to grant access to every paired device.
+  Tokens match the peer's **nickname** or raw **device_id**. Use the
+  literal token `"all"` to grant access to every paired device.
+  Nickname tokens resolve correctly even before the peer comes online
+  (e.g. right after a daemon restart) because paired nicknames are
+  persisted locally and loaded before the SSH server begins serving.
+  If a peer's nickname changes, the mapping self-heals on the next
+  online event or daemon restart.
 
 Defaults are secure: omitting `permissions` treats the share as
 read-only, and omitting (or leaving empty) `allowed-devices` makes the

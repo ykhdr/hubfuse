@@ -56,6 +56,10 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	d.onlineDevices[e.DeviceId] = info
 	d.mu.Unlock()
 
+	// Persist the freshest nickname so it survives future daemon restarts
+	// (closes the online-gap window for this peer — issue #48).
+	d.rememberNickname(e.DeviceId, e.Nickname)
+
 	mc, shouldMount := d.shouldMount(e.Nickname)
 	if !shouldMount {
 		return
