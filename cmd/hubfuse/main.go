@@ -536,6 +536,17 @@ func pairConfirmCmd() *cobra.Command {
 				if saveErr := agent.SavePeerPublicKey(knownDevicesDir, peerDeviceID, peerPublicKey); saveErr != nil {
 					return fmt.Errorf("save peer public key: %w", saveErr)
 				}
+
+				// Persist the peer's nickname alongside the key so that ACLs using
+				// a nickname token resolve correctly even before the peer's
+				// DeviceOnline event arrives on the next daemon start (issue #48).
+				if peerNickname != "" {
+					if nickErr := agent.SetNickname(knownDevicesDir, peerDeviceID, peerNickname); nickErr != nil {
+						// Non-fatal: the key was saved, so pairing succeeded.
+						// The daemon will self-heal via ListDevices on next start.
+						slog.Warn("could not persist peer nickname", "peer_device_id", peerDeviceID, "error", nickErr)
+					}
+				}
 			}
 
 			fmt.Printf("paired with %q (device_id: %s)\n", peerNickname, peerDeviceID)
