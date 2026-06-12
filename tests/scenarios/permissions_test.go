@@ -45,6 +45,27 @@ func dialSFTPAs(t *testing.T, dialer *helpers.Agent, peer *helpers.Agent) *sftp.
 	return sftpClient
 }
 
+// waitForShare blocks until alias appears in the peer's synthetic SFTP root.
+// "share add" only rewrites config.kdl; the daemon applies it asynchronously
+// when the config watcher fires, so a listing taken immediately after pairing
+// can race the reload and come back empty.
+func waitForShare(t *testing.T, client *sftp.Client, alias string) {
+	t.Helper()
+	require.Eventuallyf(t, func() bool {
+		entries, err := client.ReadDir("/")
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			if e.Name() == alias {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond,
+		"share %q never appeared in the SFTP root listing", alias)
+}
+
 // TestACL_ReadOnlyRejectsWrites — a share declared ro accepts reads and
 // rejects writes from an allowed peer.
 func TestACL_ReadOnlyRejectsWrites(t *testing.T) {
@@ -71,6 +92,7 @@ func TestACL_ReadOnlyRejectsWrites(t *testing.T) {
 		"alice should have saved bob's public key")
 
 	client := dialSFTPAs(t, bob, alice)
+	waitForShare(t, client, "docs")
 
 	// Read side works.
 	f, err := client.Open("/docs/hello.txt")
@@ -121,8 +143,11 @@ func TestACL_AllowedDevicesFiltersListing(t *testing.T) {
 	require.True(t, alice.WaitForPairedCount(t, 2, 5*time.Second),
 		"alice should have saved carol's public key")
 
-	// bob — share visible, read works.
+	// bob — share visible, read works. waitForShare also guarantees the
+	// daemon has loaded the share before carol's must-not-see check below,
+	// so that negative assertion cannot pass vacuously.
 	bobClient := dialSFTPAs(t, bob, alice)
+	waitForShare(t, bobClient, "docs")
 	bobEntries, err := bobClient.ReadDir("/")
 	require.NoError(t, err)
 	var bobNames []string
@@ -166,6 +191,7 @@ func TestACL_WildcardAllowsEverybody(t *testing.T) {
 	require.True(t, alice.WaitForPairedWith(t, 5*time.Second))
 
 	client := dialSFTPAs(t, bob, alice)
+	waitForShare(t, client, "pub")
 	entries, err := client.ReadDir("/")
 	require.NoError(t, err)
 	var names []string
