@@ -284,7 +284,7 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		"known_hosts contents")
 }
 
-func TestMount_FuseTUsesSSHFSBinaryWithSameArgs(t *testing.T) {
+func TestMount_FuseTUsesSSHFSBinaryWithCacheDisabled(t *testing.T) {
 	dir := t.TempDir()
 	knownDir := filepath.Join(dir, common.KnownDevicesDir)
 	keyPath := filepath.Join(dir, "id_ed25519")
@@ -304,14 +304,18 @@ func TestMount_FuseTUsesSSHFSBinaryWithSameArgs(t *testing.T) {
 	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "192.168.1.10", 2222), "Mount()")
 
 	knownHostsPath := filepath.Join(dir, common.KnownHostsDir, "device-a")
-	// fuse-t ships a drop-in sshfs binary, so the invocation is byte-identical
-	// to the default sshfs backend (extraOpts is empty for both today).
+	// fuse-t ships a drop-in sshfs binary; the invocation differs from the
+	// default backend only by the backend-specific extraOpts. cache=no is
+	// required: the FUSE-T sshfs fork's internal stat cache feeds a stale
+	// size-0 to the NFS translation layer right after create→write→close,
+	// making the next append land at offset 0 and overwrite the file (#45).
 	want := []string{
 		"sshfs",
 		"-p", "2222",
 		"-o", "IdentityFile=" + keyPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=" + knownHostsPath,
+		"-o", "cache=no",
 		"hubfuse@192.168.1.10:documents",
 		mountTo,
 	}
