@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +11,16 @@ import (
 	"github.com/pkg/sftp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+)
+
+// SFTP open pflag bit constants (SSH_FXF_* values from the SFTP protocol spec).
+const (
+	pflagRead   uint32 = 0x1
+	pflagWrite  uint32 = 0x2
+	pflagAppend uint32 = 0x4
+	pflagCreat  uint32 = 0x8
+	pflagTrunc  uint32 = 0x10
+	pflagExcl   uint32 = 0x20
 )
 
 func mkACLHandlers(t *testing.T, deviceID string, acls []ShareACL, r DeviceResolver) *aclHandlers {
@@ -217,4 +229,175 @@ func TestACLHandlers_Filelist_Stat_ExistingFile(t *testing.T) {
 	lister, err := h.Filelist(newRequest("Stat", "/docs/hello.txt"))
 	require.NoError(t, err)
 	require.NotNil(t, lister)
+}
+
+// rwShare returns a single rw share ACL for the given directory.
+func rwShare(dir string) []ShareACL {
+	return []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: false}}
+}
+
+// mustCloseWriter asserts that the writer implements io.Closer and closes it.
+func mustCloseWriter(t *testing.T, w io.WriterAt) {
+	t.Helper()
+	c, ok := w.(io.Closer)
+	require.True(t, ok, "writer must implement io.Closer")
+	require.NoError(t, c.Close())
+}
+
+// writeReq creates a Put request with the given raw pflag bits set.
+func writeReq(path string, flags uint32) *sftp.Request {
+	req := sftp.NewRequest("Put", path)
+	req.Flags = flags
+	return req
+}
+
+// TestACLHandlers_Filewrite_RplusPreservesPrefix verifies that a READ|WRITE open
+// (pflags 0x3) of an existing file does not truncate it: writing "BBB\n" at
+// offset 4 must preserve the original "AAA\n" prefix, leaving "AAA\nBBB\n".
+// Bug #45: the old fallback added O_CREATE|O_TRUNC, producing "\0\0\0\0BBB\n".
+func TestACLHandlers_Filewrite_RplusPreservesPrefix(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagRead|pflagWrite))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("BBB\n"), 4)
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_Filewrite_WriteOnlyPreservesPrefix verifies that a WRITE-only
+// open (pflags 0x2) of an existing file does not truncate it.
+func TestACLHandlers_Filewrite_WriteOnlyPreservesPrefix(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("BBB\n"), 4)
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_Filewrite_AppendOffsetCorrectClient verifies the append flow
+// with a correct-offset client (like sshfs): WRITE|CREAT|APPEND with
+// WriteAt("BBB\n", 4) must not error and must append to the seeded "AAA\n".
+// Bug #54: the old code called os.File.WriteAt on an O_APPEND handle, which
+// always returns an error.
+func TestACLHandlers_Filewrite_AppendOffsetCorrectClient(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite|pflagCreat|pflagAppend))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("BBB\n"), 4) // correct offset from sshfs
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_Filewrite_AppendOffsetZeroClient documents SSH_FXF_APPEND
+// semantics: the server must ignore the client-supplied offset on append handles
+// and always write at EOF. WRITE|APPEND with WriteAt("BBB\n", 0) must still
+// land at EOF, producing "AAA\nBBB\n". (pkg/sftp's own client sends offset 0.)
+func TestACLHandlers_Filewrite_AppendOffsetZeroClient(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite|pflagAppend))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("BBB\n"), 0) // offset 0 from pkg/sftp client
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_Filewrite_UploadSemanticsPreserved verifies that a
+// WRITE|CREAT|TRUNC open replaces the existing file content exactly.
+func TestACLHandlers_Filewrite_UploadSemanticsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("OLDCONTENT"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite|pflagCreat|pflagTrunc))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("new"), 0)
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(got))
+}
+
+// TestACLHandlers_Filewrite_WriteWithoutCreatOnMissingFile verifies that
+// WRITE without CREAT on a nonexistent path returns fs.ErrNotExist.
+func TestACLHandlers_Filewrite_WriteWithoutCreatOnMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+
+	_, err := h.Filewrite(writeReq("/docs/nonexistent.txt", pflagWrite))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "expected fs.ErrNotExist, got %v", err)
+}
+
+// TestACLHandlers_Filewrite_ExclHonored verifies that WRITE|CREAT|EXCL on an
+// existing file returns fs.ErrExist.
+func TestACLHandlers_Filewrite_ExclHonored(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("existing"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	_, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite|pflagCreat|pflagExcl))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, fs.ErrExist), "expected fs.ErrExist, got %v", err)
+}
+
+// TestACLHandlers_Filewrite_DegenerateEmptyFlags verifies that Flags=0 (bare
+// Put semantics — no Read or Write bit set) falls back to create+truncate,
+// creating the file if absent and replacing any prior content.
+func TestACLHandlers_Filewrite_DegenerateEmptyFlags(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "new.txt")
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/new.txt", 0))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("hello"), 0)
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(got))
 }

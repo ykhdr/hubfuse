@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -129,9 +130,21 @@ func (h *aclHandlers) resolveWriteReal(virtualPath string) (string, error) {
 }
 
 // openFlagsForRequest maps an SFTP open-request's pflags to os.OpenFile flags.
-// Falls back to the Put semantics (O_WRONLY|O_CREATE|O_TRUNC) when no flags
-// are set, which matches the simple "upload this file" contract most clients
-// use.
+//
+// The client's pflags are honored exactly. pkg/sftp's request server delivers
+// every write via io.WriterAt.WriteAt(data, offset); os.File.WriteAt always
+// returns an error on O_APPEND handles ("invalid use of WriteAt on file opened
+// with O_APPEND", issue #54). For that reason, when the client sets APPEND the
+// file is still opened with O_APPEND (kernel-atomic EOF positioning), but
+// Filewrite wraps it in an appendOnlyWriter whose WriteAt ignores the offset
+// and calls f.Write instead — matching OpenSSH sftp-server semantics.
+//
+// The implicit O_CREATE|O_TRUNC fallback fires ONLY when neither the Read nor
+// the Write pflag is set ("bare Put" minimal clients). Any explicit Read or
+// Write pflag means the client is managing creation/truncation itself, so we
+// must not add implicit flags — the old unconditional fallback truncated
+// existing files on legitimate non-truncating write-opens, producing NUL-prefix
+// corruption (issue #45).
 func openFlagsForRequest(r *sftp.Request) int {
 	p := r.Pflags()
 	flags := 0
@@ -140,10 +153,15 @@ func openFlagsForRequest(r *sftp.Request) int {
 		flags |= os.O_RDWR
 	case p.Write:
 		flags |= os.O_WRONLY
-	default:
-		// Reader wrote here? Default to write anyway — Filewrite is only
-		// invoked for write-class methods.
+	case p.Read:
+		// Read-only pflags routed to a write-class method (pathological
+		// client, e.g. READ|CREAT without WRITE): the handle must still be
+		// writable, but the client did not opt into upload semantics.
 		flags |= os.O_WRONLY
+	default:
+		// Neither Read nor Write is set: fully degenerate "bare Put" client.
+		// Apply upload semantics so plain sftp-put still works.
+		flags |= os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	}
 	if p.Append {
 		flags |= os.O_APPEND
@@ -157,13 +175,41 @@ func openFlagsForRequest(r *sftp.Request) int {
 	if p.Excl {
 		flags |= os.O_EXCL
 	}
-	// If the client sent none of the creation/trunc hints (bare Put semantics),
-	// fall back to create+truncate so the existing plain-upload path keeps
-	// working.
-	if !p.Creat && !p.Trunc && !p.Excl && !p.Append {
-		flags |= os.O_CREATE | os.O_TRUNC
-	}
 	return flags
+}
+
+// appendOnlyWriter wraps an O_APPEND *os.File for use as an io.WriterAt.
+//
+// SFTP SSH_FXF_APPEND semantics require every write to land at EOF regardless
+// of the offset carried in the WRITE packet — identical to OpenSSH sftp-server
+// behavior. pkg/sftp's own client (client.go toPflags) maps os.O_APPEND →
+// SSH_FXF_APPEND but tracks file offsets from 0 (no seek-to-EOF on open), so
+// library clients depend on the server ignoring the supplied offset. Offset-
+// correct clients like sshfs also work correctly because kernel O_APPEND
+// positions the write atomically before the fd-level Write.
+//
+// The mutex is required because pkg/sftp's request server processes packets on
+// a concurrent worker pool (request-server.go:189-198); without serialization,
+// concurrent WriteAt calls on the same handle would race on the underlying
+// os.File.Write.
+type appendOnlyWriter struct {
+	f  *os.File
+	mu sync.Mutex
+}
+
+// WriteAt ignores off and appends p to the file at the current EOF position.
+// This satisfies both offset-correct clients (sshfs) and offset-from-0 clients
+// (pkg/sftp's own client), matching the SFTP spec and OpenSSH sftp-server.
+func (a *appendOnlyWriter) WriteAt(p []byte, _ int64) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.f.Write(p)
+}
+
+// Close closes the underlying file. pkg/sftp's request server closes handles
+// via an io.Closer type assertion (request.go:254 in pkg/sftp v1.13.10).
+func (a *appendOnlyWriter) Close() error {
+	return a.f.Close()
 }
 
 // requestedMode returns the mode bits the client asked for on create, or
@@ -201,6 +247,9 @@ func (h *aclHandlers) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	f, err := os.OpenFile(real, openFlagsForRequest(r), requestedMode(r))
 	if err != nil {
 		return nil, err
+	}
+	if r.Pflags().Append {
+		return &appendOnlyWriter{f: f}, nil
 	}
 	return f, nil
 }

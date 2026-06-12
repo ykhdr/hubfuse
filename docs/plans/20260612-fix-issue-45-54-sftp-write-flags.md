@@ -110,7 +110,7 @@ session task (see Post-Completion).
 - Modify: `internal/agent/sftphandler.go`
 - Modify: `internal/agent/sftphandler_test.go`
 
-- [ ] write failing tests (TDD red):
+- [x] write failing tests (TDD red):
   - `r+` offset write preserves prefix: seed `AAA\n`; `Filewrite` with
     `Flags=READ|WRITE`; `WriteAt("BBB\n", 4)`; close → file bytes exactly
     `AAA\nBBB\n` (red on base: `\0\0\0\0BBB\n`)
@@ -132,25 +132,27 @@ session task (see Post-Completion).
     `errors.Is(err, fs.ErrExist)`
   - degenerate empty pflags (`Flags=0`) → legacy fallback still
     creates+truncates (documents why the fallback is kept)
-- [ ] run `go test ./internal/agent/ -run TestACLHandlers -count=1` —
+- [x] run `go test ./internal/agent/ -run TestACLHandlers -count=1` —
   new tests fail as predicted (red)
-- [ ] rewrite `openFlagsForRequest`: honor pflags exactly; fallback
+- [x] rewrite `openFlagsForRequest`: honor pflags exactly; fallback
   `O_CREATE|O_TRUNC` only when neither Read nor Write is set; keep
   `O_APPEND` for append opens; update the doc comment to state the
   WriteAt constraint and the OpenSSH-equivalent append semantics
-- [ ] add `appendOnlyWriter` (struct with `*os.File` + `sync.Mutex`):
+- [x] add `appendOnlyWriter` (struct with `*os.File` + `sync.Mutex`):
   `WriteAt` ignores the offset, serializes `f.Write(p)`; forwards
   `Close`; doc comment explains why offsets are deliberately ignored
   (SSH_FXF_APPEND spec semantics, OpenSSH parity, pkg/sftp-client
   offset-0 behavior)
-- [ ] return `appendOnlyWriter` from `Filewrite` when `p.Append` is set;
+- [x] return `appendOnlyWriter` from `Filewrite` when `p.Append` is set;
   verify pkg/sftp request server closes handles via `io.Closer`
-- [ ] run `go test ./internal/agent/ -run TestACLHandlers -count=1` —
+- [x] run `go test ./internal/agent/ -run TestACLHandlers -count=1` —
   all green
 
 ### Task 2: verify acceptance criteria
 
-- [ ] `make build`, `make vet`, `make test` all pass
+- [x] `make build` passes
+- [x] `make vet` passes
+- [x] `make test-unit` passes (coordinator runs full `make test`)
 - [ ] re-read #45 and #54 symptom lists; confirm each maps to a covered
   code path (append via sshfs, offset write via NFS/FUSE-T path, plain
   upload, create-new)
