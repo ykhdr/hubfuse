@@ -175,6 +175,26 @@ sftp-server (which serves RDWR handles) showed no corruption; paramiko
   O_APPEND fds; only WriteAt is restricted by Go)
 - [x] green + `make build && make vet && make test-unit`
 
+### ➕ Task 1c: disable fuse-t sshfs attribute cache (mount side)
+
+Even with the server fully correct (instrumented build proved Stat
+returned size=4 and the client still wrote the append at offset 0), the
+FUSE-T sshfs fork's internal stat cache feeds a stale size-0 to the NFS
+layer right after create→write→close, so the first append overwrites the
+file head. `-o cache=no` eliminates it (verified live); the NFS layer and
+macOS client keep their own caches, so only a redundant third cache is
+lost.
+
+**Files:**
+- Modify: `internal/agent/mounter.go`
+- Modify: `internal/agent/mounter_test.go`
+
+- [x] update TestMount_FuseTUsesSSHFSBinaryWithCacheDisabled to expect
+  `-o cache=no` (red first)
+- [x] set `extraOpts: ["cache=no"]` on the fuse-t profile in
+  `mountBackends` with a doc comment explaining the live diagnosis
+- [x] green: `go test ./internal/agent/`, `make build`, `make vet`
+
 ### Task 2: verify acceptance criteria
 
 - [x] `make build` passes

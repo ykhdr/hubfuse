@@ -33,11 +33,16 @@ type mountBackend struct {
 // Every flag the mounter passes (-p, -o IdentityFile, -o StrictHostKeyChecking,
 // -o UserKnownHostsFile) is an SSH option that sshfs forwards to ssh, not a
 // FUSE option, so the same invocation works for either FUSE implementation.
-// extraOpts is empty for both today; the field exists so a backend can inject
-// FUSE-specific options later without touching the call site.
+//
+// The fuse-t profile disables the sshfs-fork's internal attribute cache:
+// FUSE-T's bundled sshfs (2.9-based) serves a stale size-0 stat to the NFS
+// translation layer right after a create→write→close sequence, so the next
+// append computes EOF as 0 and overwrites the file head (issue #45, diagnosed
+// live). The NFS layer and the macOS client keep their own caches, so this
+// only trades a redundant third cache for correctness.
 var mountBackends = map[string]mountBackend{
 	"sshfs":  {binary: "sshfs", extraOpts: nil},
-	"fuse-t": {binary: "sshfs", extraOpts: nil}, // fuse-t ships a drop-in sshfs
+	"fuse-t": {binary: "sshfs", extraOpts: []string{"cache=no"}}, // fuse-t ships a drop-in sshfs
 }
 
 // resolveBackend returns the backend profile for the configured mount tool.
