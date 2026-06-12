@@ -200,15 +200,15 @@ lost.
 - [x] `make build` passes
 - [x] `make vet` passes
 - [x] `make test-unit` passes (coordinator runs full `make test`)
-- [ ] re-read #45 and #54 symptom lists; confirm each maps to a covered
+- [x] re-read #45 and #54 symptom lists; confirm each maps to a covered
   code path (append via sshfs, offset write via NFS/FUSE-T path, plain
-  upload, create-new)
+  upload, create-new) — plus live-verified both directions
 
 ### Task 3: documentation and plan archival
 
-- [ ] README "Share access control" section: no change needed (behavior
-  now matches what it already documents); confirm
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README "Share access control" section: no change needed (behavior
+  now matches what it already documents); confirmed
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
