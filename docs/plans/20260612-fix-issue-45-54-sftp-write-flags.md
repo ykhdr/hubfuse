@@ -75,6 +75,19 @@ Accepted trade-off: concurrent out-of-order WRITE packets on one append
 handle land in arrival order, not offset order — identical to OpenSSH
 sftp-server; single-streamer appends (the real-world case) are unaffected.
 
+Verified pkg/sftp v1.13.10 internals (plan review):
+- `Request.close()` closes the returned WriterAt via an `io.Closer` type
+  assertion (`request.go:254`) — the wrapper must forward `Close`.
+- Write-class opens that also set READ fall back to `Method="Put"` +
+  `Filewrite` because our handler does not implement `OpenFileWriter`
+  (`request.go:333-357`); reads on such handles are a pre-existing
+  unsupported path, unchanged by this fix — the wrapper does NOT need to
+  implement `io.ReaderAt`.
+- The request server processes packets on a concurrent worker pool
+  (`request-server.go:189-198`), so `WriteAt` calls for one handle can run
+  in parallel — the mutex in `appendOnlyWriter` is required for
+  correctness, not merely defensive.
+
 ## Development Approach
 
 - **Testing approach**: TDD — failing tests first (red), then the fix
