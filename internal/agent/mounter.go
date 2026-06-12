@@ -367,17 +367,21 @@ func (m *Mounter) writeKnownHostsFile(deviceID, deviceIP string, sshPort int) (s
 	return path, nil
 }
 
-// mountpointGoneCtx runs m.checkMountpoint(path) in a goroutine and returns
-// true ("gone / treat as unmounted") if:
+// mountpointGoneCtx runs m.checkMountpoint(path) in a goroutine and returns true
+// ("gone / treat as unmounted") ONLY on positive evidence that the mount is no
+// longer there:
 //   - the check returns (false, _) — path is no longer a mountpoint, or
 //   - the check returns (_, non-nil err) — path is inaccessible (ENOENT etc.),
-//     which we treat as gone (favor self-heal over a stuck entry), or
-//   - ctx is cancelled before the check returns — a wedged syscall.Stat on a
-//     FUSE mount must not re-block a bounded shutdown (#50).
+//     which we treat as gone (favor self-heal over a stuck entry).
 //
-// When ctx fires first the goroutine is abandoned (acceptable: process is exiting
-// or the caller uses a short timeout). A one-liner comment inside marks the
-// intentional checkErr-as-gone behavior.
+// If ctx is cancelled before the check returns, it returns FALSE — "could not
+// confirm gone." A wedged syscall.Stat on a FUSE mount must not re-block a
+// bounded teardown (#50), but a timeout is NOT evidence the mount is gone, so we
+// must NOT reap on it: a runtime force caller (e.g. UnmountDevice) that simply
+// hit its budget would otherwise drop a still-live mount and desync the in-memory
+// state. The caller (unmountKey) turns a non-confirmed result into a retained
+// entry + returned error; the goroutine is abandoned (acceptable: short timeout
+// or the process is exiting). (#50 bounded, no false reap)
 func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 	type result struct {
 		isMnt bool
@@ -390,9 +394,11 @@ func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 	}()
 	select {
 	case <-ctx.Done():
-		// ctx fired — treat as gone so shutdown proceeds (#50 bounded/force).
-		m.logger.Warn("reap: mountpoint check timed out, dropping entry", "path", path)
-		return true
+		// ctx fired before the check returned — we could NOT confirm the mount is
+		// gone. Return false so the entry is retained and an error is reported;
+		// the bounded caller still returns promptly (no hang). (#50 bounded)
+		m.logger.Warn("mountpoint check did not complete within deadline; not reaping", "path", path)
+		return false
 	case r := <-ch:
 		if r.err != nil {
 			// Any error (ENOENT, EACCES, EINTR) is treated as "gone" to favour
@@ -404,11 +410,20 @@ func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 	}
 }
 
+// unmountOpTimeout bounds a single unmount command + re-check in teardown paths
+// that have no overall caller deadline (the interactive UnmountAll). The
+// shutdown path (UnmountAllForce) passes its own already-bounded context, which
+// is respected as-is so the total budget is not exceeded. (#50 bounded)
+const unmountOpTimeout = 5 * time.Second
+
 // unmountKey is the core unmount implementation. It calls m.unmount(ctx, path,
 // force) and, on failure, re-checks whether the path is still a mountpoint via
-// mountpointGoneCtx. If the path is gone (or the ctx-bounded check times out),
-// the entry is reaped — deleted from activeMounts, a WARN is logged, and nil is
-// returned. This is the fix for #47 (dead mount reap) and #50 (bounded ctx).
+// mountpointGoneCtx. If the path is confirmed gone, the entry is reaped — deleted
+// from activeMounts, a WARN is logged, and nil is returned (#47 dead-mount reap).
+// If the command failed and the path is still a mountpoint — OR the re-check
+// could not confirm within its deadline — the entry is RETAINED and an error is
+// returned, so a bounded caller never hangs (#50) yet a still-live mount is never
+// silently dropped.
 //
 // The caller must hold m.mu.
 func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) error {
@@ -444,8 +459,9 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) erro
 			)
 			return nil
 		}
-		// Path is still a mountpoint — real failure; retain entry so a retry is
-		// possible.
+		// Path is still a mountpoint, or the re-check could not confirm it is gone
+		// within the deadline — treat as a real failure and retain the entry so a
+		// retry is possible (never silently drop a possibly-live mount). (#50)
 		return fmt.Errorf("unmount %q (device %q share %q): %w", mnt.LocalPath, key.Device, key.Share, cmdErr)
 	}
 
@@ -481,6 +497,12 @@ func (m *Mounter) Unmount(device, share string) error {
 
 // unmountAll is the core loop: iterates over all active mounts (snapshot taken
 // under the lock) and calls unmountKey for each, accumulating errors.
+//
+// If ctx already carries a deadline (the shutdown path, UnmountAllForce), that
+// single budget is shared across every mount as-is. If it does NOT (the
+// interactive UnmountAll, which passes context.Background()), each mount is given
+// its own unmountOpTimeout so one wedged mount can never hang the whole sweep
+// indefinitely. (#50 bounded)
 func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 	m.mu.Lock()
 	keys := make([]mountKey, 0, len(m.activeMounts))
@@ -489,11 +511,23 @@ func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 	}
 	m.mu.Unlock()
 
+	_, hasDeadline := ctx.Deadline()
+
 	var errs []string
 	for _, key := range keys {
+		opCtx := ctx
+		var cancel context.CancelFunc
+		if !hasDeadline {
+			opCtx, cancel = context.WithTimeout(ctx, unmountOpTimeout)
+		}
+
 		m.mu.Lock()
-		err := m.unmountKey(ctx, key, force)
+		err := m.unmountKey(opCtx, key, force)
 		m.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -505,7 +539,9 @@ func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 	return nil
 }
 
-// UnmountAll unmounts all active mounts (interactive, force=false).
+// UnmountAll unmounts all active mounts (interactive, force=false). Each mount is
+// bounded by unmountOpTimeout (unmountAll adds a per-mount deadline because the
+// background ctx has none) so a wedged mount cannot hang the sweep. (#50 bounded)
 func (m *Mounter) UnmountAll() error {
 	return m.unmountAll(context.Background(), false)
 }

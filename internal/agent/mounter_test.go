@@ -887,9 +887,11 @@ func TestIsMountpoint_TempDirIsNotMountpoint(t *testing.T) {
 // ─── mountpointGoneCtx: wedged-check guard ────────────────────────────────────
 
 // TestMountpointGoneCtx_BlockingCheckCtxCancelled verifies that mountpointGoneCtx
-// returns "gone=true" promptly when the checkMountpoint function blocks and the
-// context is cancelled — proving a wedged syscall.Stat cannot re-block a bounded
-// shutdown. This is the unit-level proof for #50.1 worst-case. (#50 bounded)
+// returns promptly (does not hang) when the checkMountpoint function blocks and
+// the context is cancelled, and that it returns gone=FALSE — a timeout is not
+// evidence the mount is gone, so it must NOT trigger a reap. This proves a wedged
+// syscall.Stat cannot re-block a bounded teardown (#50) while never falsely
+// dropping a possibly-live mount. (#50 bounded, no false reap)
 func TestMountpointGoneCtx_BlockingCheckCtxCancelled(t *testing.T) {
 	dir := t.TempDir()
 	m := newTestMounter(t, dir, filepath.Join(dir, "key"), nil, nil)
@@ -908,7 +910,7 @@ func TestMountpointGoneCtx_BlockingCheckCtxCancelled(t *testing.T) {
 	gone := m.mountpointGoneCtx(ctx, "/fake/path")
 	elapsed := time.Since(start)
 
-	assert.True(t, gone, "mountpointGoneCtx must return gone=true when ctx fires before check returns")
+	assert.False(t, gone, "mountpointGoneCtx must return gone=false on a deadline (timeout is not evidence the mount is gone)")
 	assert.Less(t, elapsed, 500*time.Millisecond, "mountpointGoneCtx must return promptly, not hang")
 }
 
@@ -936,8 +938,11 @@ func TestMountpointGoneCtx_CheckReturnsPresent(t *testing.T) {
 
 // TestUnmountAllForce_WedgedCommandAndRecheckBoundedByCtx is the worst-case
 // scenario test: BOTH the unmount command AND the checkMountpoint re-check
-// block. The ctx-bounded force path must return promptly, reap the entry, and
-// not hang. This proves #50.1 even under the absolute worst case. (#50 bounded)
+// block. The ctx-bounded force path must return PROMPTLY (no hang) — this is the
+// #50.1 guarantee. Because neither the command nor the re-check could confirm the
+// mount is gone within the budget, the entry is RETAINED and an error is
+// reported (we never silently drop a possibly-live mount on a mere timeout).
+// (#50 bounded, no false reap)
 func TestUnmountAllForce_WedgedCommandAndRecheckBoundedByCtx(t *testing.T) {
 	dir := t.TempDir()
 	knownDir := filepath.Join(dir, common.KnownDevicesDir)
@@ -979,10 +984,11 @@ func TestUnmountAllForce_WedgedCommandAndRecheckBoundedByCtx(t *testing.T) {
 	err := m.UnmountAllForce(ctx)
 	elapsed := time.Since(start)
 
-	// The ctx fires: unmount returns ctx.Err(), recheck also hits ctx.Done(),
-	// so the entry is reaped and nil is returned.
-	assert.NoError(t, err, "UnmountAllForce must return nil (entry reaped via ctx-guard)")
-	assert.False(t, m.IsActive("device-a", "docs"), "entry must be reaped after ctx-bounded wedge")
+	// The ctx fires: the command returns ctx.Err() and the re-check times out
+	// (gone=false), so the entry is RETAINED and an error is reported — but the
+	// call still returns promptly (no hang), which is the #50.1 guarantee.
+	require.Error(t, err, "UnmountAllForce must report an error when it could not confirm the mount is gone")
+	assert.True(t, m.IsActive("device-a", "docs"), "a wedged mount must NOT be reaped on a mere timeout (no false reap)")
 	assert.Less(t, elapsed, 1*time.Second, "UnmountAllForce must not hang when both command and recheck block")
 }
 
