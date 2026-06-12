@@ -338,6 +338,27 @@ func TestACLHandlers_Filewrite_AppendOffsetZeroClient(t *testing.T) {
 	assert.Equal(t, "AAA\nBBB\n", string(got))
 }
 
+// TestACLHandlers_Filewrite_AppendPlusTrunc covers the legal
+// truncate-then-append combination: TRUNC empties the file on open, and the
+// append writer then lands bytes at the (new) EOF.
+func TestACLHandlers_Filewrite_AppendPlusTrunc(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("OLDCONTENT"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	w, err := h.Filewrite(writeReq("/docs/file.txt", pflagWrite|pflagCreat|pflagAppend|pflagTrunc))
+	require.NoError(t, err)
+
+	_, err = w.WriteAt([]byte("BBB\n"), 0)
+	require.NoError(t, err)
+	mustCloseWriter(t, w)
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "BBB\n", string(got))
+}
+
 // TestACLHandlers_Filewrite_UploadSemanticsPreserved verifies that a
 // WRITE|CREAT|TRUNC open replaces the existing file content exactly.
 func TestACLHandlers_Filewrite_UploadSemanticsPreserved(t *testing.T) {
