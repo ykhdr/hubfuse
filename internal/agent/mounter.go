@@ -187,9 +187,19 @@ type Mount struct {
 // guardMode is the restricted mode applied to an unmounted mount target:
 // r-x for owner, nothing for group/other. The cleared write bit blocks entry
 // creation/deletion (so stray local writes fail with EACCES); the set execute
-// bit still lets the agent traverse the path to mount over it. A live FUSE
-// mount masks this mode while active, and it is re-applied on unmount/reap.
+// bit still lets the agent traverse the path. A live FUSE mount masks this mode
+// while active, and it is re-applied on unmount/reap.
 const guardMode os.FileMode = 0o500
+
+// mountableMode is applied to the mount point immediately before invoking the
+// mount backend. fusermount3 (Linux) refuses to mount onto a directory the user
+// cannot write to — and guardMode (0o500) clears the write bit — so the point is
+// briefly made owner-writable for the mount to attach. A successful mount masks
+// this mode; every failure path (and a later unmount) re-applies guardMode, so
+// the target is only this permissive during the bounded mount-establishment
+// window. (macFUSE/FUSE-T tolerate 0o500, but Linux fusermount3 does not, so we
+// chmod unconditionally for cross-platform correctness.)
+const mountableMode os.FileMode = 0o700
 
 // Mounter manages SSHFS mounts for remote shares.
 type Mounter struct {
@@ -302,11 +312,24 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		return err
 	}
 
+	// Make the point writable so the mount backend can attach (fusermount3 on
+	// Linux requires it). The live mount masks this; every failure path below and
+	// a later unmount re-apply guardMode. (#49 guard-target)
+	if err := m.makeMountable(mc.To); err != nil {
+		// Still guarded at guardMode (chmod failed) — safe; just report.
+		return fmt.Errorf("mount %q from device %q: %w", mc.Share, mc.Device, err)
+	}
+
 	// The remote path is just the alias; the SSH server maps aliases to real paths.
 	args := buildMountArgs(m.backend, sshPort, m.keyPath, knownHostsPath, deviceIP, mc.Share, mc.To)
 	cmd := m.execCommand(ctx, m.backend.binary, args...)
 
 	if err := cmd.Start(); err != nil {
+		// The point was made mountable above; re-restrict it so the failed mount
+		// does not leave a writable target. (#49 guard-target)
+		if guardErr := m.guardTarget(mc.To); guardErr != nil {
+			m.logger.Warn("re-guard mount target after start failure", "path", mc.To, "error", guardErr)
+		}
 		return fmt.Errorf("start %s for %q from device %q: %w", m.backend.binary, mc.Share, mc.Device, err)
 	}
 
@@ -659,6 +682,22 @@ func (m *Mounter) guardTarget(path string) error {
 	}
 	if err := os.Chmod(path, guardMode); err != nil {
 		return fmt.Errorf("restrict mount target %q: %w", path, err)
+	}
+	return nil
+}
+
+// makeMountable chmods the mount point to mountableMode immediately before the
+// mount backend attaches, because fusermount3 (Linux) refuses to mount onto a
+// directory the user cannot write. A successful mount masks this mode; the
+// caller re-applies guardMode on every failure path and on unmount. No-op when
+// m.stub is true (scenario-test harness — the stub never creates a real mount).
+// (#49 guard-target)
+func (m *Mounter) makeMountable(path string) error {
+	if m.stub {
+		return nil
+	}
+	if err := os.Chmod(path, mountableMode); err != nil {
+		return fmt.Errorf("prepare mount point %q for mounting: %w", path, err)
 	}
 	return nil
 }

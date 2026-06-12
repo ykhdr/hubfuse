@@ -1054,9 +1054,12 @@ func newTestMounterWithLogger(t *testing.T, knownDevicesDir, keyPath string, log
 	return m
 }
 
-// TestGuardTarget_MountRestrictsOnCreation verifies that a successful Mount
-// leaves the target directory at guardMode (0o500) because no real FUSE mount
-// masks the underlying mode in the test mounter. (#49 test 1)
+// TestGuardTarget_MountRestrictsOnCreation verifies that Mount creates the target
+// and makes it mountable (mountableMode) just before attaching the backend — a
+// real FUSE mount then masks this mode, and unmount re-applies guardMode (covered
+// by TestGuardTarget_Reguard*). The test mounter never creates a real mount, so
+// the underlying mountableMode is directly observable. fusermount3 (Linux)
+// requires the write bit at mount time, which is why this is not guardMode. (#49)
 func TestGuardTarget_MountRestrictsOnCreation(t *testing.T) {
 	dir := t.TempDir()
 	knownDir := filepath.Join(dir, common.KnownDevicesDir)
@@ -1074,7 +1077,7 @@ func TestGuardTarget_MountRestrictsOnCreation(t *testing.T) {
 
 	info, err := os.Stat(mountTo)
 	require.NoError(t, err, "mount target must exist")
-	assert.Equal(t, guardMode, info.Mode().Perm(), "mount target must be restricted to guardMode after Mount")
+	assert.Equal(t, mountableMode, info.Mode().Perm(), "mount target must be made mountable (owner-writable) for the backend to attach")
 }
 
 // TestGuardTarget_RemountActiveKeyDoesNotChmod verifies that Mount for a key that

@@ -853,10 +853,11 @@ func TestGuardTarget_MountRemoveRestoresPerms(t *testing.T) {
 	mc := agentconfig.MountConfig{Device: "remote", Share: "music", To: mountTo}
 	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-abc", "10.0.0.9", 2222), "pre-mount")
 
-	// Verify the target is guarded.
+	// After a successful Mount the point is left at mountableMode (a real FUSE
+	// mount would mask it); guardMode is re-applied on unmount, asserted below.
 	info, err := os.Stat(mountTo)
 	require.NoError(t, err)
-	assert.Equal(t, guardMode, info.Mode().Perm(), "target must be at guardMode after Mount")
+	assert.Equal(t, mountableMode, info.Mode().Perm(), "target must be mountable (owner-writable) after Mount")
 
 	// Now drive onConfigChange with the mount removed.
 	oldCfg := &agentconfig.Config{
