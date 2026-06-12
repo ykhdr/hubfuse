@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -60,6 +62,24 @@ func splitVirtual(virtual string) (alias, rest string, ok bool) {
 
 func denied() error { return sftp.ErrSSHFxPermissionDenied }
 
+// resolveErr maps path-resolution errors to the correct SFTP status code.
+//
+// Not-exist errors (fs.ErrNotExist, including wrapped syscall.ENOENT from
+// filepath.EvalSymlinks) surface as SSH_FX_NO_SUCH_FILE so that SFTP/sshfs
+// clients receive a negative lookup: create and mkdir depend on an ENOENT
+// response to obtain a negative dentry before issuing the write (issue #46).
+//
+// All other errors — escape attempts (custom fmt.Errorf from the Rel
+// containment check), ACL failures, and unknown-alias paths — stay as
+// PERMISSION_DENIED so that share-alias existence and outside-share paths
+// do not leak to unauthorized peers.
+func resolveErr(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return sftp.ErrSSHFxNoSuchFile
+	}
+	return denied()
+}
+
 // resolveReadReal finds the share for virtualPath, confirms the peer is
 // allowed, returns the canonical (symlink-resolved) on-disk path contained
 // within the share root. Any escape attempt surfaces as a permission error —
@@ -79,7 +99,7 @@ func (h *aclHandlers) resolveReadReal(virtualPath string) (string, error) {
 	}
 	real, err := containedReal(acl.Path, lexical)
 	if err != nil {
-		return "", denied()
+		return "", resolveErr(err)
 	}
 	return real, nil
 }
@@ -103,7 +123,7 @@ func (h *aclHandlers) resolveWriteReal(virtualPath string) (string, error) {
 	}
 	real, err := containedWritePath(acl.Path, lexical)
 	if err != nil {
-		return "", denied()
+		return "", resolveErr(err)
 	}
 	return real, nil
 }
