@@ -765,9 +765,12 @@ func TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux(t *testing.T) {
 // ─── Shutdown: bounded unmount (#50) ─────────────────────────────────────────
 
 // TestShutdown_BoundedUnmountReturnsUnderTimeout verifies that daemon.Shutdown
-// completes within a reasonable time even when the unmount command blocks on
-// a wedged mount. The ctx-guard inside UnmountAllForce reaps the entry and
-// shutdown proceeds. This is the daemon-level proof for #50.1. (#50 bounded/force)
+// completes within a reasonable time even when BOTH the unmount command and the
+// mountpoint re-check block on a wedged mount. The ctx-guard inside
+// UnmountAllForce ensures shutdown returns promptly (it does not hang); because
+// neither step could confirm the mount is gone, the entry is retained rather than
+// falsely reaped. The "returned within the guard" assertion is the daemon-level
+// proof for #50.1. (#50 bounded/force, no false reap)
 func TestShutdown_BoundedUnmountReturnsUnderTimeout(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
@@ -810,14 +813,18 @@ func TestShutdown_BoundedUnmountReturnsUnderTimeout(t *testing.T) {
 
 	select {
 	case err := <-done:
-		// Shutdown may return an error from sshServer.Stop or similar; the important
-		// thing is that it returned at all (not hung). We just verify the mount is gone.
+		// Shutdown may return an error (the wedged unmount could not be confirmed,
+		// plus sshServer.Stop etc.); the important thing is that it RETURNED at all
+		// (not hung) — that is the #50.1 guarantee.
 		_ = err
 	case <-time.After(6 * time.Second):
 		t.Fatal("Shutdown() did not return within 6s — bounded unmount is not working (#50)")
 	}
 
-	assert.False(t, d.mounter.IsActive("device-a", "docs"), "mount entry must be reaped after bounded shutdown")
+	// A mount that could not be confirmed gone (both command and re-check wedged)
+	// is RETAINED, not reaped — we never silently drop a possibly-live mount on a
+	// timeout. The process is exiting anyway, so the retained entry is harmless.
+	assert.True(t, d.mounter.IsActive("device-a", "docs"), "a wedged mount must not be falsely reaped on a timeout")
 }
 
 // TestShutdown_BoundedUnmount_EmptyMountsReturnsImmediately verifies that
