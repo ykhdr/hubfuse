@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -344,10 +345,14 @@ func (d *Daemon) runServices(ctx context.Context) error {
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
 // server, stops the config watcher, and closes the hub client.
+// UnmountAllForce runs under a 5s timeout so a wedged mount cannot prevent
+// clean shutdown — comfortably under the daemonize 10s SIGKILL deadline. (#50 bounded/force)
 func (d *Daemon) Shutdown() error {
 	var errs []string
 
-	if err := d.mounter.UnmountAll(); err != nil {
+	uctx, ucancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer ucancel()
+	if err := d.mounter.UnmountAllForce(uctx); err != nil {
 		errs = append(errs, fmt.Sprintf("unmount all: %v", err))
 	}
 

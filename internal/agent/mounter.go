@@ -108,6 +108,65 @@ func isMountpoint(path string) (bool, error) {
 	return st.Dev != parentSt.Dev, nil
 }
 
+// unmountLadder returns the ordered list of argv sequences to try for an
+// unmount operation. Each inner slice is a complete command (binary + args).
+// The caller should try them in order, stopping on first success. This is a
+// pure helper — it has no side effects and is the single source of truth for
+// the per-OS escalation strategy. It mirrors the design of buildMountArgs so
+// it is table-testable without requiring real FUSE mounts. (#50 bounded/force)
+//
+// Linux non-force: fusermount -u → fusermount -uz (lazy)
+// Linux force:     fusermount -u → fusermount -uz → umount -l
+// macOS non-force: umount
+// macOS force:     umount → diskutil unmount force → umount -f
+func unmountLadder(goos string, force bool) [][]string {
+	switch goos {
+	case "darwin":
+		ladder := [][]string{
+			{"umount"},
+		}
+		if force {
+			ladder = append(ladder,
+				[]string{"diskutil", "unmount", "force"},
+				[]string{"umount", "-f"},
+			)
+		}
+		return ladder
+	default:
+		ladder := [][]string{
+			{"fusermount", "-u"},
+			{"fusermount", "-uz"},
+		}
+		if force {
+			ladder = append(ladder, []string{"umount", "-l"})
+		}
+		return ladder
+	}
+}
+
+// unmountPath runs the platform-specific unmount command for path.
+// It uses exec.CommandContext so a wedged command is abandoned when ctx is
+// cancelled or times out. force selects the escalation strategy (see
+// unmountLadder). Returns nil on first success; aggregates the last error
+// otherwise. (#50 bounded/force)
+func unmountPath(ctx context.Context, path string, force bool) error {
+	steps := unmountLadder(runtime.GOOS, force)
+	var lastErr error
+	for _, argv := range steps {
+		cmd := exec.CommandContext(ctx, argv[0], append(argv[1:], path)...)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		lastErr = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		// Stop early if the context is cancelled — no point trying further rungs.
+		if ctx.Err() != nil {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
 // mountKey is the map key for an active mount, uniquely identifying a
 // device+share pair without string concatenation.
 type mountKey struct {
@@ -137,8 +196,8 @@ type Mounter struct {
 
 	// execCommand is used to build commands; override in tests.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
-	// unmount is used to unmount a path; override in tests.
-	unmount func(path string) error
+	// unmount is used to unmount a path; override in tests. (#50 bounded/force)
+	unmount func(ctx context.Context, path string, force bool) error
 	// checkMountpoint reports whether path is currently a mountpoint. Defaults to
 	// isMountpoint; override in tests (or when stub-sshfs is in use) to skip the
 	// real filesystem check.
@@ -308,53 +367,121 @@ func (m *Mounter) writeKnownHostsFile(deviceID, deviceIP string, sshPort int) (s
 	return path, nil
 }
 
+// mountpointGoneCtx runs m.checkMountpoint(path) in a goroutine and returns
+// true ("gone / treat as unmounted") if:
+//   - the check returns (false, _) — path is no longer a mountpoint, or
+//   - the check returns (_, non-nil err) — path is inaccessible (ENOENT etc.),
+//     which we treat as gone (favor self-heal over a stuck entry), or
+//   - ctx is cancelled before the check returns — a wedged syscall.Stat on a
+//     FUSE mount must not re-block a bounded shutdown (#50).
+//
+// When ctx fires first the goroutine is abandoned (acceptable: process is exiting
+// or the caller uses a short timeout). A one-liner comment inside marks the
+// intentional checkErr-as-gone behavior.
+func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
+	type result struct {
+		isMnt bool
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		isMnt, err := m.checkMountpoint(path)
+		ch <- result{isMnt, err}
+	}()
+	select {
+	case <-ctx.Done():
+		// ctx fired — treat as gone so shutdown proceeds (#50 bounded/force).
+		m.logger.Warn("reap: mountpoint check timed out, dropping entry", "path", path)
+		return true
+	case r := <-ch:
+		if r.err != nil {
+			// Any error (ENOENT, EACCES, EINTR) is treated as "gone" to favour
+			// self-healing over a permanently stuck entry (#47 reap). A transient
+			// EACCES could theoretically reap a live mount; we accept that trade-off.
+			return true
+		}
+		return !r.isMnt
+	}
+}
+
+// unmountKey is the core unmount implementation. It calls m.unmount(ctx, path,
+// force) and, on failure, re-checks whether the path is still a mountpoint via
+// mountpointGoneCtx. If the path is gone (or the ctx-bounded check times out),
+// the entry is reaped — deleted from activeMounts, a WARN is logged, and nil is
+// returned. This is the fix for #47 (dead mount reap) and #50 (bounded ctx).
+//
+// The caller must hold m.mu.
+func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force bool) error {
+	mnt, exists := m.activeMounts[key]
+	if !exists {
+		return fmt.Errorf("no active mount for device %q share %q", key.Device, key.Share)
+	}
+
+	cmdErr := m.unmount(ctx, mnt.LocalPath, force)
+	if cmdErr != nil {
+		// Re-check whether the mountpoint is still present. #47 reap
+		//
+		// The force/shutdown path deliberately shares the caller's ctx so the
+		// command + re-check together stay inside the single bounded budget
+		// (#50). The interactive (force=false) path instead gives the re-check
+		// its own fresh, independent 3s window: a slow-but-killed unmount
+		// command must not starve the re-check into a false "gone" verdict that
+		// reaps a still-live mount.
+		recheckCtx := ctx
+		if !force {
+			var cancel context.CancelFunc
+			recheckCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+		}
+		if m.mountpointGoneCtx(recheckCtx, mnt.LocalPath) {
+			// Mount is already gone — reap the stale entry and return success.
+			delete(m.activeMounts, key)
+			m.logger.Warn("reaped dead mount entry",
+				"device", key.Device,
+				"share", key.Share,
+				"local_path", mnt.LocalPath,
+				"unmount_err", cmdErr,
+			)
+			return nil
+		}
+		// Path is still a mountpoint — real failure; retain entry so a retry is
+		// possible.
+		return fmt.Errorf("unmount %q (device %q share %q): %w", mnt.LocalPath, key.Device, key.Share, cmdErr)
+	}
+
+	// Command succeeded — do NOT re-check (lazy unmount may still look mounted
+	// briefly). Delete and log.
+	delete(m.activeMounts, key)
+	m.logger.Info("unmounted share",
+		"device", key.Device,
+		"share", key.Share,
+		"local_path", mnt.LocalPath,
+	)
+	return nil
+}
+
 // Unmount unmounts the share identified by device and share name.
+// This is the back-compat interactive path: force=false. The 3s timeout bounds
+// the unmount command itself; unmountKey gives the post-failure re-check its own
+// independent window, so the interactive call can never hang indefinitely.
+// (#47 reap, back-compat; #50 bounded)
 func (m *Mounter) Unmount(device, share string) error {
 	key := mountKey{Device: device, Share: share}
+
+	// Bound the unmount command so the interactive path can never hang
+	// indefinitely on a wedged mount. (#50 bounded)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	mnt, exists := m.activeMounts[key]
-	if !exists {
-		return fmt.Errorf("no active mount for device %q share %q", device, share)
-	}
-
-	if err := m.unmount(mnt.LocalPath); err != nil {
-		return fmt.Errorf("unmount %q (device %q share %q): %w", mnt.LocalPath, device, share, err)
-	}
-
-	delete(m.activeMounts, key)
-
-	m.logger.Info("unmounted share",
-		"device", device,
-		"share", share,
-		"local_path", mnt.LocalPath,
-	)
-
-	return nil
+	return m.unmountKey(ctx, key, false)
 }
 
-// unmountPath runs the platform-specific unmount command for path.
-func unmountPath(path string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("umount", path)
-	default:
-		cmd = exec.Command("fusermount", "-u", path)
-	}
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// UnmountAll unmounts all active mounts.
-// It attempts to unmount each mount and accumulates errors.
-func (m *Mounter) UnmountAll() error {
+// unmountAll is the core loop: iterates over all active mounts (snapshot taken
+// under the lock) and calls unmountKey for each, accumulating errors.
+func (m *Mounter) unmountAll(ctx context.Context, force bool) error {
 	m.mu.Lock()
 	keys := make([]mountKey, 0, len(m.activeMounts))
 	for k := range m.activeMounts {
@@ -364,7 +491,10 @@ func (m *Mounter) UnmountAll() error {
 
 	var errs []string
 	for _, key := range keys {
-		if err := m.Unmount(key.Device, key.Share); err != nil {
+		m.mu.Lock()
+		err := m.unmountKey(ctx, key, force)
+		m.mu.Unlock()
+		if err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -375,7 +505,19 @@ func (m *Mounter) UnmountAll() error {
 	return nil
 }
 
-// UnmountDevice unmounts all shares from the named device.
+// UnmountAll unmounts all active mounts (interactive, force=false).
+func (m *Mounter) UnmountAll() error {
+	return m.unmountAll(context.Background(), false)
+}
+
+// UnmountAllForce unmounts all active mounts with force=true under the provided
+// context. Used by daemon.Shutdown to guarantee a bounded teardown. (#50 bounded/force)
+func (m *Mounter) UnmountAllForce(ctx context.Context) error {
+	return m.unmountAll(ctx, true)
+}
+
+// UnmountDevice unmounts all shares from the named device (force=true, because
+// device-offline/-removed teardown should never leave wedged mounts behind).
 func (m *Mounter) UnmountDevice(deviceNickname string) error {
 	m.mu.Lock()
 	var keys []mountKey
@@ -386,9 +528,16 @@ func (m *Mounter) UnmountDevice(deviceNickname string) error {
 	}
 	m.mu.Unlock()
 
+	// Short timeout so device-offline handling cannot wedge the event loop.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	var errs []string
 	for _, key := range keys {
-		if err := m.Unmount(key.Device, key.Share); err != nil {
+		m.mu.Lock()
+		err := m.unmountKey(ctx, key, true) // force=true: device is gone (#50 force)
+		m.mu.Unlock()
+		if err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -426,7 +575,8 @@ func (m *Mounter) SetExecCommandForTests(fn func(ctx context.Context, name strin
 }
 
 // SetUnmountForTests overrides the unmount implementation (used in tests).
-func (m *Mounter) SetUnmountForTests(fn func(path string) error) {
+// The new signature matches the updated seam: (ctx, path, force). (#50 bounded/force)
+func (m *Mounter) SetUnmountForTests(fn func(ctx context.Context, path string, force bool) error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.unmount = fn

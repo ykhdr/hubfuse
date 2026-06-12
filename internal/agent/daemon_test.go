@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -759,4 +760,80 @@ func TestPreflightMountBinary_FuseTRuntimeCheckNotOnLinux(t *testing.T) {
 	preflightMountBinary("fuse-t", resolveBackend("fuse-t"), true, "linux", lookPath, fileExists, logger)
 
 	assert.NotContains(t, buf.String(), "FUSE-T runtime not found", "runtime check must be skipped on linux")
+}
+
+// ─── Shutdown: bounded unmount (#50) ─────────────────────────────────────────
+
+// TestShutdown_BoundedUnmountReturnsUnderTimeout verifies that daemon.Shutdown
+// completes within a reasonable time even when the unmount command blocks on
+// a wedged mount. The ctx-guard inside UnmountAllForce reaps the entry and
+// shutdown proceeds. This is the daemon-level proof for #50.1. (#50 bounded/force)
+func TestShutdown_BoundedUnmountReturnsUnderTimeout(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	// Pre-mount: override checkMountpoint to allow Mount's verify loop to pass.
+	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) { return true, nil })
+
+	writePubKey(t, dir, "device-a")
+	mc := agentconfig.MountConfig{
+		Device: "device-a",
+		Share:  "docs",
+		To:     filepath.Join(dir, "mnt"),
+	}
+	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "pre-mount")
+	require.True(t, d.mounter.IsActive("device-a", "docs"), "pre-mount must be active")
+
+	// Install a blocking unmount: blocks on ctx cancellation.
+	blocked := make(chan struct{}) // never closed in this test
+	d.mounter.SetUnmountForTests(func(ctx context.Context, _ string, _ bool) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-blocked:
+			return nil
+		}
+	})
+	// Install a blocking checkMountpoint: also blocks on the same channel.
+	// This exercises the worst-case where BOTH command and re-check are wedged.
+	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
+		<-blocked
+		return true, nil
+	})
+
+	// Shutdown must complete within a generous guard (the internal budget is 5s;
+	// we allow 6s from the test's perspective so CI has headroom).
+	done := make(chan error, 1)
+	go func() {
+		// Shutdown calls d.hubClient (nil) and d.sshServer.Stop — those are fine.
+		done <- d.Shutdown()
+	}()
+
+	select {
+	case err := <-done:
+		// Shutdown may return an error from sshServer.Stop or similar; the important
+		// thing is that it returned at all (not hung). We just verify the mount is gone.
+		_ = err
+	case <-time.After(6 * time.Second):
+		t.Fatal("Shutdown() did not return within 6s — bounded unmount is not working (#50)")
+	}
+
+	assert.False(t, d.mounter.IsActive("device-a", "docs"), "mount entry must be reaped after bounded shutdown")
+}
+
+// TestShutdown_BoundedUnmount_EmptyMountsReturnsImmediately verifies that
+// Shutdown with no active mounts returns promptly (regression guard).
+func TestShutdown_BoundedUnmount_EmptyMountsReturnsImmediately(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Shutdown()
+	}()
+
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown() with no mounts should return immediately")
+	}
 }
