@@ -148,6 +148,33 @@ session task (see Post-Completion).
 - [x] run `go test ./internal/agent/ -run TestACLHandlers -count=1` —
   all green
 
+### ➕ Task 1b: implement sftp.OpenFileWriter for read-modify-write handles
+
+Live FUSE-T verification exposed a third defect: RDWR opens (pflags
+READ|WRITE) fall back to write-only "Put" handles because aclHandlers does
+not implement pkg/sftp's `OpenFileWriter`; READ packets on such handles
+fail. The macOS NFS client (FUSE-T) merges partial blocks via
+OPEN→READ→WRITE on one handle — the failed READ makes it merge against a
+zero page and write back a NUL-filled block. Control test against OpenSSH
+sftp-server (which serves RDWR handles) showed no corruption; paramiko
+`r+` read against hubfuse failed with "Expected data" (proof).
+
+**Files:**
+- Modify: `internal/agent/sftphandler.go`
+- Modify: `internal/agent/sftphandler_test.go`
+
+- [x] write failing tests (TDD red): OpenFile RDWR on existing file —
+  ReadAt returns content, then WriteAt of a merged block at offset 0
+  preserves it; OpenFile on RO share → denied; OpenFile RDWR+APPEND —
+  ReadAt works and WriteAt lands at EOF
+- [x] add `OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error)` to
+  aclHandlers: resolveWriteReal + openFlagsForRequest + os.OpenFile;
+  append handles return the (extended) append wrapper, others return the
+  *os.File directly
+- [x] extend the append wrapper with `ReadAt` (ReadAt is legal on
+  O_APPEND fds; only WriteAt is restricted by Go)
+- [x] green + `make build && make vet && make test-unit`
+
 ### Task 2: verify acceptance criteria
 
 - [x] `make build` passes

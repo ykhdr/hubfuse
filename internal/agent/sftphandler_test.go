@@ -422,3 +422,95 @@ func TestACLHandlers_Filewrite_DegenerateEmptyFlags(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "hello", string(got))
 }
+
+// Compile-time assertion: aclHandlers must implement sftp.OpenFileWriter.
+// This fails to compile until OpenFile is added — TDD red at the type level.
+var _ sftp.OpenFileWriter = (*aclHandlers)(nil)
+
+// TestACLHandlers_OpenFile_RDWRReadModifyWrite verifies the core FUSE-T/NFS
+// read-modify-write pattern: open RDWR, ReadAt the existing content, WriteAt
+// a merged block at offset 0. Without OpenFile the READ on a write-only handle
+// fails and the NFS client merges against a zero page (issue #45).
+func TestACLHandlers_OpenFile_RDWRReadModifyWrite(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	rw, err := h.OpenFile(writeReq("/docs/file.txt", pflagRead|pflagWrite))
+	require.NoError(t, err)
+	require.NotNil(t, rw)
+
+	// Read the existing block first (read-modify-write pattern).
+	buf := make([]byte, 4)
+	n, err := rw.ReadAt(buf, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 4, n)
+	assert.Equal(t, "AAA\n", string(buf))
+
+	// Write the merged block back — full overwrite at offset 0.
+	_, err = rw.WriteAt([]byte("AAA\nBBB\n"), 0)
+	require.NoError(t, err)
+
+	c, ok := rw.(io.Closer)
+	require.True(t, ok, "OpenFile handle must implement io.Closer")
+	require.NoError(t, c.Close())
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_OpenFile_ReadOnlyShareDenied verifies that OpenFile on a
+// read-only share returns sftp.ErrSSHFxPermissionDenied.
+func TestACLHandlers_OpenFile_ReadOnlyShareDenied(t *testing.T) {
+	dir := t.TempDir()
+	acls := []ShareACL{{Alias: "docs", Path: dir, AllowAll: true, ReadOnly: true}}
+	h := mkACLHandlers(t, "dev-bob", acls, stubResolver{})
+
+	_, err := h.OpenFile(writeReq("/docs/file.txt", pflagRead|pflagWrite))
+	assert.ErrorIs(t, err, sftp.ErrSSHFxPermissionDenied)
+}
+
+// TestACLHandlers_OpenFile_RDWRAppend verifies that RDWR+APPEND open supports
+// both ReadAt (legal on O_APPEND fds) and WriteAt (which lands at EOF).
+func TestACLHandlers_OpenFile_RDWRAppend(t *testing.T) {
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("AAA\n"), 0o644))
+
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+	rw, err := h.OpenFile(writeReq("/docs/file.txt", pflagRead|pflagWrite|pflagAppend))
+	require.NoError(t, err)
+	require.NotNil(t, rw)
+
+	// ReadAt must work on O_APPEND fds (pread is not restricted).
+	buf := make([]byte, 4)
+	n, err := rw.ReadAt(buf, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 4, n)
+	assert.Equal(t, "AAA\n", string(buf))
+
+	// WriteAt must land at EOF regardless of supplied offset (APPEND semantics).
+	_, err = rw.WriteAt([]byte("BBB\n"), 0)
+	require.NoError(t, err)
+
+	c, ok := rw.(io.Closer)
+	require.True(t, ok, "OpenFile append handle must implement io.Closer")
+	require.NoError(t, c.Close())
+
+	got, err := os.ReadFile(fpath)
+	require.NoError(t, err)
+	assert.Equal(t, "AAA\nBBB\n", string(got))
+}
+
+// TestACLHandlers_OpenFile_NonexistentWithoutCreat verifies that OpenFile of
+// a nonexistent path without the CREAT flag returns an fs.ErrNotExist error.
+func TestACLHandlers_OpenFile_NonexistentWithoutCreat(t *testing.T) {
+	dir := t.TempDir()
+	h := mkACLHandlers(t, "dev-bob", rwShare(dir), stubResolver{})
+
+	_, err := h.OpenFile(writeReq("/docs/missing.txt", pflagRead|pflagWrite))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "expected fs.ErrNotExist, got %v", err)
+}

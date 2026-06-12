@@ -178,7 +178,10 @@ func openFlagsForRequest(r *sftp.Request) int {
 	return flags
 }
 
-// appendOnlyWriter wraps an O_APPEND *os.File for use as an io.WriterAt.
+// appendHandle wraps an O_APPEND *os.File for use as both an io.WriterAt and
+// an io.ReaderAt. It is returned by Filewrite (write-only append) and by
+// OpenFile (RDWR+APPEND) so that read-modify-write clients can read the
+// current content before writing.
 //
 // SFTP SSH_FXF_APPEND semantics require every write to land at EOF regardless
 // of the offset carried in the WRITE packet — identical to OpenSSH sftp-server
@@ -191,8 +194,9 @@ func openFlagsForRequest(r *sftp.Request) int {
 // The mutex is required because pkg/sftp's request server processes packets on
 // a concurrent worker pool (request-server.go:189-198); without serialization,
 // concurrent WriteAt calls on the same handle would race on the underlying
-// os.File.Write.
-type appendOnlyWriter struct {
+// os.File.Write. ReadAt (pread) is atomic at the kernel level and does not
+// need the mutex.
+type appendHandle struct {
 	f  *os.File
 	mu sync.Mutex
 }
@@ -200,15 +204,21 @@ type appendOnlyWriter struct {
 // WriteAt ignores off and appends p to the file at the current EOF position.
 // This satisfies both offset-correct clients (sshfs) and offset-from-0 clients
 // (pkg/sftp's own client), matching the SFTP spec and OpenSSH sftp-server.
-func (a *appendOnlyWriter) WriteAt(p []byte, _ int64) (int, error) {
+func (a *appendHandle) WriteAt(p []byte, _ int64) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.f.Write(p)
 }
 
+// ReadAt reads len(p) bytes from the file at offset off. pread(2) is atomic
+// and unaffected by the O_APPEND flag, so no mutex is taken.
+func (a *appendHandle) ReadAt(p []byte, off int64) (int, error) {
+	return a.f.ReadAt(p, off)
+}
+
 // Close closes the underlying file. pkg/sftp's request server closes handles
 // via an io.Closer type assertion (request.go:254 in pkg/sftp v1.13.10).
-func (a *appendOnlyWriter) Close() error {
+func (a *appendHandle) Close() error {
 	return a.f.Close()
 }
 
@@ -249,7 +259,38 @@ func (h *aclHandlers) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 	if r.Pflags().Append {
-		return &appendOnlyWriter{f: f}, nil
+		return &appendHandle{f: f}, nil
+	}
+	return f, nil
+}
+
+// OpenFile implements sftp.OpenFileWriter, the optional interface that
+// pkg/sftp's request server (request.go:333-343) checks via type assertion
+// when it sees a write-class open that also carries the READ pflag.
+//
+// Without this method, RDWR opens fall back to write-only "Put" handles via
+// Filewrite; pkg/sftp then routes READ packets on that handle through a
+// separate reader path that fails because no ReaderAt was stored — the server
+// returns SSH_FX_FAILURE on every read. The macOS NFS client behind FUSE-T
+// performs OPEN→READ→WRITE read-modify-write merges of partial blocks on a
+// single RDWR handle; the failed READ causes it to merge against a zero page
+// and write back a NUL-filled block — the remaining corruption mode of
+// issue #45 (proven live: paramiko 'r+' ReadAt failed with "Expected data").
+//
+// Control test against OpenSSH sftp-server (which implements the RDWR path)
+// showed no corruption. Fix = implement this interface so pkg/sftp serves
+// the RDWR handle with a handle that satisfies both io.WriterAt and io.ReaderAt.
+func (h *aclHandlers) OpenFile(r *sftp.Request) (sftp.WriterAtReaderAt, error) {
+	real, err := h.resolveWriteReal(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(real, openFlagsForRequest(r), requestedMode(r))
+	if err != nil {
+		return nil, err
+	}
+	if r.Pflags().Append {
+		return &appendHandle{f: f}, nil
 	}
 	return f, nil
 }
