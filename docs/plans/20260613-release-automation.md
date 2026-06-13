@@ -182,10 +182,10 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Create: `.goreleaser.yaml`
 
-- [ ] write schema-v2 config per Technical Details (two builds, ldflags into `internal/version`, `CGO_ENABLED=0`, linux/darwin × amd64/arm64).
-- [ ] **per-build** archives (two `archives` entries scoped via `ids:` — one for `hubfuse`, one for `hubfuse-hub` — with distinct `name_template` each) so the two binaries ship as separate downloads; no hardcoded LICENSE.
-- [ ] checksums.txt; `changelog.use: github-native`; `release.prerelease: auto`; `before.hooks: [go mod tidy]`.
-- [ ] if `goreleaser` available: `goreleaser check` passes; else note as deferred to CI. (verification — no unit test applies)
+- [x] write schema-v2 config per Technical Details (two builds, ldflags into `internal/version`, `CGO_ENABLED=0`, linux/darwin × amd64/arm64).
+- [x] **per-build** archives (two `archives` entries scoped via `ids:` — one for `hubfuse`, one for `hubfuse-hub` — with distinct `name_template` each) so the two binaries ship as separate downloads; no hardcoded LICENSE.
+- [x] checksums.txt; `changelog.use: github-native`; `release.prerelease: auto`; `before.hooks: [go mod tidy]`.
+- [x] goreleaser check (deferred to CI — not installed locally; install did not finish within timeout; YAML validated as well-formed via yaml parser). (verification — no unit test applies)
 
 ### Task 5: Add release GitHub Actions workflow
 
