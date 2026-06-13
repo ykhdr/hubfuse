@@ -201,10 +201,10 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Modify: `Makefile`
 
-- [ ] add `release-snapshot` target → `goreleaser release --snapshot --clean`.
-- [ ] add `release-check` target → `goreleaser check`.
-- [ ] add both to `.PHONY`; leave `install`/`build` unchanged.
-- [ ] if `goreleaser` installed, run `make release-check`; otherwise document install hint (`go install github.com/goreleaser/goreleaser/v2@latest`). (tooling target — no unit test applies)
+- [x] add `release-snapshot` target → `goreleaser release --snapshot --clean`.
+- [x] add `release-check` target → `goreleaser check`.
+- [x] add both to `.PHONY`; leave `install`/`build` unchanged.
+- [x] if `goreleaser` installed, run `make release-check`; otherwise document install hint (`go install github.com/goreleaser/goreleaser/v2@latest`). (goreleaser not installed; install hint documented in Makefile; deferred to CI)
 
 ### Task 7: Update README
 

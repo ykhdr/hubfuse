@@ -1,4 +1,4 @@
-.PHONY: proto-gen build test test-unit test-integration test-cli test-scenarios vet lint clean install
+.PHONY: proto-gen build test test-unit test-integration test-cli test-scenarios vet lint clean install release-snapshot release-check
 
 proto-gen:
 	protoc --go_out=. --go-grpc_out=. --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative proto/hubfuse.proto
@@ -28,3 +28,10 @@ clean:
 
 install:
 	go install ./cmd/hubfuse-hub/ ./cmd/hubfuse/
+
+# release helpers (install goreleaser via: go install github.com/goreleaser/goreleaser/v2@latest)
+release-snapshot:
+	goreleaser release --snapshot --clean
+
+release-check:
+	goreleaser check
