@@ -17,8 +17,12 @@ builds:
     goarch:
       - amd64
       - arm64
-    ldflags:
-      - -s -w -X github.com/ykhdr/hubfuse/internal/version.version={{.Version}} -X github.com/ykhdr/hubfuse/internal/version.commit={{.Commit}} -X github.com/ykhdr/hubfuse/internal/version.date={{.Date}}
+    ldflags: &ldflags
+      - -s
+      - -w
+      - -X github.com/ykhdr/hubfuse/internal/version.version=v{{.Version}}
+      - -X github.com/ykhdr/hubfuse/internal/version.commit={{.Commit}}
+      - -X github.com/ykhdr/hubfuse/internal/version.date={{.Date}}
   - id: hubfuse-hub
     main: ./cmd/hubfuse-hub
     binary: hubfuse-hub
@@ -30,8 +34,7 @@ builds:
     goarch:
       - amd64
       - arm64
-    ldflags:
-      - -s -w -X github.com/ykhdr/hubfuse/internal/version.version={{.Version}} -X github.com/ykhdr/hubfuse/internal/version.commit={{.Commit}} -X github.com/ykhdr/hubfuse/internal/version.date={{.Date}}
+    ldflags: *ldflags
 
 archives:
   - id: hubfuse

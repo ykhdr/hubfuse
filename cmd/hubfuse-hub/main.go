@@ -48,7 +48,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version information",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.Println(version.Full())
+			fmt.Fprintln(cmd.OutOrStdout(), version.Full())
 			return nil
 		},
 	}

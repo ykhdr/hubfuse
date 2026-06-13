@@ -49,9 +49,11 @@ A single shared `internal/version` package holds the version state and resolutio
 
 **Version resolution precedence** (in `internal/version`):
 1. ldflags `version != ""` → GoReleaser release build → use it.
-2. else `debug.ReadBuildInfo()`: if `Main.Version` is non-empty and not `"(devel)"` → `go install ...@vX.Y.Z` → use it.
-3. else read `BuildInfo.Settings` `vcs.revision` (+ `vcs.modified`) → local `go build` → `dev-<short-sha>` (append `-dirty` if modified).
+2. else `BuildInfo.Settings` `vcs.revision` present (+ `vcs.modified`) → in-repo local `go build` → `dev-<short-sha>` (append `-dirty` if modified).
+3. else `debug.ReadBuildInfo()`: if `Main.Version` is non-empty and not `"(devel)"` → `go install ...@vX.Y.Z` → use it.
 4. else → `dev`.
+
+> The vcs.revision check precedes the Main.Version check on purpose: a local `go build` stamps Main.Version with a Go pseudo-version (`v0.0.0-<ts>-<sha>`) AND records vcs.revision, so checking revision first keeps the cleaner `dev-<sha>` output. Installed binaries (`go install ...@vX.Y.Z`) are built from the module cache and carry NO vcs.revision, so they still fall through to the Main.Version branch.
 
 **Key design decisions (brainstormed):**
 - **ldflags → `internal/version` vars, not `main.*`** — single source of truth shared by both binaries (rejected: per-binary `main.version` vars → duplication).
@@ -93,10 +95,12 @@ func Full() string         // multi-line block — for `version` subcommand
 
 ```
 -s -w
--X github.com/ykhdr/hubfuse/internal/version.version={{.Version}}
+-X github.com/ykhdr/hubfuse/internal/version.version=v{{ .Version }}
 -X github.com/ykhdr/hubfuse/internal/version.commit={{.Commit}}
 -X github.com/ykhdr/hubfuse/internal/version.date={{.Date}}
 ```
+
+> Use `v{{ .Version }}` (v-prefix re-added in front of GoReleaser's `.Version`), **not** `{{.Tag}}`. `.Version` is the v-stripped tag for releases (`1.2.3`) and the snapshot version in snapshot mode (`0.1.0-next`), so `v{{ .Version }}` yields a correct v-prefixed version in **both** release (`v1.2.3`) and snapshot (`v0.1.0-next`) modes — consistent with the archive `name_template` (which also uses `.Version`) and with the `go install @vX.Y.Z` / local `go build` modes that keep the `v`. `{{.Tag}}` would be wrong in snapshot mode: there is no real tag, so it stamps a stale `v0.0.0`.
 
 `{{.Date}}` is a valid built-in GoReleaser variable (current UTC build time, RFC3339) — it is also the GoReleaser default. Alternative: `{{.CommitDate}}` (the commit's date) for reproducible builds where the same tag always yields the same binary. We use `{{.Date}}` deliberately (the field is a build date); switch to `.CommitDate` only if reproducible-build hashes become a requirement.
 
@@ -222,7 +226,7 @@ func Full() string         // multi-line block — for `version` subcommand
 - [x] `make vet` passes.
 - [x] `make build` passes (both binaries compile).
 - [x] `go test ./internal/version/...` passes; `make test` (or at least `make test-unit`) still green.
-- [x] `go run ./cmd/hubfuse version` and `./cmd/hubfuse-hub version` show resolved version (locally resolves via Go BuildInfo to a `v0.0.0-<pseudo>+dirty` Go pseudo-version — non-empty, reports Commit/Date/Go/OS-Arch).
+- [x] `go run ./cmd/hubfuse version` and `./cmd/hubfuse-hub version` show resolved version (local in-repo build resolves via `vcs.revision` to `dev-<short-sha>` — appending `-dirty` if the worktree is modified — and reports Commit/Date/Go/OS-Arch). Resolution by build mode: local `go build` → `dev-<short-sha>[-dirty]`; `go install ...@vX.Y.Z` → `vX.Y.Z`; `go install ...@latest` on an untagged commit → Go pseudo-version (`v0.0.0-<ts>-<sha>`); GoReleaser → ldflags `v{{ .Version }}`.
 - [x] `goreleaser check` passes if installed (optional). (deferred to CI — `goreleaser` not installed locally; not installed per task constraint; CI runs `goreleaser/goreleaser-action@v7`.)
 - [x] verify Overview requirements are met (tags-as-releases pipeline, `go install` documented, version reported in all build modes).
 

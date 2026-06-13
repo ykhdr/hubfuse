@@ -29,11 +29,11 @@ func TestResolve(t *testing.T) {
 			wantDate:   "2026-06-13T10:00:00Z",
 		},
 		{
-			name:       "ldflags version set but commit/date empty falls back to build info / unknown",
+			name:       "ldflags version set but commit/date empty -> none / unknown",
 			ld:         ldflagsInfo{version: "v1.0.0"},
 			bd:         buildData{revision: "deadbeefcafe"},
 			wantVer:    "v1.0.0",
-			wantCommit: "deadbeefcafe",
+			wantCommit: noneCommit,
 			wantDate:   unknownDate,
 		},
 		{
@@ -45,19 +45,25 @@ func TestResolve(t *testing.T) {
 			wantDate:   unknownDate,
 		},
 		{
-			name:       "go install version from main.Version",
-			ld:         ldflagsInfo{},
-			bd:         buildData{mainVersion: "v0.3.1", revision: "feedface0001"},
-			wantVer:    "v0.3.1",
-			wantCommit: "feedface0001",
-			wantDate:   unknownDate,
-		},
-		{
-			name:       "go install version without revision -> none commit",
+			// `go install ...@vX.Y.Z` is built from the module cache and has
+			// NO vcs.revision, so it resolves via the Main.Version branch.
+			name:       "go install version without revision -> main.Version, none commit",
 			ld:         ldflagsInfo{},
 			bd:         buildData{mainVersion: "v0.3.1"},
 			wantVer:    "v0.3.1",
 			wantCommit: noneCommit,
+			wantDate:   unknownDate,
+		},
+		{
+			// Reorder guard: an in-repo `go build` stamps Main.Version with a
+			// Go pseudo-version AND records vcs.revision. The vcs.revision
+			// branch must win, yielding the cleaner dev-<sha> form rather than
+			// the pseudo-version.
+			name:       "pseudo main.Version with vcs revision -> dev-shortsha (vcs wins)",
+			ld:         ldflagsInfo{},
+			bd:         buildData{mainVersion: "v0.0.0-20260613100000-feedface0001", revision: "feedface0001"},
+			wantVer:    "dev-feedfac",
+			wantCommit: "feedface0001",
 			wantDate:   unknownDate,
 		},
 		{

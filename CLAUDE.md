@@ -20,6 +20,8 @@ make test-integration   # go test ./tests/integration/... -timeout 120s
 make vet                # go vet ./...
 make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
 make install            # install hubfuse-hub and hubfuse to $GOPATH/bin
+make release-snapshot   # build a local snapshot release with GoReleaser (no publish)
+make release-check      # validate .goreleaser.yaml (goreleaser check)
 ```
 
 Run a single test: `go test ./internal/hub/store/... -run TestName`

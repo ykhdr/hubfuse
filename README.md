@@ -210,6 +210,7 @@ earlier releases these fields were documented but not enforced.
 | `stop` | Stop the running hub |
 | `status` | Show hub status (running/stopped, pid) |
 | `issue-join [--ttl 10m]` | Issue a single-use join token; print it on stdout |
+| `version` | Print version, commit, build date, Go version, and OS/arch |
 
 Offline devices older than one week (`168h`) are pruned automatically. Customize the window with `--device-retention <duration>` or set `device-retention "<duration>"` in `~/.hubfuse-hub/config.kdl`. Use `0` to disable pruning.
 
@@ -231,6 +232,7 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 | `mount add <device>:<share> --to <path>` | Mount a remote share |
 | `mount remove <device>:<share>` | Unmount |
 | `mount list` | List mounts |
+| `version` | Print version, commit, build date, Go version, and OS/arch |
 
 ### Recovery
 
@@ -249,4 +251,6 @@ make test-unit          # unit tests only
 make test-integration   # integration tests (120s timeout)
 make vet                # static analysis
 make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
+make release-snapshot   # build a local snapshot release with GoReleaser (no publish)
+make release-check      # validate .goreleaser.yaml (goreleaser check)
 ```

@@ -86,9 +86,16 @@ func buildDataFromBuildInfo(bi *debug.BuildInfo) buildData {
 
 // resolve is the pure precedence helper. Order:
 //  1. ldflags version set -> GoReleaser release build.
-//  2. BuildInfo.Main.Version non-empty and not "(devel)" -> go install ...@vX.Y.Z.
-//  3. vcs.revision present -> local build -> dev-<short-sha>(+-dirty).
+//  2. vcs.revision present -> in-repo local `go build` -> dev-<short-sha>(+-dirty).
+//  3. BuildInfo.Main.Version non-empty and not "(devel)" -> go install ...@vX.Y.Z.
 //  4. bare fallback -> "dev".
+//
+// The vcs.revision check precedes the Main.Version check on purpose: a local
+// `go build` stamps Main.Version with a Go pseudo-version (v0.0.0-<ts>-<sha>)
+// AND records vcs.revision, so the cleaner dev-<sha> form would otherwise be
+// masked. Installed binaries (`go install ...@vX.Y.Z` / `@latest`) are built
+// from the module cache and carry NO vcs.revision, so they still fall through
+// to the Main.Version branch and report their real version.
 func resolve(ld ldflagsInfo, bd buildData) Info {
 	info := Info{
 		GoVersion: runtime.Version(),
@@ -98,12 +105,8 @@ func resolve(ld ldflagsInfo, bd buildData) Info {
 	switch {
 	case ld.version != "":
 		info.Version = ld.version
-		info.Commit = firstNonEmpty(ld.commit, bd.revision, noneCommit)
+		info.Commit = firstNonEmpty(ld.commit, noneCommit)
 		info.Date = firstNonEmpty(ld.date, unknownDate)
-	case bd.mainVersion != "" && bd.mainVersion != develVersion:
-		info.Version = bd.mainVersion
-		info.Commit = firstNonEmpty(bd.revision, noneCommit)
-		info.Date = unknownDate
 	case bd.revision != "":
 		info.Version = fallbackVer + "-" + shortSHA(bd.revision)
 		if bd.modified {
@@ -111,9 +114,13 @@ func resolve(ld ldflagsInfo, bd buildData) Info {
 		}
 		info.Commit = bd.revision
 		info.Date = unknownDate
+	case bd.mainVersion != "" && bd.mainVersion != develVersion:
+		info.Version = bd.mainVersion
+		info.Commit = noneCommit
+		info.Date = unknownDate
 	default:
 		info.Version = fallbackVer
-		info.Commit = firstNonEmpty(bd.revision, noneCommit)
+		info.Commit = noneCommit
 		info.Date = unknownDate
 	}
 
