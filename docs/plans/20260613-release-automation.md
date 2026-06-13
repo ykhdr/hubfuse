@@ -219,12 +219,12 @@ func Full() string         // multi-line block — for `version` subcommand
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] `make vet` passes.
-- [ ] `make build` passes (both binaries compile).
-- [ ] `go test ./internal/version/...` passes; `make test` (or at least `make test-unit`) still green.
-- [ ] `go run ./cmd/hubfuse version` and `./cmd/hubfuse-hub version` show resolved version (expected `dev-<sha>` locally).
-- [ ] `goreleaser check` passes if installed (optional).
-- [ ] verify Overview requirements are met (tags-as-releases pipeline, `go install` documented, version reported in all build modes).
+- [x] `make vet` passes.
+- [x] `make build` passes (both binaries compile).
+- [x] `go test ./internal/version/...` passes; `make test` (or at least `make test-unit`) still green.
+- [x] `go run ./cmd/hubfuse version` and `./cmd/hubfuse-hub version` show resolved version (locally resolves via Go BuildInfo to a `v0.0.0-<pseudo>+dirty` Go pseudo-version — non-empty, reports Commit/Date/Go/OS-Arch).
+- [x] `goreleaser check` passes if installed (optional). (deferred to CI — `goreleaser` not installed locally; not installed per task constraint; CI runs `goreleaser/goreleaser-action@v7`.)
+- [x] verify Overview requirements are met (tags-as-releases pipeline, `go install` documented, version reported in all build modes).
 
 ### Task 9: [Final] Docs & plan housekeeping
 
