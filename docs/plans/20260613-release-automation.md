@@ -171,11 +171,11 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Modify: `cmd/hubfuse-hub/main.go`
 
-- [ ] in `rootCmd()` (:25): set `cmd.Version = version.Short()`.
-- [ ] add a `versionCmd()` factory printing `version.Full()`.
-- [ ] add `versionCmd()` to the existing `cmd.AddCommand(...)` at :39.
-- [ ] `make build` + manual check: `go run ./cmd/hubfuse-hub version` and `--version`.
-- [ ] run `go vet ./...` + build — must pass before next task.
+- [x] in `rootCmd()` (:25): set `cmd.Version = version.Short()`.
+- [x] add a `versionCmd()` factory printing `version.Full()`.
+- [x] add `versionCmd()` to the existing `cmd.AddCommand(...)` at :39.
+- [x] `make build` + manual check: `go run ./cmd/hubfuse-hub version` and `--version`.
+- [x] run `go vet ./...` + build — must pass before next task.
 
 ### Task 4: Add `.goreleaser.yaml`
 

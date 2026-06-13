@@ -13,6 +13,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
 	"github.com/ykhdr/hubfuse/internal/hub"
+	"github.com/ykhdr/hubfuse/internal/version"
 )
 
 func main() {
@@ -24,8 +25,9 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse-hub",
-		Short: "HubFuse hub server",
+		Use:     "hubfuse-hub",
+		Short:   "HubFuse hub server",
+		Version: version.Short(),
 		// main prints errors itself via clierrors.Format, so silence Cobra's
 		// default "Error: ..." prefix. Usage is only suppressed once we've
 		// passed arg/flag validation (see PersistentPreRunE below) so that
@@ -36,8 +38,20 @@ func rootCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(startCmd(), stopCmd(), statusCmd(), issueJoinCmd())
+	cmd.AddCommand(startCmd(), stopCmd(), statusCmd(), issueJoinCmd(), versionCmd())
 	return cmd
+}
+
+// versionCmd implements: hubfuse-hub version
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version information",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.Println(version.Full())
+			return nil
+		},
+	}
 }
 
 func startCmd() *cobra.Command {
