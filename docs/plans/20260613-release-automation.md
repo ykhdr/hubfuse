@@ -160,11 +160,11 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Modify: `cmd/hubfuse/main.go`
 
-- [ ] in `rootCmd()`: set `cmd.Version = version.Short()` (enables `--version`).
-- [ ] add a `versionCmd()` factory (`Use: "version"`) whose `Run` prints `version.Full()`.
-- [ ] register `versionCmd()` on the root command (alongside existing subcommands).
-- [ ] `make build` + manual check: `go run ./cmd/hubfuse version` and `--version` print sane output.
-- [ ] run `go vet ./...` and `go test ./...` for affected packages — must pass before next task.
+- [x] in `rootCmd()`: set `cmd.Version = version.Short()` (enables `--version`).
+- [x] add a `versionCmd()` factory (`Use: "version"`) whose `Run` prints `version.Full()`.
+- [x] register `versionCmd()` on the root command (alongside existing subcommands).
+- [x] `make build` + manual check: `go run ./cmd/hubfuse version` and `--version` print sane output.
+- [x] run `go vet ./...` and `go test ./...` for affected packages — must pass before next task.
 
 ### Task 3: Wire version into `hubfuse-hub` CLI
 
