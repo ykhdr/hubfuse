@@ -211,11 +211,11 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Modify: `README.md`
 
-- [ ] add "Install via `go install`" with both binaries (`...@latest`), near the existing `make install` section (~:51).
-- [ ] add "Updating" subsection (re-run the same `go install ...@latest`).
-- [ ] mention prebuilt binaries from GitHub Releases.
-- [ ] document `hubfuse version` / `hubfuse-hub version` and `--version`.
-- [ ] (docs — no unit test applies)
+- [x] add "Install via `go install`" with both binaries (`...@latest`), near the existing `make install` section (~:51).
+- [x] add "Updating" subsection (re-run the same `go install ...@latest`).
+- [x] mention prebuilt binaries from GitHub Releases.
+- [x] document `hubfuse version` / `hubfuse-hub version` and `--version`.
+- [x] (docs — no unit test applies)
 
 ### Task 8: Verify acceptance criteria
 

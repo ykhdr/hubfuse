@@ -81,6 +81,47 @@ any data — an active MITM presenting a different certificate is rejected befor
 the Join RPC is ever issued. Rotating the hub's server certificate invalidates
 all outstanding join tokens; issue fresh ones after rotation.
 
+## Installation
+
+### Install via `go install`
+
+With Go installed, install either binary directly from the module path:
+
+```bash
+go install github.com/ykhdr/hubfuse/cmd/hubfuse@latest
+go install github.com/ykhdr/hubfuse/cmd/hubfuse-hub@latest
+```
+
+This requires a Go toolchain and `$GOPATH/bin` (or `$GOBIN`) on your `PATH`.
+
+### Updating
+
+Updating is the same command — re-run `go install ...@latest` to pull the
+newest released tag:
+
+```bash
+go install github.com/ykhdr/hubfuse/cmd/hubfuse@latest
+go install github.com/ykhdr/hubfuse/cmd/hubfuse-hub@latest
+```
+
+### Prebuilt binaries
+
+If you don't have Go, prebuilt binaries are published on the project's
+[GitHub Releases](https://github.com/ykhdr/hubfuse/releases) page as `tar.gz`
+archives (one per binary, per OS/arch) alongside a `checksums.txt`.
+
+### Version
+
+Both binaries report their version. The `version` subcommand prints a detailed
+block (version, commit, build date, Go version, OS/arch):
+
+```bash
+hubfuse version
+hubfuse-hub version
+```
+
+The `--version` flag prints the single-line version (e.g. `hubfuse --version`).
+
 ## Configuration
 
 Agent configuration lives in `~/.hubfuse/config.kdl` (KDL format). Example:
