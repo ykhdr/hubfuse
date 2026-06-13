@@ -4,10 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // ─── GenerateSSHKeyPair ───────────────────────────────────────────────────────
@@ -164,6 +166,81 @@ func TestSavePeerPublicKey_RejectsUnsafeDeviceID(t *testing.T) {
 			assert.Error(t, loadErr, "LoadPeerPublicKey(%q) must reject unsafe ID", tc.deviceID)
 		})
 	}
+}
+
+// TestSavePeerPublicKey_AtomicUnderConcurrentWriteAndRead is a regression guard
+// for the pair-confirm race (flaky TestScenario_PairConfirm_DaemonReloadsSSHAllowedKeys):
+// the `hubfuse pair-confirm` CLI and the running daemon write the same
+// <deviceID>.pub concurrently while the daemon's reloadSSHAllowedKeys reads it
+// straight back. A non-atomic os.WriteFile (O_TRUNC) lets the reader catch the
+// empty truncation window and fail with `ssh: no key found`. The atomic
+// temp+rename write must never expose that window: a reader always sees a
+// complete, parseable key. Best run with -race.
+func TestSavePeerPublicKey_AtomicUnderConcurrentWriteAndRead(t *testing.T) {
+	knownDir := t.TempDir()
+	const deviceID = "peer-device"
+
+	// A real, parseable ed25519 public key: ParseAuthorizedKey rejects garbage,
+	// so the reader below can only fail by catching an empty/partial file.
+	pubKey, err := GenerateSSHKeyPair(t.TempDir())
+	require.NoError(t, err, "GenerateSSHKeyPair()")
+
+	// Seed the file so readers never legitimately hit "does not exist".
+	require.NoError(t, SavePeerPublicKey(knownDir, deviceID, pubKey), "seed SavePeerPublicKey()")
+
+	const (
+		writers    = 4
+		iterations = 500
+	)
+
+	// Concurrent writers model the CLI and daemon both re-saving the same key.
+	var writersWG sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		writersWG.Add(1)
+		go func() {
+			defer writersWG.Done()
+			for j := 0; j < iterations; j++ {
+				if err := SavePeerPublicKey(knownDir, deviceID, pubKey); err != nil {
+					t.Errorf("concurrent SavePeerPublicKey(): %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Reader loops load+parse exactly like reloadSSHAllowedKeys; it must never
+	// observe an empty or unparseable file.
+	stop := make(chan struct{})
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
+	go func() {
+		defer readerWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			raw, loadErr := LoadPeerPublicKey(knownDir, deviceID)
+			if loadErr != nil {
+				t.Errorf("LoadPeerPublicKey() during concurrent write: %v", loadErr)
+				return
+			}
+			if _, _, _, _, parseErr := gossh.ParseAuthorizedKey([]byte(raw)); parseErr != nil {
+				t.Errorf("ParseAuthorizedKey() observed a truncated file: %v (raw=%q)", parseErr, raw)
+				return
+			}
+		}
+	}()
+
+	writersWG.Wait()
+	close(stop)
+	readerWG.Wait()
+
+	// No temp files leaked into the known-devices dir; only the .pub remains.
+	devices, err := ListPairedDevices(knownDir)
+	require.NoError(t, err, "ListPairedDevices()")
+	assert.Equal(t, []string{deviceID}, devices, "exactly one paired device, no temp-file leakage")
 }
 
 // ─── ListPairedDevices ────────────────────────────────────────────────────────

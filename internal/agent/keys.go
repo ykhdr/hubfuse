@@ -93,6 +93,16 @@ func validateDeviceID(deviceID string) error {
 // SavePeerPublicKey stores the public key for deviceID under knownDevicesDir.
 // The file is named <deviceID>.pub and is written with 0644 permissions.
 // Parent directories are created as needed.
+//
+// The write is atomic (temp file + rename). This matters because the same
+// <deviceID>.pub path is written by two separate processes during pair-confirm:
+// the `hubfuse pair-confirm` CLI and the running daemon's handlePairingCompleted
+// handler — and the daemon then reads it straight back in reloadSSHAllowedKeys.
+// A plain os.WriteFile opens with O_TRUNC, exposing a "truncated, not yet
+// rewritten" window in which a concurrent reader sees an empty file and parses
+// it as `ssh: no key found`, leaving the SSH allowed-keys map without the new
+// peer. os.Rename is atomic within a directory on POSIX, so a reader always
+// observes either the previous or the new complete file, never an empty one.
 func SavePeerPublicKey(knownDevicesDir, deviceID, publicKey string) error {
 	if err := validateDeviceID(deviceID); err != nil {
 		return err
@@ -102,14 +112,39 @@ func SavePeerPublicKey(knownDevicesDir, deviceID, publicKey string) error {
 		return fmt.Errorf("create known devices directory %q: %w", knownDevicesDir, err)
 	}
 
-	path := filepath.Join(knownDevicesDir, deviceID+".pub")
 	content := publicKey
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		return fmt.Errorf("write peer public key %q: %w", path, err)
+	// Write to a temp file in the same directory so the rename is atomic on
+	// POSIX systems (same filesystem). The ".tmp" suffix keeps it out of
+	// ListPairedDevices, which matches only "*.pub".
+	tmp, err := os.CreateTemp(knownDevicesDir, ".peerkey-*.pub.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp peer public key file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("write temp peer public key file: %w", err)
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod temp peer public key file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("close temp peer public key file: %w", err)
+	}
+
+	path := filepath.Join(knownDevicesDir, deviceID+".pub")
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename temp peer public key file to %q: %w", path, err)
 	}
 
 	return nil
