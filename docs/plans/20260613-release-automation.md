@@ -149,11 +149,11 @@ func Full() string         // multi-line block — for `version` subcommand
 - Create: `internal/version/version.go`
 - Create: `internal/version/version_test.go`
 
-- [ ] create `internal/version/version.go` with ldflags vars (`version`, `commit`, `date`), `Info` struct, `Get()`, `Short()`, `Full()`.
-- [ ] implement a pure precedence helper (takes ldflags values + build-info fields) covering all 4 branches; `Get()` wires `debug.ReadBuildInfo()` into it.
-- [ ] `Short()` returns the single-line version; `Full()` returns the multi-line block (Version/Commit/Date/GoVersion/OS-Arch).
-- [ ] write table-driven tests for the precedence helper (ldflags-set, `go install` version, vcs-revision + dirty, bare fallback) and for `Short()`/`Full()` formatting.
-- [ ] run `go test ./internal/version/...` — must pass before next task.
+- [x] create `internal/version/version.go` with ldflags vars (`version`, `commit`, `date`), `Info` struct, `Get()`, `Short()`, `Full()`.
+- [x] implement a pure precedence helper (takes ldflags values + build-info fields) covering all 4 branches; `Get()` wires `debug.ReadBuildInfo()` into it.
+- [x] `Short()` returns the single-line version; `Full()` returns the multi-line block (Version/Commit/Date/GoVersion/OS-Arch).
+- [x] write table-driven tests for the precedence helper (ldflags-set, `go install` version, vcs-revision + dirty, bare fallback) and for `Short()`/`Full()` formatting.
+- [x] run `go test ./internal/version/...` — must pass before next task.
 
 ### Task 2: Wire version into `hubfuse` CLI
 
