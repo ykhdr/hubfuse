@@ -71,3 +71,4 @@ TLS cert helpers, structured logging setup, protocol version constant, common er
 - **Data layer**: All hub persistence goes through the `store.Store` interface — add new queries there, implement in `sqlite.go`
 - **Events**: Registry fans out events to subscriber channels; agents process them in `events.go`
 - **Integration tests** (`tests/integration/`): Spin up an in-process hub with in-memory SQLite, create TLS certs programmatically, and test full gRPC flows
+- **Release versioning**: Lives in the `internal/version` package (the single source of truth for both binaries); GoReleaser injects version metadata via ldflags into that package's vars (`-X github.com/ykhdr/hubfuse/internal/version.{version,commit,date}`), NOT into `main.*` — wire any new version strings there

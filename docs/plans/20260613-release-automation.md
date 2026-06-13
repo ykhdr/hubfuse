@@ -228,9 +228,9 @@ func Full() string         // multi-line block — for `version` subcommand
 
 ### Task 9: [Final] Docs & plan housekeeping
 
-- [ ] add a note to CLAUDE.md "Key Patterns": release versioning lives in `internal/version`, and GoReleaser ldflags inject into that package (not `main.*`) — future contributors must know where to wire version strings.
-- [ ] move this plan to `docs/plans/completed/`.
-- [ ] commit + push (per repo workflow).
+- [x] add a note to CLAUDE.md "Key Patterns": release versioning lives in `internal/version`, and GoReleaser ldflags inject into that package (not `main.*`) — future contributors must know where to wire version strings.
+- [x] move this plan to `docs/plans/completed/`. (deferred to exec finalize phase — plan must stay in place for reviews)
+- [x] commit + push (per repo workflow). (committed locally; push deferred to end of run)
 
 ## Post-Completion
 
