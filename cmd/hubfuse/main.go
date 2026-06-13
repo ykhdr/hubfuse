@@ -19,6 +19,7 @@ import (
 	"github.com/ykhdr/hubfuse/internal/agent/config"
 	"github.com/ykhdr/hubfuse/internal/common"
 	"github.com/ykhdr/hubfuse/internal/common/daemonize"
+	"github.com/ykhdr/hubfuse/internal/version"
 	pb "github.com/ykhdr/hubfuse/proto"
 )
 
@@ -31,8 +32,9 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "hubfuse",
-		Short: "HubFuse agent daemon",
+		Use:     "hubfuse",
+		Short:   "HubFuse agent daemon",
+		Version: version.Short(),
 		// main prints errors itself via clierrors.Format, so silence Cobra's
 		// default "Error: ..." prefix. Usage is only suppressed once we've
 		// passed arg/flag validation (see PersistentPreRunE below) so that
@@ -68,8 +70,21 @@ func rootCmd() *cobra.Command {
 		renameCmd(),
 		shareCmd,
 		mountCmd,
+		versionCmd(),
 	)
 	return cmd
+}
+
+// versionCmd implements: hubfuse version
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version information",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), version.Full())
+			return err
+		},
+	}
 }
 
 // joinCmd implements: hubfuse join <hub-address>

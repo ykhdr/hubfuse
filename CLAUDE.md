@@ -20,6 +20,8 @@ make test-integration   # go test ./tests/integration/... -timeout 120s
 make vet                # go vet ./...
 make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
 make install            # install hubfuse-hub and hubfuse to $GOPATH/bin
+make release-snapshot   # build a local snapshot release with GoReleaser (no publish)
+make release-check      # validate .goreleaser.yaml (goreleaser check)
 ```
 
 Run a single test: `go test ./internal/hub/store/... -run TestName`
@@ -71,3 +73,4 @@ TLS cert helpers, structured logging setup, protocol version constant, common er
 - **Data layer**: All hub persistence goes through the `store.Store` interface — add new queries there, implement in `sqlite.go`
 - **Events**: Registry fans out events to subscriber channels; agents process them in `events.go`
 - **Integration tests** (`tests/integration/`): Spin up an in-process hub with in-memory SQLite, create TLS certs programmatically, and test full gRPC flows
+- **Release versioning**: Lives in the `internal/version` package (the single source of truth for both binaries); GoReleaser injects version metadata via ldflags into that package's vars (`-X github.com/ykhdr/hubfuse/internal/version.{version,commit,date}`), NOT into `main.*` — wire any new version strings there

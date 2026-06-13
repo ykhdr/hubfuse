@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: hubfuse
+    main: ./cmd/hubfuse
+    binary: hubfuse
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags: &ldflags
+      - -s
+      - -w
+      - -X github.com/ykhdr/hubfuse/internal/version.version=v{{.Version}}
+      - -X github.com/ykhdr/hubfuse/internal/version.commit={{.Commit}}
+      - -X github.com/ykhdr/hubfuse/internal/version.date={{.Date}}
+  - id: hubfuse-hub
+    main: ./cmd/hubfuse-hub
+    binary: hubfuse-hub
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags: *ldflags
+
+archives:
+  - id: hubfuse
+    ids:
+      - hubfuse
+    formats:
+      - tar.gz
+    name_template: "hubfuse_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: hubfuse-hub
+    ids:
+      - hubfuse-hub
+    formats:
+      - tar.gz
+    name_template: "hubfuse-hub_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github-native
+
+release:
+  prerelease: auto
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"

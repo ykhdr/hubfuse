@@ -1,3 +1,19 @@
-# No --version flag or version subcommand exists in hubfuse yet.
-# This test is skipped until a version command is added.
-skip 'no version flag or version subcommand in hubfuse CLI'
+# `hubfuse version` prints the structured multi-line version block.
+# fmt.Fprintln(cmd.OutOrStdout(), ...) routes the block to stdout, consistent
+# with the --version flag.
+exec hubfuse version
+stdout 'Version:'
+stdout 'Commit:'
+stdout 'Date:'
+stdout 'Go version:'
+stdout 'OS/Arch:'
+
+# `hubfuse --version` prints Cobra's single-line "<name> version <X>" to stdout.
+exec hubfuse --version
+stdout 'hubfuse version'
+
+# `hubfuse-hub version` exposes the same shared version block on stdout.
+exec hubfuse-hub version
+stdout 'Version:'
+stdout 'Go version:'
+stdout 'OS/Arch:'
