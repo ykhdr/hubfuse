@@ -192,9 +192,9 @@ func Full() string         // multi-line block — for `version` subcommand
 **Files:**
 - Create: `.github/workflows/release.yml`
 
-- [ ] tag-triggered (`v*`) workflow per outline: checkout (fetch-depth 0), setup-go (go-version-file), goreleaser-action@v7 with `distribution: goreleaser` + `version: "~> v2"` + `args: release --clean`, `GITHUB_TOKEN`.
-- [ ] `permissions: contents: write`; confirm it does not collide with `ci.yml`/`claude.yml`.
-- [ ] sanity-check YAML (e.g. `yamllint`/`actionlint` if available, otherwise visual). (config file — no unit test applies)
+- [x] tag-triggered (`v*`) workflow per outline: checkout (fetch-depth 0), setup-go (go-version-file), goreleaser-action@v7 with `distribution: goreleaser` + `version: "~> v2"` + `args: release --clean`, `GITHUB_TOKEN`.
+- [x] `permissions: contents: write`; confirm it does not collide with `ci.yml`/`claude.yml` (names: `CI`, `Claude Code` vs new `Release` — no collision).
+- [x] sanity-check YAML (`actionlint` not available locally → validated via python yaml parser: well-formed; plus careful visual check). (config file — no unit test applies)
 
 ### Task 6: Add Makefile release helpers
 
