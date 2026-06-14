@@ -254,3 +254,7 @@ make proto-gen          # regenerate gRPC code from proto/hubfuse.proto
 make release-snapshot   # build a local snapshot release with GoReleaser (no publish)
 make release-check      # validate .goreleaser.yaml (goreleaser check)
 ```
+
+## License
+
+HubFuse is licensed under the [Apache License 2.0](LICENSE).
