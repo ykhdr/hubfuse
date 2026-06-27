@@ -13,6 +13,9 @@ type SpawnOpts struct {
 	LogPath      string
 	PIDFilePath  string
 	ReadyTimeout time.Duration
+	// ChildArgs is accepted for struct-literal parity with the unix
+	// build but ignored: Spawn always errors on windows.
+	ChildArgs []string
 }
 
 // Spawn returns an error on Windows: the daemon path relies on POSIX

@@ -63,6 +63,7 @@ func rootCmd() *cobra.Command {
 		leaveCmd(),
 		startCmd(),
 		stopCmd(),
+		restartCmd(),
 		statusCmd(),
 		pairCmd(),
 		pairConfirmCmd(),
@@ -335,6 +336,22 @@ func bestEffortLeave(dataDir string) error {
 	return nil
 }
 
+// spawnAgentDaemon re-execs the current binary as a detached agent
+// daemon, after ensuring dataDir exists. childArgs overrides the child's
+// argv: pass nil for the normal `start -d` path (Spawn derives args from
+// os.Args), or []string{"start"} from `restart` so the child runs the
+// daemon directly instead of recursing into `restart`.
+func spawnAgentDaemon(dataDir, pidPath, logPath string, childArgs []string) error {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	return daemonize.Spawn(daemonize.SpawnOpts{
+		LogPath:     logPath,
+		PIDFilePath: pidPath,
+		ChildArgs:   childArgs,
+	})
+}
+
 // startCmd implements: hubfuse start
 func startCmd() *cobra.Command {
 	var (
@@ -364,13 +381,7 @@ func startCmd() *cobra.Command {
 			// The detached child's stdout/stderr (which is where the
 			// console-handler logs land) gets redirected into defaultLog.
 			if daemon && !daemonize.IsChild() {
-				if err := os.MkdirAll(dataDir, 0o700); err != nil {
-					return fmt.Errorf("create data dir: %w", err)
-				}
-				return daemonize.Spawn(daemonize.SpawnOpts{
-					LogPath:     defaultLog,
-					PIDFilePath: pidPath,
-				})
+				return spawnAgentDaemon(dataDir, pidPath, defaultLog, nil)
 			}
 
 			logger, err := common.SetupLogger(common.LoggerOptions{
@@ -432,6 +443,51 @@ func stopCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pidPath := common.ExpandHome(filepath.Join(common.AgentDataDir, common.AgentPIDFile))
 			return daemonize.SignalStop(pidPath, "agent")
+		},
+	}
+}
+
+// restartCmd implements: hubfuse restart
+//
+// It stops the running daemon (if any) and starts a fresh detached one,
+// reusing the stop/spawn primitives from the daemonize package. The
+// detached child is launched with ChildArgs=["start"] so it runs the
+// daemon directly instead of re-executing `restart` (which would error
+// out under the IsChild guard and leave no daemon running).
+func restartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the agent daemon",
+		Long: "Restart the agent daemon: stop the running daemon (if any), " +
+			"then start a fresh detached one.\n\n" +
+			"The new daemon is started with default logging settings; it does " +
+			"not inherit any --log-file/--log-level flags the previous daemon " +
+			"was launched with. To restart with custom logging, run `hubfuse " +
+			"stop` then `hubfuse start -d` with the desired flags.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			pidPath := filepath.Join(dataDir, common.AgentPIDFile)
+			defaultLog := filepath.Join(dataDir, common.AgentLogFile)
+
+			// Stop the existing daemon first. Only spawn a replacement
+			// after a confirmed stop — never start a second daemon while
+			// the first may still be alive.
+			pid, alive, err := daemonize.CheckRunning(pidPath)
+			if err != nil {
+				return fmt.Errorf("check existing agent: %w", err)
+			}
+			if alive {
+				if err := daemonize.SignalStop(pidPath, "agent"); err != nil {
+					return fmt.Errorf("stop agent (pid %d): %w", pid, err)
+				}
+			} else {
+				fmt.Println("agent is not running; starting a new daemon")
+			}
+
+			// ChildArgs=["start"] makes the detached child run the daemon
+			// directly; re-execing "restart" would error out under the
+			// IsChild guard and leave no daemon running.
+			return spawnAgentDaemon(dataDir, pidPath, defaultLog, []string{"start"})
 		},
 	}
 }

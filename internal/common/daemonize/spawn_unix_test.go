@@ -22,6 +22,16 @@ import (
 func TestMain(m *testing.M) {
 	switch os.Getenv("HUBFUSE_TEST_ROLE") {
 	case "ready":
+		// Optionally record the argv this child was launched with so a
+		// test can assert SpawnOpts.ChildArgs was honored. Written BEFORE
+		// the PID file so it is guaranteed present once Spawn returns
+		// (Spawn returns as soon as the PID file appears).
+		if argsFile := os.Getenv("HUBFUSE_TEST_ARGSFILE"); argsFile != "" {
+			if err := os.WriteFile(argsFile, []byte(strings.Join(os.Args[1:], "\n")), 0o644); err != nil {
+				_, _ = os.Stderr.WriteString("child: write argsfile failed: " + err.Error() + "\n")
+				os.Exit(4)
+			}
+		}
 		// Write the PID file at the path passed in HUBFUSE_TEST_PIDFILE,
 		// then block on SIGTERM/SIGINT.
 		if err := WritePIDFile(os.Getenv("HUBFUSE_TEST_PIDFILE")); err != nil {
@@ -74,6 +84,44 @@ func TestSpawn_Success(t *testing.T) {
 
 	out := <-done
 	assert.Contains(t, out, "started (pid ", "Spawn stdout expected started line")
+
+	pid, alive, err := CheckRunning(pidPath)
+	require.NoError(t, err)
+	require.True(t, alive, "child not alive after Spawn returned")
+
+	proc, err := os.FindProcess(pid)
+	require.NoError(t, err)
+	require.NoError(t, proc.Signal(syscall.SIGTERM), "SIGTERM")
+	waitForDeath(t, pid, 5*time.Second)
+}
+
+func TestSpawn_ChildArgsOverride(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "child.log")
+	pidPath := filepath.Join(dir, "child.pid")
+	argsPath := filepath.Join(dir, "child.args")
+
+	t.Setenv("HUBFUSE_TEST_ROLE", "ready")
+	t.Setenv("HUBFUSE_TEST_PIDFILE", pidPath)
+	t.Setenv("HUBFUSE_TEST_ARGSFILE", argsPath)
+
+	childArgs := []string{"start", "--marker"}
+
+	done := captureStdout(t, func() {
+		require.NoError(t, Spawn(SpawnOpts{
+			LogPath:      logPath,
+			PIDFilePath:  pidPath,
+			ReadyTimeout: 3 * time.Second,
+			ChildArgs:    childArgs,
+		}))
+	})
+	<-done
+
+	// The child must have been launched with exactly ChildArgs, not the
+	// test binary's own os.Args — that is what stops `restart` recursing.
+	got, err := os.ReadFile(argsPath)
+	require.NoError(t, err, "argsfile should exist once Spawn returned")
+	assert.Equal(t, strings.Join(childArgs, "\n"), string(got), "child argv must equal SpawnOpts.ChildArgs")
 
 	pid, alive, err := CheckRunning(pidPath)
 	require.NoError(t, err)
