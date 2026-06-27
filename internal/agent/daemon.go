@@ -64,12 +64,23 @@ type Daemon struct {
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
 
+	// minReconnectInterval is the floor on how frequently the supervisor starts a
+	// new hub session. It serves two roles, both keyed off the same minimum so a
+	// flapping hub is never hammered: (1) supervise waits out this interval when a
+	// session died sooner than it — a Subscribe stream that re-establishes then
+	// dies almost immediately must not let supervise spin with zero delay (CPU
+	// peg, back-to-back Register+Subscribe, log flood); (2) reconnectSession uses
+	// it as the initial retry backoff, doubling up to backoffMax on repeated
+	// Register failures. Defaults to backoffInitial (set in NewDaemon);
+	// buildTestDaemon leaves it 0 so unit tests neither sleep on the floor nor on
+	// retries. (#61)
+	minReconnectInterval time.Duration
+
 	// registerFn and subscribeFn are injectable seams over the concrete
 	// HubClient (client.go has no interface, so it cannot be stubbed without a
-	// live gRPC connection). They default to delegating to
-	// d.hubClient.Register / d.hubClient.Subscribe (wired lazily by
-	// ensureSessionFns); unit tests override them with fakes to drive
-	// sessionOnce / reconnectSession without a live hub.
+	// live gRPC connection). NewDaemon wires them to delegate to
+	// d.hubClient.Register / d.hubClient.Subscribe; unit tests override them with
+	// fakes to drive sessionOnce / reconnectSession / supervise without a live hub.
 	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
 	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
 }
@@ -156,6 +167,19 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		nicknames:     cachedNicknames,
 		dataDir:       dir,
 		onReady:       opts.OnReady,
+
+		minReconnectInterval: backoffInitial,
+	}
+
+	// Wire the hub-session seams to the live client. The closures read d.hubClient
+	// at call time (it is set later, by connect), so eager assignment here is safe
+	// — the codebase idiom (see NewMounter's execCommand/unmount defaults). Unit
+	// tests replace these with fakes before driving the session functions.
+	d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
+		return d.hubClient.Register(ctx, shares, sshPort)
+	}
+	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return d.hubClient.Subscribe(ctx)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
@@ -407,8 +431,6 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 // the PID file is preserved), then hands the live stream to a long-running
 // supervisor goroutine that reconnects whenever the session dies. (#61)
 func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
-	d.ensureSessionFns()
-
 	stream, err := d.sessionOnce(ctx)
 	if err != nil {
 		return err
@@ -417,25 +439,6 @@ func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
 	go d.supervise(ctx, stream)
 
 	return nil
-}
-
-// ensureSessionFns lazily wires registerFn / subscribeFn to delegate to the
-// live hubClient when they have not been overridden (the production path). The
-// closures read d.hubClient at call time, so this is safe even though hubClient
-// is nil at construction (it is set later by connect). Unit tests install their
-// own fakes before driving sessionOnce / reconnectSession, so this never
-// clobbers an injected seam.
-func (d *Daemon) ensureSessionFns() {
-	if d.registerFn == nil {
-		d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
-			return d.hubClient.Register(ctx, shares, sshPort)
-		}
-	}
-	if d.subscribeFn == nil {
-		d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
-			return d.hubClient.Subscribe(ctx)
-		}
-	}
 }
 
 // sessionOnce runs one hub session setup: Register, signal readiness (exactly
@@ -497,12 +500,12 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 }
 
 // reconnectSession retries sessionOnce with exponential backoff
-// (backoffInitial → backoffMax) until it succeeds or ctx is cancelled. It
+// (minReconnectInterval → backoffMax) until it succeeds or ctx is cancelled. It
 // returns the live stream on success, or nil when ctx is cancelled (signalling
 // supervise to exit). The same hubClient is reused throughout: gRPC repairs the
 // transport under the hood, so a fresh dial is unnecessary.
 func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClient {
-	delay := backoffInitial
+	delay := d.minReconnectInterval
 	for {
 		stream, err := d.sessionOnce(ctx)
 		if err == nil {
@@ -531,14 +534,34 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 // supervise runs the hub session for the daemon's lifetime: it reads the event
 // stream until the session dies, then reconnects (Register → Subscribe again)
 // and resumes. It returns only when ctx is cancelled — either readStream
-// observes the cancellation or reconnectSession returns a nil stream.
+// observes the cancellation or reconnectSession returns a nil stream. A floor
+// (minReconnectInterval) is enforced between successive session starts so a
+// session that dies the instant it is established cannot make supervise spin.
 func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
 	for {
+		sessionStart := time.Now()
 		d.readStream(ctx, stream)
 		if ctx.Err() != nil {
 			return
 		}
 		d.logger.Warn("hub session lost; reconnecting")
+
+		// Floor the reconnect cadence. reconnectSession only backs off when
+		// sessionOnce FAILS; a session that re-establishes and then dies almost
+		// immediately (flaky proxy, half-open conn, or two daemons sharing one
+		// device identity each closing the other's Subscribe channel) would
+		// otherwise loop readStream → reconnectSession (instant success) →
+		// readStream with zero delay — pegging CPU and hammering the hub. If the
+		// session lived less than minReconnectInterval, wait out the remainder so
+		// successive session starts are spaced at least that far apart. (#61)
+		if dwell := time.Since(sessionStart); dwell < d.minReconnectInterval {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d.minReconnectInterval - dwell):
+			}
+		}
+
 		stream = d.reconnectSession(ctx)
 		if stream == nil {
 			return

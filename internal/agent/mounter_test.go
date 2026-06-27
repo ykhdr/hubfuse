@@ -163,16 +163,18 @@ func TestBuildMountArgs_ReconnectKeepalive(t *testing.T) {
 			b := resolveBackend(tt.tool)
 			args := buildMountArgs(b, 2222, "/key", "/kh", "10.0.0.1", "docs", "/mnt/docs")
 
-			// The reconnect/keepalive options must be present as ordered -o pairs.
-			assert.Subset(t, args, []string{"-o", "reconnect"}, "reconnect option present")
-			assert.Subset(t, args, []string{"-o", "ServerAliveInterval=15"}, "keepalive interval present")
-			assert.Subset(t, args, []string{"-o", "ServerAliveCountMax=3"}, "keepalive count present")
+			// The reconnect/keepalive options must appear as ADJACENT "-o <opt>"
+			// pairs. A set-membership check (assert.Subset) would pass a stray
+			// "reconnect" token not preceded by its "-o" flag, so assert adjacency.
+			require.GreaterOrEqual(t, optPairIndex(args, "reconnect"), 0, "reconnect present as an -o pair")
+			require.GreaterOrEqual(t, optPairIndex(args, "ServerAliveInterval=15"), 0, "keepalive interval present as an -o pair")
+			require.GreaterOrEqual(t, optPairIndex(args, "ServerAliveCountMax=3"), 0, "keepalive count present as an -o pair")
 
 			// Keepalive options must precede the source/target operands.
 			operandIdx := indexOf(args, "hubfuse@10.0.0.1:docs")
 			require.GreaterOrEqual(t, operandIdx, 0, "source operand present")
-			assert.Greater(t, operandIdx, indexOf(args, "reconnect"), "reconnect before operands")
-			assert.Greater(t, operandIdx, indexOf(args, "ServerAliveInterval=15"), "keepalive before operands")
+			assert.Greater(t, operandIdx, optPairIndex(args, "reconnect"), "reconnect before operands")
+			assert.Greater(t, operandIdx, optPairIndex(args, "ServerAliveInterval=15"), "keepalive before operands")
 
 			// For fuse-t, the reconnect options must precede the backend's
 			// cache=no extraOpt (base args come before extraOpts).
@@ -188,6 +190,19 @@ func TestBuildMountArgs_ReconnectKeepalive(t *testing.T) {
 func indexOf(s []string, v string) int {
 	for i, x := range s {
 		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
+// optPairIndex returns the index of the "-o" flag in an adjacent "-o <opt>" pair
+// within args, or -1 if opt never appears immediately after a "-o" flag. Unlike
+// set membership it enforces adjacency: a stray "<opt>" token not preceded by
+// "-o" is not a match.
+func optPairIndex(args []string, opt string) int {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-o" && args[i+1] == opt {
 			return i
 		}
 	}
@@ -740,6 +755,44 @@ func TestUnmount_CallsUnmountFunction(t *testing.T) {
 	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
 
 	assert.Equal(t, mountTo, unmountedPath, "unmount called with wrong path")
+}
+
+// TestUnmount_ReapsBackendProcess verifies that the unmount success path Wait()s
+// the mount's backend process so a daemonized sshfs parent does not linger as a
+// zombie. #61's remount unmounts on every roam, so a long-lived roaming daemon
+// would otherwise accumulate unreaped children. The injected backend exits
+// immediately (modelling the daemonized parent that exits once the mount is up);
+// after Unmount, ProcessState is populated, proving Wait() ran. (#61)
+func TestUnmount_ReapsBackendProcess(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	var theCmd *exec.Cmd
+	m.execCommand = func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		if runtime.GOOS == "windows" {
+			theCmd = exec.Command("cmd", "/C", "exit 0")
+		} else {
+			theCmd = exec.Command("true")
+		}
+		return theCmd
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "Mount()")
+	require.NotNil(t, theCmd, "backend must have been invoked")
+
+	require.NoError(t, m.Unmount("device-a", "docs"), "Unmount()")
+
+	// unmountKey reaps the backend via a synchronous Wait(), so ProcessState is
+	// set by the time Unmount returns. Without the reap it would stay nil and the
+	// process would linger as a zombie. The read is race-free: Wait() completed
+	// (synchronously, in this goroutine) before Unmount returned.
+	assert.NotNil(t, theCmd.ProcessState, "unmount must reap the backend process (Wait sets ProcessState)")
 }
 
 // TestUnmount_DeadMountReapReturnsNilAndDropsEntry verifies #47: when the

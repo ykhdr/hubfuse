@@ -58,7 +58,7 @@ Device identity is extracted from the mTLS certificate CN field via a gRPC inter
 - `daemon.go` — Orchestrator; supervises the hub session — on event-stream death it re-runs Register→Subscribe with backoff so roaming/IP changes recover without a daemon restart (issue #61)
 - `client.go` — gRPC client wrapper
 - `connector.go` — Hub connection with backoff retry
-- `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table)
+- `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table); `Mount` remounts a peer when its IP/port changes and `buildMountArgs` adds sshfs `reconnect`/`ServerAlive*` keepalive opts so a same-IP TCP blip self-heals (issue #61)
 - `sshserver.go` — Embedded SSH server (default port 2222) for incoming SSHFS
 - `config/` — KDL format config parser (`config.go`), diff detection (`diff.go`), hot-reload via fsnotify (`watcher.go`)
 

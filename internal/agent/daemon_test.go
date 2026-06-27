@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -744,6 +745,239 @@ func TestReconnectSession_ReturnsNilOnCancelledCtx(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("reconnectSession did not return on a cancelled ctx — it is stuck in backoff")
 	}
+}
+
+// TestSessionOnce_SubscribeFailureReturnsWrappedError verifies the documented
+// "Register ok, Subscribe failed" partial-success path: sessionOnce returns the
+// "subscribe to hub events" wrapped error, and onReady (which fires after
+// Register, before Subscribe) still fires exactly once when the first Subscribe
+// fails and a later retry succeeds. (#61)
+func TestSessionOnce_SubscribeFailureReturnsWrappedError(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var readyCalls int
+	d.onReady = func() { readyCalls++ }
+
+	var registerCalls atomic.Int32
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		registerCalls.Add(1)
+		return &pb.RegisterResponse{}, nil
+	}
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		if subscribeCalls.Add(1) == 1 {
+			return nil, errors.New("stream setup failed")
+		}
+		return errStream(), nil
+	}
+
+	// First session: Register ok (onReady fires), Subscribe fails → wrapped error.
+	stream, err := d.sessionOnce(context.Background())
+	require.Error(t, err, "sessionOnce must surface a Subscribe failure")
+	assert.Nil(t, stream, "no stream is returned when Subscribe fails")
+	assert.Contains(t, err.Error(), "subscribe to hub events", "error must be wrapped with the Subscribe context")
+
+	// Second session: Subscribe now succeeds.
+	stream, err = d.sessionOnce(context.Background())
+	require.NoError(t, err, "second sessionOnce must succeed")
+	require.NotNil(t, stream, "second sessionOnce must return a stream")
+
+	assert.Equal(t, int32(2), registerCalls.Load(), "both sessions re-register")
+	assert.Equal(t, 1, readyCalls, "onReady must fire exactly once even though the first Subscribe failed")
+}
+
+// TestReconnectSession_SucceedsAfterFailures verifies the success path of the
+// retry loop: registerFn fails several times then succeeds, exercising the
+// fail → backoff (delay doubling) → succeed → return-stream branch that the
+// cancelled-ctx test does not. minReconnectInterval is set tiny so the doubling
+// runs without slowing the test. (#61)
+func TestReconnectSession_SucceedsAfterFailures(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.minReconnectInterval = time.Millisecond // tiny: backoff still doubles (1→2→4ms) but stays fast
+
+	var registerCalls atomic.Int32
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		if registerCalls.Add(1) <= 3 {
+			return nil, errors.New("hub unreachable")
+		}
+		return &pb.RegisterResponse{}, nil
+	}
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		subscribeCalls.Add(1)
+		return errStream(), nil
+	}
+
+	done := make(chan pb.HubFuse_SubscribeClient, 1)
+	go func() { done <- d.reconnectSession(context.Background()) }()
+
+	select {
+	case stream := <-done:
+		require.NotNil(t, stream, "reconnectSession must return the live stream once sessionOnce succeeds")
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnectSession did not return after the hub recovered")
+	}
+
+	assert.Equal(t, int32(4), registerCalls.Load(), "reconnectSession retries Register until success (3 failures + 1 success)")
+	assert.Equal(t, int32(1), subscribeCalls.Load(), "Subscribe runs only on the successful attempt")
+}
+
+// TestSupervise_ReconnectsMultipleTimesThenExitsOnCancel is the direct unit test
+// for supervise — the core of the #61 fix. It drives more than one reconnect (a
+// regression where supervise returns after the FIRST reconnect, e.g. return
+// instead of continue, would never reach the third stream) and asserts a prompt,
+// clean goroutine exit when ctx is cancelled while readStream is blocked.
+// minReconnectInterval stays 0 (buildTestDaemon) so the loop spins fast. (#61)
+func TestSupervise_ReconnectsMultipleTimesThenExitsOnCancel(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		// The first two reconnect streams die immediately, forcing supervise to
+		// loop and reconnect again; the third blocks until ctx cancel so we can
+		// assert a prompt, clean exit while readStream is blocked.
+		if subscribeCalls.Add(1) <= 2 {
+			return errStream(), nil
+		}
+		return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// The initial stream also dies immediately (read cycle 1).
+		d.supervise(ctx, errStream())
+		close(done)
+	}()
+
+	// Wait until supervise has reconnected more than once: subscribeFn called
+	// >= 3 times means two immediate-death reconnects plus the blocking one.
+	require.Eventually(t, func() bool {
+		return subscribeCalls.Load() >= 3
+	}, 2*time.Second, 5*time.Millisecond, "supervise must reconnect more than once")
+
+	// supervise is now blocked in readStream on the third stream; cancelling ctx
+	// must make it return promptly without another reconnect.
+	cancel()
+	select {
+	case <-done:
+		// returned promptly — good.
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervise did not return after ctx cancel — it is stuck")
+	}
+	assert.Equal(t, int32(3), subscribeCalls.Load(), "supervise must not reconnect again after ctx cancel")
+}
+
+// TestSupervise_FloorsReconnectAfterImmediateDeath verifies the reconnect floor:
+// when a session is established but its stream dies almost immediately, supervise
+// must wait out minReconnectInterval before reconnecting rather than spinning
+// with zero delay (CPU peg / hub hammering). (#61)
+func TestSupervise_FloorsReconnectAfterImmediateDeath(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.minReconnectInterval = 80 * time.Millisecond
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reconnected := make(chan time.Time, 1)
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		select {
+		case reconnected <- time.Now(): // record the first reconnect's timestamp
+		default:
+		}
+		return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}, nil
+	}
+
+	start := time.Now()
+	go d.supervise(ctx, errStream()) // initial stream dies immediately at ~start
+
+	var reconnectAt time.Time
+	select {
+	case reconnectAt = <-reconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervise never reconnected")
+	}
+
+	// The initial stream died almost immediately, so supervise must have waited
+	// out (most of) the 80ms floor before reconnecting. Generous slack below the
+	// floor absorbs scheduler/timer coarseness; a regression that drops the floor
+	// would reconnect in well under 60ms.
+	elapsed := reconnectAt.Sub(start)
+	assert.GreaterOrEqual(t, elapsed, 60*time.Millisecond,
+		"supervise must wait out minReconnectInterval before reconnecting after an immediate stream death")
+}
+
+// TestSessionOnce_RemountsPeerAtChangedEndpoint covers the daemon-level wiring of
+// the #61 end-user goal: a reconnect re-runs processInitialDevices from the fresh
+// Register snapshot, and a peer whose IP changed is remounted at the new
+// endpoint. Earlier sessionOnce tests pass an empty snapshot, so this is the only
+// coverage of snapshot → Mount → remount through the daemon. (#61)
+func TestSessionOnce_RemountsPeerAtChangedEndpoint(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "peer", Share: "docs", To: mountTo},
+	}
+	writePubKey(t, dir, "peer-device") // pair the peer so auto-mount proceeds
+
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil // returned stream is unused by this test
+	}
+
+	peerAt := func(ip string, port int32) *pb.RegisterResponse {
+		return &pb.RegisterResponse{
+			DevicesOnline: []*pb.DeviceInfo{{
+				DeviceId: "peer-device",
+				Nickname: "peer",
+				Ip:       ip,
+				SshPort:  port,
+				Shares:   []*pb.Share{{Alias: "docs", Permissions: "ro"}},
+			}},
+		}
+	}
+
+	// First session: peer online at 10.0.0.5 → auto-mount there.
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return peerAt("10.0.0.5", 2222), nil
+	}
+	_, err := d.sessionOnce(context.Background())
+	require.NoError(t, err, "first sessionOnce")
+
+	require.True(t, d.mounter.IsActive("peer", "docs"), "peer share must be mounted from the Register snapshot")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.0.0.5", mounts[0].IP, "initial mount endpoint")
+
+	// Peer roamed: the second session reports a new IP. processInitialDevices
+	// re-runs from the fresh snapshot and the mounter remounts at the new endpoint.
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return peerAt("10.0.0.99", 2222), nil
+	}
+	_, err = d.sessionOnce(context.Background())
+	require.NoError(t, err, "second sessionOnce")
+
+	require.True(t, d.mounter.IsActive("peer", "docs"), "peer share must still be mounted after roaming")
+	mounts = d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1, "exactly one mount after remount")
+	assert.Equal(t, "10.0.0.99", mounts[0].IP, "mount must follow the peer to the new endpoint after reconnect")
 }
 
 // ─── preflightMountBinary ──────────────────────────────────────────────────────

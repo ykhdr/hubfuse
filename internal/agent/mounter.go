@@ -541,6 +541,21 @@ func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 // is respected as-is so the total budget is not exceeded. (#50 bounded)
 const unmountOpTimeout = 5 * time.Second
 
+// reapMountCmd reaps a finished mount's backend process. sshfs daemonizes — it
+// forks and the parent we Start()ed exits 0 once the mount is up — so by the
+// time a mount is torn down (or reaped as dead) mnt.cmd is a long-exited zombie
+// and Wait() returns immediately; it therefore never blocks the bounded teardown
+// (#50). Without this reap a long-lived, frequently-roaming daemon (#61 remounts
+// on every endpoint change unmount this path) would accumulate unreaped child
+// processes. mnt.cmd is never read after Mount stores it, so reaping here cannot
+// race another reader.
+func reapMountCmd(mnt *Mount) {
+	if mnt == nil || mnt.cmd == nil {
+		return
+	}
+	_ = mnt.cmd.Wait()
+}
+
 // unmountKey is the core unmount implementation. It calls m.unmount(ctx, path,
 // force) and, on failure, re-checks whether the path is still a mountpoint via
 // mountpointGoneCtx. If the path is confirmed gone, the entry is reaped — deleted
@@ -582,8 +597,10 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard b
 			defer cancel()
 		}
 		if m.mountpointGoneCtx(recheckCtx, mnt.LocalPath) {
-			// Mount is already gone — reap the stale entry and return success.
+			// Mount is already gone — reap the stale entry and its backend
+			// process, then return success.
 			delete(m.activeMounts, key)
+			reapMountCmd(mnt)
 			m.logger.Warn("reaped dead mount entry",
 				"device", key.Device,
 				"share", key.Share,
@@ -604,8 +621,9 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard b
 	}
 
 	// Command succeeded — do NOT re-check (lazy unmount may still look mounted
-	// briefly). Delete and log.
+	// briefly). Delete the entry, reap the backend process, and log.
 	delete(m.activeMounts, key)
+	reapMountCmd(mnt)
 	m.logger.Info("unmounted share",
 		"device", key.Device,
 		"share", key.Share,
