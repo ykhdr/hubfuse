@@ -108,15 +108,15 @@
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
 
-- [ ] в `Mount` (mounter.go:278) заменить безусловную ошибку `"already mounted"` (L285) на ветвление под уже захваченным `m.mu`: same `IP`+`SSHPort` → `return nil`; другой endpoint → `unmountKey(ctxWithTimeout, key, true, false)` затем обычный flow; нет mount → обычный flow
-- [ ] обернуть remount-unmount в `context.WithTimeout(ctx, unmountOpTimeout)` с `cancel()`; при ошибке unmount вернуть оборачивающую ошибку и не монтировать новое
-- [ ] добавить `Info`-лог при перемонтировании (old IP → new IP, share, device)
-- [ ] тест: existing **same** endpoint → `Mount` возвращает `nil`, повторный `execCommand` не вызывается, `unmount` не вызывается
-- [ ] тест: existing **другой** endpoint → старый `unmount` вызван, новый mount стартован с новым IP/портом
-- [ ] тест: **нет** mount → обычный flow (регресс существующего поведения сохранён)
-- [ ] обновить существующий same-endpoint тест (`mounter_test.go:1094-1117`): ассерт ошибки `"already mounted"` (L1117) → `NoError`; переименовать намерение теста с «rejected» на «silent no-op»; поведение «без `guardTarget`» сохраняется (ранний `return nil` до `guardTarget`)
-- [ ] прогнать `go test ./internal/agent/...` — должно пройти перед Task 3
-- [ ] коммит + пуш (по workflow `CLAUDE.md`)
+- [x] в `Mount` (mounter.go:294) заменить безусловную ошибку `"already mounted"` на ветвление под уже захваченным `m.mu`: same `IP`+`SSHPort` → `return nil`; другой endpoint → `unmountKey(ctxWithTimeout, key, true, false)` затем обычный flow; нет mount → обычный flow
+- [x] обернуть remount-unmount в `context.WithTimeout(ctx, unmountOpTimeout)` с `cancel()`; при ошибке unmount вернуть оборачивающую ошибку (`"...: unmount stale endpoint ...: %w"`) и не монтировать новое
+- [x] добавить `Info`-лог при перемонтировании («re-mounting peer at new endpoint» — device, share, old_ip/old_port → new_ip/new_port)
+- [x] тест: existing **same** endpoint → `Mount` возвращает `nil`, повторный `execCommand` не вызывается, `unmount` не вызывается (`TestMount_SameEndpointIsSilentNoOp`)
+- [x] тест: existing **другой** endpoint → старый `unmount` вызван (force=true), новый mount стартован с новым IP/портом (`TestMount_DifferentEndpointRemounts`, table: ip/port/both); плюс edge-case `TestMount_RemountUnmountFailureAborts` (unmount fail → ошибка, новый mount не стартует, stale entry удержан)
+- [x] тест: **нет** mount → обычный flow (регресс сохранён) (`TestMount_NoExistingMountProceedsNormally`)
+- [x] обновить существующий same-endpoint тест: ассерт ошибки `"already mounted"` → `NoError`; `TestMount_RejectsDuplicateMount` → `TestMount_SameEndpointIsSilentNoOp`, `TestGuardTarget_RemountActiveKeyDoesNotChmod` → `TestGuardTarget_SameEndpointRemountIsSilentNoOp` (намерение «rejected» → «silent no-op»); поведение «без `guardTarget`» сохранено (ранний `return nil` до `guardTarget`)
+- [x] прогнать `go test ./internal/agent/...` — прошло (зелёный); `go build ./...` + `go vet ./...` чисто
+- [x] коммит + пуш (по workflow `CLAUDE.md`) — push пропущен (нет GitHub-кредов в окружении); сделан только локальный коммит
 
 ### Task 3: Супервизор переподключения в daemon.go
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -480,31 +481,185 @@ func TestMount_CreatesMountPointDirectory(t *testing.T) {
 	assert.NoError(t, err, "mount point directory not created")
 }
 
-func TestMount_RejectsDuplicateMount(t *testing.T) {
+// TestMount_SameEndpointIsSilentNoOp verifies that a second Mount for an
+// already-mounted key at the SAME peer endpoint (unchanged IP+SSHPort) is a
+// silent no-op: it returns nil, does not re-invoke the mount backend, and does
+// not unmount the live mount. This replaces the old "duplicate is rejected"
+// behaviour — a re-Register that re-announces an unchanged endpoint must not
+// churn the live mount. (#61 remount-on-endpoint-change)
+func TestMount_SameEndpointIsSilentNoOp(t *testing.T) {
 	dir := t.TempDir()
 	knownDir := filepath.Join(dir, common.KnownDevicesDir)
 	keyPath := filepath.Join(dir, "id_ed25519")
 
 	writePubKeyFile(t, knownDir, "device-a")
 
-	m := newTestMounter(t, knownDir, keyPath, nil, nil)
-
-	mc := agentconfig.MountConfig{
-		Device: "device-a",
-		Share:  "docs",
-		To:     filepath.Join(dir, "mnt1"),
+	var execCalls atomic.Int32
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	m.execCommand = func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		if runtime.GOOS == "windows" {
+			return exec.Command("cmd", "/C", "exit 0")
+		}
+		return exec.Command("true")
 	}
 
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: filepath.Join(dir, "mnt1")}
 	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount must invoke the backend once")
 
-	mc2 := agentconfig.MountConfig{
-		Device: "device-a",
-		Share:  "docs",
-		To:     filepath.Join(dir, "mnt2"),
+	// Second Mount for the SAME endpoint (even with a different 'to' path) must
+	// be a silent no-op: same IP+port wins and the original mount is retained.
+	mc2 := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: filepath.Join(dir, "mnt2")}
+	require.NoError(t, m.Mount(context.Background(), mc2, "device-a", "10.0.0.1", 2222),
+		"second Mount() at the same endpoint must be a silent no-op (nil)")
+
+	assert.Equal(t, int32(1), execCalls.Load(), "same-endpoint re-Mount must NOT re-invoke the backend")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "same-endpoint re-Mount must NOT unmount the live mount")
+
+	// The original mount (mnt1) is retained unchanged.
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "exactly one active mount")
+	assert.Equal(t, filepath.Join(dir, "mnt1"), mounts[0].LocalPath, "original mount must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
+}
+
+// TestMount_DifferentEndpointRemounts verifies that when a mount already exists
+// for a key but the peer has roamed to a NEW endpoint (changed IP, port, or
+// both), Mount force-unmounts the stale mount and re-mounts at the new endpoint,
+// recording the new IP/port and invoking the backend with the new source.
+// (#61 remount-on-endpoint-change)
+func TestMount_DifferentEndpointRemounts(t *testing.T) {
+	tests := []struct {
+		name    string
+		oldIP   string
+		oldPort int
+		newIP   string
+		newPort int
+	}{
+		{name: "ip change", oldIP: "10.0.0.1", oldPort: 2222, newIP: "10.0.0.99", newPort: 2222},
+		{name: "port change", oldIP: "10.0.0.1", oldPort: 2222, newIP: "10.0.0.1", newPort: 2200},
+		{name: "ip and port change", oldIP: "10.0.0.1", oldPort: 2222, newIP: "10.0.0.99", newPort: 2200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			knownDir := filepath.Join(dir, common.KnownDevicesDir)
+			keyPath := filepath.Join(dir, "id_ed25519")
+			mountTo := filepath.Join(dir, "mnt", "docs")
+			t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+			writePubKeyFile(t, knownDir, "device-a")
+
+			var unmountCalls atomic.Int32
+			var unmountForce atomic.Bool
+			var capturedArgs []string
+			m := newTestMounter(t, knownDir, keyPath, &capturedArgs, func(_ context.Context, _ string, force bool) error {
+				unmountCalls.Add(1)
+				unmountForce.Store(force)
+				return nil
+			})
+
+			mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", tt.oldIP, tt.oldPort), "first Mount()")
+
+			// Peer roamed to a new endpoint. Re-Mount with the same key.
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", tt.newIP, tt.newPort),
+				"re-Mount at a new endpoint must succeed")
+
+			assert.Equal(t, int32(1), unmountCalls.Load(), "stale mount must be unmounted exactly once")
+			assert.True(t, unmountForce.Load(), "stale-endpoint unmount must be forced")
+
+			// The new mount must be recorded at the new endpoint.
+			mounts := m.ActiveMounts()
+			require.Len(t, mounts, 1, "exactly one active mount after remount")
+			assert.Equal(t, tt.newIP, mounts[0].IP, "active mount must record the new IP")
+			assert.Equal(t, tt.newPort, mounts[0].SSHPort, "active mount must record the new port")
+
+			// The backend was re-invoked targeting the new endpoint.
+			require.NotEmpty(t, capturedArgs, "backend must be invoked for the new mount")
+			assert.Contains(t, capturedArgs, fmt.Sprintf("hubfuse@%s:docs", tt.newIP),
+				"new mount must target the new endpoint")
+			assert.Contains(t, capturedArgs, "-p", "new mount must pass an SSH port flag")
+			assert.Contains(t, capturedArgs, fmt.Sprintf("%d", tt.newPort), "new mount must pass the new SSH port")
+		})
+	}
+}
+
+// TestMount_RemountUnmountFailureAborts verifies that when the peer roamed but
+// the stale mount cannot be torn down (unmount fails AND the mountpoint is still
+// present), Mount returns a wrapping error and does NOT start a new mount — the
+// stale entry is retained at the old endpoint for a later retry.
+// (#61 remount-on-endpoint-change)
+func TestMount_RemountUnmountFailureAborts(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		return errors.New("device is busy")
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
 	}
 
-	err := m.Mount(context.Background(), mc2, "device-a", "10.0.0.1", 2222)
-	assert.Error(t, err, "second Mount() expected error for duplicate")
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// checkMountpoint stays true (newTestMounter default) → the failed unmount's
+	// re-check sees the mount still present → unmountKey retains the entry + errors.
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.99", 2222)
+	require.Error(t, err, "re-Mount must fail when the stale endpoint cannot be unmounted")
+	assert.Contains(t, err.Error(), "unmount stale endpoint", "error must explain the remount failure")
+
+	// No new mount was started, and the stale entry is retained at the OLD endpoint.
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation when unmount fails")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "stale entry must be retained for retry")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP, "retained entry must still hold the old endpoint")
+}
+
+// TestMount_NoExistingMountProceedsNormally verifies the baseline path is
+// unchanged: when no mount exists for the key, Mount runs the normal flow,
+// never calls unmount, and records an active mount at the requested endpoint.
+// (#61 regression guard)
+func TestMount_NoExistingMountProceedsNormally(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "192.168.1.7", 2222), "Mount()")
+
+	assert.Zero(t, unmountCalls.Load(), "a first mount must never call unmount")
+	require.True(t, m.IsActive("device-a", "docs"), "mount must be active")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "192.168.1.7", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
 }
 
 func TestMount_RecordsActiveMount(t *testing.T) {
@@ -1152,11 +1307,12 @@ func TestGuardTarget_MountRestrictsOnCreation(t *testing.T) {
 	assert.Equal(t, mountableMode, info.Mode().Perm(), "mount target must be made mountable (owner-writable) for the backend to attach")
 }
 
-// TestGuardTarget_RemountActiveKeyDoesNotChmod verifies that Mount for a key that
-// is already active is rejected as "already mounted" WITHOUT running guardTarget.
-// guardTarget runs only after the already-mounted check, so it can never chmod a
-// path that is currently a live mount of ours. (#49 guard ordering)
-func TestGuardTarget_RemountActiveKeyDoesNotChmod(t *testing.T) {
+// TestGuardTarget_SameEndpointRemountIsSilentNoOp verifies that Mount for a key
+// that is already active at the SAME endpoint is a silent no-op (returns nil)
+// WITHOUT running guardTarget. The same-endpoint early return happens before
+// guardTarget, so it can never chmod a path that is currently a live mount of
+// ours. (#49 guard ordering; #61 silent no-op)
+func TestGuardTarget_SameEndpointRemountIsSilentNoOp(t *testing.T) {
 	dir := t.TempDir()
 	knownDir := filepath.Join(dir, common.KnownDevicesDir)
 	keyPath := filepath.Join(dir, "id_ed25519")
@@ -1169,18 +1325,18 @@ func TestGuardTarget_RemountActiveKeyDoesNotChmod(t *testing.T) {
 	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
 	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222))
 
-	// Simulate a live FUSE mount root exposing a distinct mode that a re-mount
-	// must not clobber.
+	// Simulate a live FUSE mount root exposing a distinct mode that a re-mount at
+	// the same endpoint must not clobber.
 	const sentinel os.FileMode = 0o755
 	require.NoError(t, os.Chmod(mountTo, sentinel))
 
-	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "already mounted")
+	// Same endpoint → silent no-op (nil), not an error, and no guardTarget chmod.
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222),
+		"re-Mount at the same endpoint must be a silent no-op")
 
 	info, statErr := os.Stat(mountTo)
 	require.NoError(t, statErr)
-	assert.Equal(t, sentinel, info.Mode().Perm(), "re-mount of an active key must not chmod the (live) mount target")
+	assert.Equal(t, sentinel, info.Mode().Perm(), "same-endpoint re-Mount must not chmod the (live) mount target")
 }
 
 // TestGuardTarget_FailedMountLeavesTargetRestricted verifies that when Mount

@@ -297,8 +297,44 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.activeMounts[key]; exists {
-		return fmt.Errorf("share %q from device %q is already mounted", mc.Share, mc.Device)
+	// An existing mount for this key is not necessarily an error. If the peer's
+	// endpoint is unchanged it is a silent no-op; if the peer roamed to a new
+	// IP/port we tear the stale mount down and re-mount at the new endpoint — all
+	// under the same m.mu so a concurrent tryMount (config-watcher goroutine) and
+	// handleDeviceOnline (supervise goroutine) can never interleave a
+	// check-and-remount, and all four Mount call sites get this for free. (#61)
+	if existing, exists := m.activeMounts[key]; exists {
+		if existing.IP == deviceIP && existing.SSHPort == sshPort {
+			// Same endpoint — the live mount already points at the right place.
+			// Return BEFORE guardTarget so a live mount's masked mode is never
+			// clobbered.
+			return nil
+		}
+		// Peer roamed (DHCP address change / SSH port change). Tear down the stale
+		// mount pointing at the now-dead old endpoint, then fall through to the
+		// normal mount flow to attach a fresh mount at the new endpoint.
+		m.logger.Info("re-mounting peer at new endpoint",
+			"device", mc.Device,
+			"share", mc.Share,
+			"old_ip", existing.IP,
+			"old_port", existing.SSHPort,
+			"new_ip", deviceIP,
+			"new_port", sshPort,
+		)
+		// force=true: the old endpoint is most likely unreachable, so the unmount
+		// must escalate (the force ladder reaches umount -l). reguard=false: the
+		// normal flow below re-guards the target via guardTarget. Bound the
+		// unmount with unmountOpTimeout — this remount path has no caller deadline.
+		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
+		err := m.unmountKey(rctx, key, true /*force*/, false /*reguard*/)
+		cancel()
+		if err != nil {
+			// Could not tear down the stale mount — do NOT start a new one; the
+			// stale entry is retained (by unmountKey) for a later retry.
+			return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
+				mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
+		}
+		// Stale entry removed; continue into the normal mount flow below.
 	}
 
 	// Create the mount point directory (if needed) and restrict it immediately so
