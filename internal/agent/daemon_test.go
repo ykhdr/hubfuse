@@ -78,6 +78,7 @@ agent {
 		logger:        discardLogger(),
 		onlineDevices: make(map[string]*OnlineDevice),
 		dataDir:       dir,
+		sshPort:       cfg.Agent.SSHPort,
 	}
 
 	return d, dir
@@ -357,6 +358,43 @@ func TestHandleDeviceOnline_AutoMountsAllSharesOfPeer(t *testing.T) {
 		"photos must remount at the new endpoint after roam — every share follows the roam, not just the first")
 }
 
+// TestHandleDeviceOnline_MountsOnlyExportedShares verifies that auto-mount
+// intersects local config with the peer's actually-exported shares: a share the
+// peer no longer exports (e.g. a SharesUpdated removal missed while the stream was
+// down) must NOT be (re)mounted to a now-dead share. (#61)
+func TestHandleDeviceOnline_MountsOnlyExportedShares(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	// Local config mounts BOTH shares...
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// ...but the peer now exports ONLY "docs".
+	evt := &pb.DeviceOnlineEvent{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs", Permissions: "ro"}},
+	}
+
+	d.handleDeviceOnline(evt)
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "the exported share must mount")
+	assert.False(t, d.mounter.IsActive("laptop", "photos"),
+		"a share the peer no longer exports must NOT be mounted")
+}
+
 // ─── handleDeviceOffline ──────────────────────────────────────────────────────
 
 func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
@@ -481,13 +519,14 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 		{Device: "peer-laptop", Share: "docs", To: filepath.Join(dir, "mnt", "docs")},
 	}
 
-	// The peer is online.
+	// The peer is online and exports the configured share.
 	d.mu.Lock()
 	d.onlineDevices["peer-device-999"] = &OnlineDevice{
 		DeviceID: "peer-device-999",
 		Nickname: "peer-laptop",
 		IP:       "10.0.0.7",
 		SSHPort:  2222,
+		Shares:   []string{"docs"},
 	}
 	d.mu.Unlock()
 
@@ -499,6 +538,47 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 	d.handlePairingCompleted(evt)
 
 	assert.True(t, d.mounter.IsActive("peer-laptop", "docs"), "share should be mounted after pairing completed for an online + configured device")
+}
+
+// TestHandlePairingCompleted_AutoMountsAllExportedSharesOfPeer verifies that a
+// multi-share peer already online when pairing completes gets ALL of its
+// configured+exported shares mounted immediately — not just the first. (#61)
+func TestHandlePairingCompleted_AutoMountsAllExportedSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "peer-laptop", Share: "docs", To: docsTo},
+		{Device: "peer-laptop", Share: "photos", To: photosTo},
+	}
+
+	// Peer already online, exporting BOTH shares, at pairing-completion time.
+	d.mu.Lock()
+	d.onlineDevices["peer-device-999"] = &OnlineDevice{
+		DeviceID: "peer-device-999",
+		Nickname: "peer-laptop",
+		IP:       "10.0.0.7",
+		SSHPort:  2222,
+		Shares:   []string{"docs", "photos"},
+	}
+	d.mu.Unlock()
+
+	evt := &pb.PairingCompletedEvent{
+		PeerDeviceId:  "peer-device-999",
+		PeerPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpeer test@host",
+	}
+
+	d.handlePairingCompleted(evt)
+
+	assert.True(t, d.mounter.IsActive("peer-laptop", "docs"), "docs must mount on pairing completion")
+	assert.True(t, d.mounter.IsActive("peer-laptop", "photos"),
+		"photos must ALSO mount on pairing completion — not just the first configured share")
 }
 
 func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
@@ -630,26 +710,85 @@ func TestIsPaired_FalseWhenKeyMissing(t *testing.T) {
 	assert.False(t, d.isPaired("unknown-device"), "isPaired() = true for a device with no key file, want false")
 }
 
-// ─── shouldMount ──────────────────────────────────────────────────────────────
+// ─── sessionOnce: register port + config-reload race (#61) ─────────────────────
 
-func TestShouldMount_TrueWhenConfigured(t *testing.T) {
-	d, dir := buildTestDaemon(t)
+// TestSessionOnce_RegistersStartupSSHPortNotLiveConfig verifies that a re-register
+// advertises the SSH port the embedded server actually bound at startup
+// (d.sshPort), NOT a value the live config may have hot-reloaded. The SSH server
+// is not restarted on config change, so advertising the config value would point
+// peers at a dead endpoint. (#61)
+func TestSessionOnce_RegistersStartupSSHPortNotLiveConfig(t *testing.T) {
+	d, _ := buildTestDaemon(t) // d.sshPort == 2222 (the bound port)
 
-	d.config.Mounts = []agentconfig.MountConfig{
-		{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")},
+	// Simulate a config hot-reload that changed ssh-port while the server keeps
+	// listening on the original port.
+	d.mu.Lock()
+	d.config.Agent.SSHPort = 9999
+	d.mu.Unlock()
+
+	var gotPort int
+	d.registerFn = func(_ context.Context, _ []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
+		gotPort = sshPort
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
 	}
 
-	mc, ok := d.shouldMount("laptop")
-	require.True(t, ok, "shouldMount() = false, want true for configured device")
-	assert.Equal(t, "docs", mc.Share)
+	_, err := d.sessionOnce(context.Background())
+	require.NoError(t, err, "sessionOnce")
+	assert.Equal(t, 2222, gotPort,
+		"re-register must advertise the SSH server's startup port, not the hot-reloaded config value")
 }
 
-func TestShouldMount_FalseWhenNotConfigured(t *testing.T) {
+// TestSessionOnce_ConcurrentConfigReloadNoRace drives sessionOnce concurrently
+// with onConfigChange (which swaps d.config under d.mu). Under -race this fails if
+// sessionOnce reads d.config without the lock — the exact data race the supervisor
+// introduced, since it re-runs sessionOnce on every reconnect alongside the config
+// watcher. (#61)
+func TestSessionOnce_ConcurrentConfigReloadNoRace(t *testing.T) {
 	d, _ := buildTestDaemon(t)
-	d.config.Mounts = nil
 
-	_, ok := d.shouldMount("unconfigured-device")
-	assert.False(t, ok, "shouldMount() = true for unconfigured device, want false")
+	d.registerFn = func(_ context.Context, shares []*pb.Share, _ int) (*pb.RegisterResponse, error) {
+		_ = len(shares) // touch the snapshot so -race observes the read
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	// Two configs with identical content but distinct pointers: ComputeDiff is
+	// empty, so onConfigChange only swaps the d.config pointer (the racing write)
+	// without touching the nil test hubClient or the mounter.
+	mkCfg := func() *agentconfig.Config {
+		return &agentconfig.Config{
+			Agent: agentconfig.AgentConfig{SSHPort: 2222},
+			Shares: []agentconfig.ShareConfig{
+				{Alias: "docs", Path: "/docs", Permissions: "ro", AllowedDevices: []string{"all"}},
+			},
+		}
+	}
+
+	done := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				d.onConfigChange(mkCfg(), mkCfg())
+			}
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		_, err := d.sessionOnce(context.Background())
+		require.NoError(t, err, "sessionOnce #%d", i)
+	}
+	close(done)
+	<-writerDone
 }
 
 // ─── processInitialDevices ────────────────────────────────────────────────────
@@ -718,6 +857,40 @@ func TestProcessInitialDevices_AutoMountsAllSharesOfPeer(t *testing.T) {
 	assert.Equal(t, "10.0.0.99", endpoints["docs"], "docs must remount at the new endpoint on reconnect")
 	assert.Equal(t, "10.0.0.99", endpoints["photos"],
 		"photos must remount at the new endpoint on reconnect — every share follows the roam")
+}
+
+// TestProcessInitialDevices_MountsOnlyExportedShares verifies the reconnect
+// snapshot path intersects local config with the peer's exported shares: a config
+// mount for a share the peer no longer exports in the snapshot must NOT be
+// (re)mounted. (#61)
+func TestProcessInitialDevices_MountsOnlyExportedShares(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// The Register snapshot reports the peer exporting ONLY "docs".
+	d.processInitialDevices([]*pb.DeviceInfo{{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs"}},
+	}})
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "the exported share must mount from the snapshot")
+	assert.False(t, d.mounter.IsActive("laptop", "photos"),
+		"a share absent from the snapshot must NOT be mounted")
 }
 
 // ─── supervisor: session reconnect (#61) ──────────────────────────────────────

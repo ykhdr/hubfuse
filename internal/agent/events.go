@@ -60,17 +60,17 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	// (closes the online-gap window for this peer — issue #48).
 	d.rememberNickname(e.DeviceId, e.Nickname)
 
-	mounts := d.mountsForDevice(e.Nickname)
+	mounts := d.mountsForOnlineDevice(info)
 	if len(mounts) == 0 {
 		return
 	}
 	if !d.isPaired(e.DeviceId) {
 		return
 	}
-	// Mount/remount EVERY configured share for this peer. When the peer roamed to
-	// a new IP/port, Mount's remount branch tears down each stale share and
-	// re-points it at the new endpoint — so a multi-share peer recovers ALL of its
-	// shares, not just the first. (#61)
+	// Mount/remount EVERY configured share the peer still exports. When the peer
+	// roamed to a new IP/port, Mount's remount branch tears down each stale share
+	// and re-points it at the new endpoint — so a multi-share peer recovers ALL of
+	// its shares, not just the first; a share it stopped exporting is skipped. (#61)
 	for _, mc := range mounts {
 		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 			d.logger.Error("auto-mount on device-online failed",
@@ -222,16 +222,16 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 		return
 	}
 
-	mc, shouldMount := d.shouldMount(info.Nickname)
-	if !shouldMount {
-		return
-	}
-
-	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
-		d.logger.Error("auto-mount after pairing failed",
-			"device", info.Nickname,
-			"share", mc.Share,
-			"error", err,
-		)
+	// Mount EVERY configured share the peer currently exports, not just the first:
+	// a multi-share peer already online when pairing completes must get all of its
+	// shares immediately, consistent with the device-online and reconnect paths. (#61)
+	for _, mc := range d.mountsForOnlineDevice(info) {
+		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+			d.logger.Error("auto-mount after pairing failed",
+				"device", info.Nickname,
+				"share", mc.Share,
+				"error", err,
+			)
+		}
 	}
 }

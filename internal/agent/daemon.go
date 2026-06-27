@@ -57,6 +57,14 @@ type Daemon struct {
 	// dataDir is the base data directory (~/.hubfuse by default).
 	dataDir string
 
+	// sshPort is the port the embedded SSH server bound at startup. It is
+	// captured once in NewDaemon and never changes: the SSH server binds its port
+	// once and is not restarted on config hot-reload, so every (re)Register must
+	// advertise THIS port — not the live config's ssh-port — or a roaming peer
+	// would remount to an endpoint the daemon isn't actually listening on. Read
+	// without a lock: it is written once, before any goroutine starts. (#61)
+	sshPort int
+
 	onReady func()
 
 	// readyOnce guards onReady so it fires exactly once for the daemon's
@@ -166,6 +174,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		onlineDevices: make(map[string]*OnlineDevice),
 		nicknames:     cachedNicknames,
 		dataDir:       dir,
+		sshPort:       sshPort,
 		onReady:       opts.OnReady,
 
 		minReconnectInterval: backoffInitial,
@@ -451,8 +460,20 @@ func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
 // (Register ok, Subscribe failed) returns an error and the caller retries the
 // whole sessionOnce — a repeat Register is idempotent on the hub.
 func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
-	shares := configSharesToProto(d.config.Shares)
-	regResp, err := d.registerFn(ctx, shares, d.config.Agent.SSHPort)
+	// Snapshot the config pointer under the lock before reading shares: the
+	// supervisor re-runs sessionOnce on every reconnect, concurrently with the
+	// config watcher's onConfigChange, which swaps d.config under d.mu. Read it the
+	// same way every other supervisor-path access does (mountsForOnlineDevice,
+	// guardConfiguredTargets) — onConfigChange only ever replaces the pointer, so a
+	// snapshotted *Config is immutable. The SSH port comes from the immutable
+	// startup value (d.sshPort), never the live config, so a re-register always
+	// advertises the port the embedded SSH server is actually listening on. (#61)
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+
+	shares := configSharesToProto(cfg.Shares)
+	regResp, err := d.registerFn(ctx, shares, d.sshPort)
 	if err != nil {
 		return nil, fmt.Errorf("register with hub: %w", err)
 	}
@@ -658,15 +679,16 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 		// next restart (closes the online-gap window for this peer).
 		d.rememberNickname(dev.DeviceId, dev.Nickname)
 
-		mounts := d.mountsForDevice(dev.Nickname)
+		mounts := d.mountsForOnlineDevice(info)
 		if len(mounts) == 0 {
 			continue
 		}
 		if !d.isPaired(dev.DeviceId) {
 			continue
 		}
-		// Mount/remount EVERY configured share for this peer — a multi-share peer
-		// must recover all of its shares on (re)connect, not just the first. (#61)
+		// Mount/remount EVERY configured share the peer still exports — a
+		// multi-share peer must recover all of its shares on (re)connect, not just
+		// the first, but a share it stopped exporting must not be re-mounted. (#61)
 		for _, mc := range mounts {
 			if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
 				d.logger.Error("auto-mount failed",
@@ -679,35 +701,43 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	}
 }
 
-// mountsForDevice returns every configured mount whose device nickname matches
-// deviceNickname. A single peer can export multiple shares — each its own mount
-// entry — so the auto-mount/remount paths must act on ALL of them: returning only
-// the first would leave a multi-share peer's other shares unmounted and, after a
-// roam, stranded on the dead old endpoint. Returns nil when none match. (#61)
-func (d *Daemon) mountsForDevice(deviceNickname string) []agentconfig.MountConfig {
+// mountsForOnlineDevice returns the configured mounts that should be (re)mounted
+// for an online peer: those whose device nickname matches info.Nickname AND whose
+// share the peer is currently exporting (info.Shares). Both halves matter:
+//
+//   - A single peer can export multiple shares — each its own mount entry — so the
+//     auto-mount/remount paths must act on ALL of them, not just the first, or a
+//     multi-share peer's other shares stay unmounted and, after a roam, stranded
+//     on the dead old endpoint.
+//   - Intersecting with the peer's exported set (from the Register snapshot or the
+//     DeviceOnline event) means a share the peer stopped exporting — a
+//     SharesUpdated removal missed while the event stream was down — is never
+//     (re)mounted to a now-dead share. (We do not unmount an already-stale mount
+//     here; that add-only-no-prune reconnect behaviour is a documented tradeoff.)
+//
+// The config pointer is snapshotted under the lock (onConfigChange swaps it under
+// d.mu). Returns nil when nothing matches. (#61)
+func (d *Daemon) mountsForOnlineDevice(info *OnlineDevice) []agentconfig.MountConfig {
 	d.mu.RLock()
 	cfg := d.config
 	d.mu.RUnlock()
 
+	exported := make(map[string]struct{}, len(info.Shares))
+	for _, s := range info.Shares {
+		exported[s] = struct{}{}
+	}
+
 	var mounts []agentconfig.MountConfig
 	for _, mc := range cfg.Mounts {
-		if mc.Device == deviceNickname {
-			mounts = append(mounts, mc)
+		if mc.Device != info.Nickname {
+			continue
 		}
+		if _, ok := exported[mc.Share]; !ok {
+			continue
+		}
+		mounts = append(mounts, mc)
 	}
 	return mounts
-}
-
-// shouldMount reports whether the config has at least one mount entry for a
-// device with the given nickname, returning the first match. Paths that must
-// handle every share of a multi-share peer use mountsForDevice instead; this
-// first-match form remains for the single-mount pairing path.
-func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bool) {
-	mounts := d.mountsForDevice(deviceNickname)
-	if len(mounts) > 0 {
-		return mounts[0], true
-	}
-	return agentconfig.MountConfig{}, false
 }
 
 // isPaired reports whether a device is paired by checking for a public key
