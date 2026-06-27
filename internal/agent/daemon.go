@@ -506,6 +506,14 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 // transport under the hood, so a fresh dial is unnecessary.
 func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClient {
 	delay := d.minReconnectInterval
+	if delay <= 0 {
+		// Floor the FAILURE backoff so a persistent Register failure cannot
+		// busy-spin if minReconnectInterval was left at 0 (the ">0" invariant is
+		// unenforced; NewDaemon sets backoffInitial, but this guards callers that
+		// don't). Only the backoff delay is floored — the success path returns
+		// before this is read, and the supervise floor is independent. (#61)
+		delay = backoffInitial
+	}
 	for {
 		stream, err := d.sessionOnce(ctx)
 		if err == nil {

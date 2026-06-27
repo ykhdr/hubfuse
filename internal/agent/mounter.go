@@ -326,7 +326,7 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		// normal flow below re-guards the target via guardTarget. Bound the
 		// unmount with unmountOpTimeout — this remount path has no caller deadline.
 		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
-		err := m.unmountKey(rctx, key, true /*force*/, false /*reguard*/)
+		err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
 		cancel()
 		if err != nil {
 			// Could not tear down the stale mount — do NOT start a new one; the
@@ -362,7 +362,7 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	}
 
 	// Materialise known_hosts under the lock so concurrent Mounts for the same
-	// device cannot race-clobber each other, and so a duplicate-mount rejection
+	// device cannot race-clobber each other, and so the same-endpoint early-return
 	// above cannot leave a rewritten file on disk.
 	knownHostsPath, err := m.writeKnownHostsFile(deviceID, deviceIP, sshPort)
 	if err != nil {
