@@ -568,10 +568,13 @@ func reapMountCmd(mnt *Mount) {
 // reguard controls whether to re-restrict the target dir to guardMode after the
 // entry is removed (#49 guard-target). Pass reguard=true for all interactive and
 // device-offline paths (the target stays in config and must be re-restricted so
-// stray writes are blocked until the next mount); pass reguard=false only for
-// shutdown (UnmountAllForce), where the process is exiting and the chmod is
-// pointless. reguard failures are logged at WARN and never returned — a re-guard
-// error must not turn a successful unmount into a failure.
+// stray writes are blocked until the next mount). Pass reguard=false for two
+// callers: shutdown (UnmountAllForce), where the process is exiting and the chmod
+// is pointless; and the remount path (Mount's endpoint-change branch), where the
+// normal mount flow that immediately follows re-guards the target itself, so a
+// reguard here would be redundant work instantly undone. reguard failures are
+// logged at WARN and never returned — a re-guard error must not turn a successful
+// unmount into a failure.
 //
 // The caller must hold m.mu.
 func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard bool) error {

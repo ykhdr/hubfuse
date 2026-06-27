@@ -302,6 +302,61 @@ func TestHandleDeviceOnline_NoMountWhenNotPaired(t *testing.T) {
 	assert.False(t, d.mounter.IsActive("laptop", "docs"), "share should NOT be mounted for an unpaired device")
 }
 
+// TestHandleDeviceOnline_AutoMountsAllSharesOfPeer verifies that a peer exporting
+// MULTIPLE configured shares gets ALL of them mounted on DeviceOnline, and that
+// after the peer roams to a new endpoint every share remounts at the new IP — not
+// just the first matching mount entry. (#61 multi-share remount)
+func TestHandleDeviceOnline_AutoMountsAllSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	// Two mount entries for the same peer nickname — one per exported share.
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+
+	writePubKey(t, dir, "device-123")
+
+	online := func(ip string) *pb.DeviceOnlineEvent {
+		return &pb.DeviceOnlineEvent{
+			DeviceId: "device-123",
+			Nickname: "laptop",
+			Ip:       ip,
+			SshPort:  2222,
+			Shares: []*pb.Share{
+				{Alias: "docs", Permissions: "ro"},
+				{Alias: "photos", Permissions: "ro"},
+			},
+		}
+	}
+
+	// First online: BOTH shares must mount at the initial endpoint.
+	d.handleDeviceOnline(online("10.0.0.5"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount on device-online")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"),
+		"photos must also mount on device-online — not just the first configured share")
+
+	// Peer roamed to a new IP. BOTH shares must remount at the new endpoint.
+	d.handleDeviceOnline(online("10.0.0.99"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must stay mounted after roam")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"), "photos must stay mounted after roam")
+
+	endpoints := make(map[string]string)
+	for _, mnt := range d.mounter.ActiveMounts() {
+		endpoints[mnt.Share] = mnt.IP
+	}
+	assert.Equal(t, "10.0.0.99", endpoints["docs"], "docs must remount at the new endpoint after roam")
+	assert.Equal(t, "10.0.0.99", endpoints["photos"],
+		"photos must remount at the new endpoint after roam — every share follows the roam, not just the first")
+}
+
 // ─── handleDeviceOffline ──────────────────────────────────────────────────────
 
 func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
@@ -615,6 +670,54 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
 	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
 	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
+}
+
+// TestProcessInitialDevices_AutoMountsAllSharesOfPeer verifies the reconnect path:
+// the RegisterResponse snapshot auto-mounts EVERY configured share of a paired
+// multi-share peer, and a later snapshot reporting a roamed endpoint remounts all
+// of them at the new IP — not just the first. (#61 multi-share remount)
+func TestProcessInitialDevices_AutoMountsAllSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+
+	writePubKey(t, dir, "device-123")
+
+	snapshot := func(ip string) []*pb.DeviceInfo {
+		return []*pb.DeviceInfo{{
+			DeviceId: "device-123",
+			Nickname: "laptop",
+			Ip:       ip,
+			SshPort:  2222,
+			Shares:   []*pb.Share{{Alias: "docs"}, {Alias: "photos"}},
+		}}
+	}
+
+	// Initial register snapshot: both shares mount.
+	d.processInitialDevices(snapshot("10.0.0.5"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount from the register snapshot")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"),
+		"photos must also mount from the register snapshot — not just the first share")
+
+	// Reconnect snapshot reports the peer at a new endpoint: both shares remount.
+	d.processInitialDevices(snapshot("10.0.0.99"))
+	endpoints := make(map[string]string)
+	for _, mnt := range d.mounter.ActiveMounts() {
+		endpoints[mnt.Share] = mnt.IP
+	}
+	assert.Equal(t, "10.0.0.99", endpoints["docs"], "docs must remount at the new endpoint on reconnect")
+	assert.Equal(t, "10.0.0.99", endpoints["photos"],
+		"photos must remount at the new endpoint on reconnect — every share follows the roam")
 }
 
 // ─── supervisor: session reconnect (#61) ──────────────────────────────────────

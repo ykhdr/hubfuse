@@ -642,7 +642,10 @@ func (d *Daemon) Shutdown() error {
 }
 
 // processInitialDevices handles the list of online devices received on Register.
-// For each device that is paired and has a mount configured, it auto-mounts.
+// For each device that is paired, it auto-mounts every share configured for that
+// device. processInitialDevices runs again on every reconnect, so a roaming peer
+// whose endpoint changed has each of its shares re-pointed at the new IP/port by
+// Mount's remount branch. (#61)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	for _, dev := range devices {
 		info := protoToOnlineDevice(dev)
@@ -655,34 +658,54 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 		// next restart (closes the online-gap window for this peer).
 		d.rememberNickname(dev.DeviceId, dev.Nickname)
 
-		mc, shouldMount := d.shouldMount(dev.Nickname)
-		if !shouldMount {
+		mounts := d.mountsForDevice(dev.Nickname)
+		if len(mounts) == 0 {
 			continue
 		}
 		if !d.isPaired(dev.DeviceId) {
 			continue
 		}
-		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
-			d.logger.Error("auto-mount failed",
-				"device", dev.Nickname,
-				"share", mc.Share,
-				"error", err,
-			)
+		// Mount/remount EVERY configured share for this peer — a multi-share peer
+		// must recover all of its shares on (re)connect, not just the first. (#61)
+		for _, mc := range mounts {
+			if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+				d.logger.Error("auto-mount failed",
+					"device", dev.Nickname,
+					"share", mc.Share,
+					"error", err,
+				)
+			}
 		}
 	}
 }
 
-// shouldMount checks whether the config has a mount entry for a device with the
-// given nickname. Returns the MountConfig and true if found.
-func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bool) {
+// mountsForDevice returns every configured mount whose device nickname matches
+// deviceNickname. A single peer can export multiple shares — each its own mount
+// entry — so the auto-mount/remount paths must act on ALL of them: returning only
+// the first would leave a multi-share peer's other shares unmounted and, after a
+// roam, stranded on the dead old endpoint. Returns nil when none match. (#61)
+func (d *Daemon) mountsForDevice(deviceNickname string) []agentconfig.MountConfig {
 	d.mu.RLock()
 	cfg := d.config
 	d.mu.RUnlock()
 
+	var mounts []agentconfig.MountConfig
 	for _, mc := range cfg.Mounts {
 		if mc.Device == deviceNickname {
-			return mc, true
+			mounts = append(mounts, mc)
 		}
+	}
+	return mounts
+}
+
+// shouldMount reports whether the config has at least one mount entry for a
+// device with the given nickname, returning the first match. Paths that must
+// handle every share of a multi-share peer use mountsForDevice instead; this
+// first-match form remains for the single-mount pairing path.
+func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bool) {
+	mounts := d.mountsForDevice(deviceNickname)
+	if len(mounts) > 0 {
+		return mounts[0], true
 	}
 	return agentconfig.MountConfig{}, false
 }
