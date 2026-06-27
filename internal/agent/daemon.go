@@ -91,6 +91,13 @@ type Daemon struct {
 	// fakes to drive sessionOnce / reconnectSession / supervise without a live hub.
 	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
 	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
+
+	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
+	// config-watcher's share-publish path (onConfigChange) is testable without a
+	// live gRPC connection. NewDaemon wires it to d.hubClient.UpdateShares; unit
+	// tests override it to observe the publish (e.g. assert d.config is already
+	// swapped to the new pointer by the time shares are pushed to the hub). (#61)
+	updateSharesFn func(ctx context.Context, shares []*pb.Share) error
 }
 
 // NewDaemon loads the config and identity, creates the connector, mounter, and
@@ -189,6 +196,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	}
 	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
 		return d.hubClient.Subscribe(ctx)
+	}
+	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
+		return d.hubClient.UpdateShares(ctx, shares)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced

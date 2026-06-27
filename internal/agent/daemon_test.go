@@ -79,6 +79,10 @@ agent {
 		onlineDevices: make(map[string]*OnlineDevice),
 		dataDir:       dir,
 		sshPort:       cfg.Agent.SSHPort,
+		// Default no-op share publish so a test that drives onConfigChange's
+		// SharesChanged path does not deref the nil hubClient. Tests that assert on
+		// the publish override this seam.
+		updateSharesFn: func(context.Context, []*pb.Share) error { return nil },
 	}
 
 	return d, dir
@@ -693,6 +697,89 @@ func TestOnConfigChange_MountsRemoved(t *testing.T) {
 	require.NoError(t, d.mounter.Unmount("remote", "music"), "Unmount")
 
 	assert.False(t, d.mounter.IsActive("remote", "music"), "share should be inactive after Unmount")
+}
+
+// TestOnConfigChange_SwapsConfigBeforePublishingShares verifies the codex iter3
+// ordering fix: onConfigChange must swap d.config to the new pointer BEFORE it
+// publishes the new shares to the hub. Otherwise a concurrent sessionOnce
+// (re-Register on reconnect) could snapshot the stale d.config and re-Register the
+// old shares AFTER UpdateShares(new) already landed, leaving the hub with obsolete
+// shares. The seam captures d.config exactly when the publish fires. (#61)
+func TestOnConfigChange_SwapsConfigBeforePublishingShares(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	oldCfg := &agentconfig.Config{
+		Shares: []agentconfig.ShareConfig{
+			{Alias: "old-share", Path: "/old", Permissions: "ro", AllowedDevices: []string{"all"}},
+		},
+	}
+	newCfg := &agentconfig.Config{
+		Shares: []agentconfig.ShareConfig{
+			{Alias: "new-share", Path: "/new", Permissions: "rw", AllowedDevices: []string{"all"}},
+		},
+	}
+	d.config = oldCfg
+
+	var (
+		publishCalls    int
+		configAtPublish *agentconfig.Config
+		sharesAtPublish []*pb.Share
+	)
+	d.updateSharesFn = func(_ context.Context, shares []*pb.Share) error {
+		publishCalls++
+		d.mu.RLock()
+		configAtPublish = d.config
+		d.mu.RUnlock()
+		sharesAtPublish = shares
+		return nil
+	}
+
+	d.onConfigChange(oldCfg, newCfg)
+
+	require.Equal(t, 1, publishCalls, "a share change must publish to the hub exactly once")
+	assert.Same(t, newCfg, configAtPublish,
+		"d.config must already be the new pointer by the time shares are published to the hub")
+	require.Len(t, sharesAtPublish, 1)
+	assert.Equal(t, "new-share", sharesAtPublish[0].Alias, "the published shares must be the new ones")
+
+	d.mu.RLock()
+	gotConfig := d.config
+	d.mu.RUnlock()
+	assert.Same(t, newCfg, gotConfig, "d.config must remain the new pointer after onConfigChange")
+}
+
+// TestTryMount_UsesSnapshottedEndpoint verifies the codex iter3 hardening: tryMount
+// resolves the peer endpoint to local primitives under the lock and mounts at THAT
+// endpoint, instead of aliasing the map's *OnlineDevice across the unlocked
+// resolve→Mount handoff (the pointer pattern another goroutine's in-place mutation
+// could later corrupt). (#61)
+func TestTryMount_UsesSnapshottedEndpoint(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	writePubKey(t, dir, "device-xyz")
+	d.mu.Lock()
+	d.onlineDevices["device-xyz"] = &OnlineDevice{
+		DeviceID: "device-xyz",
+		Nickname: "workstation",
+		IP:       "10.1.2.3",
+		SSHPort:  2022,
+	}
+	d.mu.Unlock()
+
+	mc := agentconfig.MountConfig{
+		Device: "workstation",
+		Share:  "docs",
+		To:     filepath.Join(dir, "mnt", "docs"),
+	}
+	t.Cleanup(func() { _ = os.Chmod(mc.To, 0o755) })
+
+	d.tryMount(mc)
+
+	require.True(t, d.mounter.IsActive("workstation", "docs"), "tryMount must mount for an online+paired device")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.1.2.3", mounts[0].IP, "tryMount must mount at the snapshotted peer IP")
+	assert.Equal(t, 2022, mounts[0].SSHPort, "tryMount must mount at the snapshotted peer SSH port")
 }
 
 // ─── isPaired ─────────────────────────────────────────────────────────────────

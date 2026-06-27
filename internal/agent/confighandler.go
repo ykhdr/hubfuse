@@ -14,10 +14,24 @@ import (
 func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 	diff := agentconfig.ComputeDiff(old, new)
 
+	// Swap the cached config BEFORE publishing the new shares to the hub. The
+	// supervisor re-runs sessionOnce (Register) on every reconnect, concurrently
+	// with this watcher; sessionOnce snapshots d.config and re-Registers its
+	// shares. If we published UpdateShares(new) while d.config still held the old
+	// shares, a concurrent sessionOnce could snapshot the old shares and Register
+	// them AFTER UpdateShares(new) landed — leaving the hub with obsolete shares.
+	// Swapping first makes the in-memory config consistent with the publish, so a
+	// sessionOnce that runs after this point necessarily snapshots the new shares.
+	// Nothing between here and the swap site reads d.config, so the move is safe;
+	// the lock is never held across the blocking UpdateShares RPC. (#61)
+	d.mu.Lock()
+	d.config = new
+	d.mu.Unlock()
+
 	if diff.SharesChanged {
 		// Push updated shares to the hub.
 		shares := configSharesToProto(new.Shares)
-		if err := d.hubClient.UpdateShares(context.Background(), shares); err != nil {
+		if err := d.updateSharesFn(context.Background(), shares); err != nil {
 			d.logger.Error("failed to update shares on hub", "error", err)
 		}
 		// Push ACL snapshot to the SSH server and surface any shares that
@@ -50,10 +64,6 @@ func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 			)
 		}
 	}
-
-	d.mu.Lock()
-	d.config = new
-	d.mu.Unlock()
 }
 
 // configSharesToProto converts a slice of ShareConfig to proto Share messages.
@@ -98,17 +108,33 @@ func warnInaccessibleShares(logger *slog.Logger, acls []ShareACL) {
 // tryMount attempts to mount the share described by mc if the target device is
 // currently online and paired.
 func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
+	// Snapshot the endpoint primitives BY VALUE under the lock rather than
+	// aliasing the map's *OnlineDevice across the unlocked region below. A
+	// concurrent handleDeviceOnline replaces the map entry with a fresh
+	// *OnlineDevice (it never mutates the published one), so today the snapshot is
+	// at worst a stale-but-valid endpoint; copying the values keeps tryMount from
+	// reading a struct another goroutine could later mutate in place (the pattern
+	// handleSharesUpdated already uses for .Shares) and makes the resolve→Mount
+	// handoff self-contained. (#61)
+	var (
+		found    bool
+		deviceID string
+		ip       string
+		sshPort  int
+	)
 	d.mu.RLock()
-	var info *OnlineDevice
 	for _, dev := range d.onlineDevices {
 		if dev.Nickname == mc.Device {
-			info = dev
+			found = true
+			deviceID = dev.DeviceID
+			ip = dev.IP
+			sshPort = dev.SSHPort
 			break
 		}
 	}
 	d.mu.RUnlock()
 
-	if info == nil {
+	if !found {
 		d.logger.Debug("tryMount: device not online, skipping",
 			"device", mc.Device,
 			"share", mc.Share,
@@ -121,7 +147,7 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 		return
 	}
 
-	if !d.isPaired(info.DeviceID) {
+	if !d.isPaired(deviceID) {
 		d.logger.Debug("tryMount: device not paired, skipping",
 			"device", mc.Device,
 			"share", mc.Share,
@@ -134,7 +160,7 @@ func (d *Daemon) tryMount(mc agentconfig.MountConfig) {
 		return
 	}
 
-	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+	if err := d.mounter.Mount(context.Background(), mc, deviceID, ip, sshPort); err != nil {
 		d.logger.Error("tryMount failed",
 			"device", mc.Device,
 			"share", mc.Share,
