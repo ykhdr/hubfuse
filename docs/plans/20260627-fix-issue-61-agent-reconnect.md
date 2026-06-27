@@ -152,11 +152,11 @@
 
 ### Task 5: Проверка критериев приёмки
 
-- [ ] проверить, что все пункты Overview реализованы (супервизор реконнектится, новый IP распространяется, пиры перемонтируют, same-IP блип чинится sshfs)
-- [ ] проверить краевые случаи: `onReady` один раз; чистый выход супервизора по `ctx`; remount только при смене endpoint
-- [ ] `make build`
-- [ ] `make vet`
-- [ ] `make test` (unit + integration) и `go test ./tests/scenarios/... -timeout 120s`
+- [x] проверить, что все пункты Overview реализованы (супервизор реконнектится, новый IP распространяется, пиры перемонтируют, same-IP блип чинится sshfs) — сверено по коду: `daemon.go` `sessionOnce`/`readStream`/`reconnectSession`/`supervise` (L450-547) + `registerAndSubscribe` (sync 1-я сессия → `go supervise`); `processInitialDevices` повторно прогоняется на каждом реконнекте из снапшота `RegisterResponse` (хаб не тронут); `mounter.go` remount-ветка в `Mount` (L306-338); reconnect/keepalive-опции в `buildMountArgs` (L85-87)
+- [x] проверить краевые случаи: `onReady` один раз; чистый выход супервизора по `ctx`; remount только при смене endpoint — `readyOnce.Do`+nil-guard (`daemon.go` L463-467); `reconnectSession` возвращает `nil` по `ctx.Done` (L519)→`supervise` выходит; same endpoint → ранний `return nil` (L307-312). Покрыто тестами: `TestSessionOnce_OnReadyFiresExactlyOnce`/`NilOnReadyDoesNotPanic`, `TestReconnectSession_ReturnsNilOnCancelledCtx`, `TestMount_SameEndpointIsSilentNoOp`/`DifferentEndpointRemounts`/`RemountUnmountFailureAborts`
+- [x] `make build` — зелёный (чисто)
+- [x] `make vet` — зелёный (чисто)
+- [x] `make test` (unit + integration) и `go test ./tests/scenarios/... -timeout 120s` — всё зелёное: `internal/...` (agent 5.6s), `tests/integration` (9.3s), `tests/cli` (1.9s), `tests/scenarios` (33s); отдельный прогон scenarios с `-timeout 120s` — ok. Правок кода не потребовалось (всё прошло с первого раза)
 
 ### Task 6: Документация и финализация
 
