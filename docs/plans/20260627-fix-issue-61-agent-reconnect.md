@@ -95,12 +95,12 @@
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
 
-- [ ] в `buildMountArgs` (mounter.go:66) добавить в базовый `args` (до цикла `extraOpts`): `-o reconnect`, `-o ServerAliveInterval=15`, `-o ServerAliveCountMax=3`
-- [ ] значения вынести в именованные константы рядом с функцией (например `sshKeepaliveInterval`, `sshKeepaliveCountMax`)
-- [ ] обновить/добавить table-тест на `buildMountArgs`: аргументы содержат `reconnect` и keepalive-опции для бэкендов `sshfs` и `fuse-t`
-- [ ] убедиться, что относительный порядок операндов (`hubfuse@ip:share`, `to`) и `extraOpts` (`cache=no` для fuse-t) не нарушен
-- [ ] прогнать `go test ./internal/agent/... -run Mount` — должно пройти перед Task 2
-- [ ] коммит + пуш (по workflow `CLAUDE.md`)
+- [x] в `buildMountArgs` (mounter.go:66) добавить в базовый `args` (до цикла `extraOpts`): `-o reconnect`, `-o ServerAliveInterval=15`, `-o ServerAliveCountMax=3`
+- [x] значения вынести в именованные константы рядом с функцией (например `sshKeepaliveInterval`, `sshKeepaliveCountMax`)
+- [x] обновить/добавить table-тест на `buildMountArgs`: аргументы содержат `reconnect` и keepalive-опции для бэкендов `sshfs` и `fuse-t`
+- [x] убедиться, что относительный порядок операндов (`hubfuse@ip:share`, `to`) и `extraOpts` (`cache=no` для fuse-t) не нарушен
+- [x] прогнать `go test ./internal/agent/... -run Mount` — должно пройти перед Task 2
+- [x] коммит + пуш (по workflow `CLAUDE.md`) — push пропущен (нет GitHub-кредов в окружении); сделан только локальный коммит
 
 ### Task 2: Перемонтирование при смене IP/порта в Mounter.Mount
 

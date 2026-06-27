@@ -111,6 +111,9 @@ func TestBuildMountArgs_BaseArgs(t *testing.T) {
 		"-o", "IdentityFile=/key/path",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=/known/hosts",
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"hubfuse@192.168.1.10:documents",
 		"/mnt/docs",
 	}
@@ -119,8 +122,9 @@ func TestBuildMountArgs_BaseArgs(t *testing.T) {
 
 func TestBuildMountArgs_ExtraOptsInjectedBeforeOperands(t *testing.T) {
 	// Construct a backend with non-empty extraOpts to verify ordering: the
-	// extra -o pairs must appear after the base options and before the
-	// user@host:share / target operands.
+	// extra -o pairs must appear after the base options (including the
+	// reconnect/keepalive options) and before the user@host:share / target
+	// operands.
 	b := mountBackend{binary: "sshfs", extraOpts: []string{"volname=share", "noappledouble"}}
 	args := buildMountArgs(b, 22, "/key", "/kh", "10.0.0.1", "photos", "/mnt/photos")
 
@@ -129,12 +133,64 @@ func TestBuildMountArgs_ExtraOptsInjectedBeforeOperands(t *testing.T) {
 		"-o", "IdentityFile=/key",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=/kh",
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "volname=share",
 		"-o", "noappledouble",
 		"hubfuse@10.0.0.1:photos",
 		"/mnt/photos",
 	}
 	assert.Equal(t, want, args, "mount args with extraOpts")
+}
+
+// TestBuildMountArgs_ReconnectKeepalive verifies that both resolved backends
+// emit the sshfs reconnect and keepalive options (issue #61): a same-IP TCP
+// blip self-heals via sshfs reconnect instead of leaving a wedged mount. The
+// keepalive options must land in the base args, before any backend extraOpts
+// (e.g. fuse-t's cache=no) and before the source/target operands.
+func TestBuildMountArgs_ReconnectKeepalive(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+	}{
+		{name: "sshfs", tool: "sshfs"},
+		{name: "fuse-t", tool: "fuse-t"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := resolveBackend(tt.tool)
+			args := buildMountArgs(b, 2222, "/key", "/kh", "10.0.0.1", "docs", "/mnt/docs")
+
+			// The reconnect/keepalive options must be present as ordered -o pairs.
+			assert.Subset(t, args, []string{"-o", "reconnect"}, "reconnect option present")
+			assert.Subset(t, args, []string{"-o", "ServerAliveInterval=15"}, "keepalive interval present")
+			assert.Subset(t, args, []string{"-o", "ServerAliveCountMax=3"}, "keepalive count present")
+
+			// Keepalive options must precede the source/target operands.
+			operandIdx := indexOf(args, "hubfuse@10.0.0.1:docs")
+			require.GreaterOrEqual(t, operandIdx, 0, "source operand present")
+			assert.Greater(t, operandIdx, indexOf(args, "reconnect"), "reconnect before operands")
+			assert.Greater(t, operandIdx, indexOf(args, "ServerAliveInterval=15"), "keepalive before operands")
+
+			// For fuse-t, the reconnect options must precede the backend's
+			// cache=no extraOpt (base args come before extraOpts).
+			if tt.tool == "fuse-t" {
+				assert.Less(t, indexOf(args, "reconnect"), indexOf(args, "cache=no"),
+					"reconnect before fuse-t cache=no extraOpt")
+			}
+		})
+	}
+}
+
+// indexOf returns the index of the first occurrence of v in s, or -1.
+func indexOf(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestValidateMountTool(t *testing.T) {
@@ -270,6 +326,9 @@ func TestMount_BuildsCorrectSSHFSArgs(t *testing.T) {
 		"-o", "IdentityFile=" + keyPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=" + knownHostsPath,
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"hubfuse@192.168.1.10:documents",
 		mountTo,
 	}
@@ -315,6 +374,9 @@ func TestMount_FuseTUsesSSHFSBinaryWithCacheDisabled(t *testing.T) {
 		"-o", "IdentityFile=" + keyPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=" + knownHostsPath,
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "cache=no",
 		"hubfuse@192.168.1.10:documents",
 		mountTo,

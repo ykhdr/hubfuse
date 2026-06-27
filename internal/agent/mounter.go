@@ -59,16 +59,32 @@ func resolveBackend(tool string) mountBackend {
 	return mountBackends["sshfs"]
 }
 
+// sshfs reconnect/keepalive options. sshfs honours -o reconnect itself and
+// forwards ServerAlive* to ssh: after sshKeepaliveCountMax unanswered probes
+// spaced sshKeepaliveInterval seconds apart (~45s) the SSH session is detected
+// dead, and reconnect transparently re-establishes it in the background. This
+// heals a same-IP TCP blip (a brief network drop without an address change)
+// without an unmount/remount — the daemon never sees it. (issue #61)
+const (
+	sshKeepaliveInterval = 15
+	sshKeepaliveCountMax = 3
+)
+
 // buildMountArgs builds the argument list for the mount command. It emits the
-// base SSH options, then any backend-specific extraOpts as ordered "-o <opt>"
-// pairs, and finally the "hubfuse@<ip>:<share>" source and "<to>" target
-// operands last (their position is significant to sshfs).
+// base SSH options (including the sshfs reconnect/keepalive options so a
+// same-IP TCP blip self-heals; see sshKeepaliveInterval), then any
+// backend-specific extraOpts as ordered "-o <opt>" pairs, and finally the
+// "hubfuse@<ip>:<share>" source and "<to>" target operands last (their
+// position is significant to sshfs).
 func buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string {
 	args := []string{
 		"-p", strconv.Itoa(sshPort),
 		"-o", "IdentityFile=" + keyPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=" + knownHosts,
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=" + strconv.Itoa(sshKeepaliveInterval),
+		"-o", "ServerAliveCountMax=" + strconv.Itoa(sshKeepaliveCountMax),
 	}
 	for _, opt := range b.extraOpts {
 		args = append(args, "-o", opt)
