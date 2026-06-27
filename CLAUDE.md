@@ -55,7 +55,7 @@ Device identity is extracted from the mTLS certificate CN field via a gRPC inter
 
 ### Agent internals (`internal/agent/`)
 
-- `daemon.go` — Orchestrator
+- `daemon.go` — Orchestrator; supervises the hub session — on event-stream death it re-runs Register→Subscribe with backoff so roaming/IP changes recover without a daemon restart (issue #61)
 - `client.go` — gRPC client wrapper
 - `connector.go` — Hub connection with backoff retry
 - `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table)
