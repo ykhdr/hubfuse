@@ -58,6 +58,20 @@ type Daemon struct {
 	dataDir string
 
 	onReady func()
+
+	// readyOnce guards onReady so it fires exactly once for the daemon's
+	// lifetime. The supervisor re-runs sessionOnce on every reconnect, but the
+	// PID-file hook (onReady) must run only on the first successful Register.
+	readyOnce sync.Once
+
+	// registerFn and subscribeFn are injectable seams over the concrete
+	// HubClient (client.go has no interface, so it cannot be stubbed without a
+	// live gRPC connection). They default to delegating to
+	// d.hubClient.Register / d.hubClient.Subscribe (wired lazily by
+	// ensureSessionFns); unit tests override them with fakes to drive
+	// sessionOnce / reconnectSession without a live hub.
+	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
+	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
 }
 
 // NewDaemon loads the config and identity, creates the connector, mounter, and
@@ -388,46 +402,148 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 	return nil
 }
 
-// registerAndSubscribe registers with the hub, signals readiness, processes
-// the initial device list, and starts the event stream goroutine.
+// registerAndSubscribe runs the first hub session synchronously (so a hub that
+// is down at startup still surfaces as a startup error and onReady timing for
+// the PID file is preserved), then hands the live stream to a long-running
+// supervisor goroutine that reconnects whenever the session dies. (#61)
 func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
-	shares := configSharesToProto(d.config.Shares)
-	regResp, err := d.hubClient.Register(ctx, shares, d.config.Agent.SSHPort)
+	d.ensureSessionFns()
+
+	stream, err := d.sessionOnce(ctx)
 	if err != nil {
-		return fmt.Errorf("register with hub: %w", err)
+		return err
+	}
+
+	go d.supervise(ctx, stream)
+
+	return nil
+}
+
+// ensureSessionFns lazily wires registerFn / subscribeFn to delegate to the
+// live hubClient when they have not been overridden (the production path). The
+// closures read d.hubClient at call time, so this is safe even though hubClient
+// is nil at construction (it is set later by connect). Unit tests install their
+// own fakes before driving sessionOnce / reconnectSession, so this never
+// clobbers an injected seam.
+func (d *Daemon) ensureSessionFns() {
+	if d.registerFn == nil {
+		d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
+			return d.hubClient.Register(ctx, shares, sshPort)
+		}
+	}
+	if d.subscribeFn == nil {
+		d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+			return d.hubClient.Subscribe(ctx)
+		}
+	}
+}
+
+// sessionOnce runs one hub session setup: Register, signal readiness (exactly
+// once across the daemon's lifetime), process the initial online-device
+// snapshot, then open the event Subscribe stream and return it. The
+// Register → processInitialDevices → Subscribe order is preserved so the full
+// online-device state comes from the RegisterResponse snapshot rather than being
+// reconstructed from events; processInitialDevices runs again on every reconnect,
+// which is how a roaming device refreshes its own mounts. A partial success
+// (Register ok, Subscribe failed) returns an error and the caller retries the
+// whole sessionOnce — a repeat Register is idempotent on the hub.
+func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+	shares := configSharesToProto(d.config.Shares)
+	regResp, err := d.registerFn(ctx, shares, d.config.Agent.SSHPort)
+	if err != nil {
+		return nil, fmt.Errorf("register with hub: %w", err)
 	}
 	d.logger.Info("registered with hub",
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
-	if d.onReady != nil {
-		d.onReady()
-	}
+	// onReady is optional (nil in tests and when the cmd layer wants no PID
+	// hook), so guard the nil case inside the Once — a bare Do(d.onReady) would
+	// panic on a nil func.
+	d.readyOnce.Do(func() {
+		if d.onReady != nil {
+			d.onReady()
+		}
+	})
 
 	d.processInitialDevices(regResp.DevicesOnline)
 
-	stream, err := d.hubClient.Subscribe(ctx)
+	stream, err := d.subscribeFn(ctx)
 	if err != nil {
-		return fmt.Errorf("subscribe to hub events: %w", err)
+		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
 
-	go func() {
-		for {
-			event, err := stream.Recv()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					d.logger.Warn("event stream error", "error", err)
-					return
-				}
-			}
-			d.handleEvent(event)
-		}
-	}()
+	return stream, nil
+}
 
-	return nil
+// readStream consumes events from the hub subscription until Recv returns an
+// error or ctx is cancelled. A Recv error after ctx cancellation is the normal
+// shutdown path (no warning); otherwise the hub session has died and the caller
+// (supervise) reconnects.
+func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
+	for {
+		event, err := stream.Recv()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				d.logger.Warn("event stream error", "error", err)
+				return
+			}
+		}
+		d.handleEvent(event)
+	}
+}
+
+// reconnectSession retries sessionOnce with exponential backoff
+// (backoffInitial → backoffMax) until it succeeds or ctx is cancelled. It
+// returns the live stream on success, or nil when ctx is cancelled (signalling
+// supervise to exit). The same hubClient is reused throughout: gRPC repairs the
+// transport under the hood, so a fresh dial is unnecessary.
+func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClient {
+	delay := backoffInitial
+	for {
+		stream, err := d.sessionOnce(ctx)
+		if err == nil {
+			d.logger.Info("hub session re-established")
+			return stream
+		}
+
+		d.logger.Warn("hub session reconnect failed, retrying",
+			"error", err,
+			"backoff", delay,
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > backoffMax {
+			delay = backoffMax
+		}
+	}
+}
+
+// supervise runs the hub session for the daemon's lifetime: it reads the event
+// stream until the session dies, then reconnects (Register → Subscribe again)
+// and resumes. It returns only when ctx is cancelled — either readStream
+// observes the cancellation or reconnectSession returns a nil stream.
+func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
+	for {
+		d.readStream(ctx, stream)
+		if ctx.Err() != nil {
+			return
+		}
+		d.logger.Warn("hub session lost; reconnecting")
+		stream = d.reconnectSession(ctx)
+		if stream == nil {
+			return
+		}
+	}
 }
 
 // runServices starts the heartbeat ticker and config watcher, then blocks

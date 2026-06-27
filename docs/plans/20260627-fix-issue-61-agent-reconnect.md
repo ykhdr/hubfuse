@@ -124,18 +124,18 @@
 - Modify: `internal/agent/daemon.go`
 - Modify: `internal/agent/daemon_test.go`
 
-- [ ] добавить тестовый seam: поля-функции `registerFn`/`subscribeFn` на `Daemon` (в стиле `Mounter.execCommand`), по умолчанию делегируют `d.hubClient.Register`/`.Subscribe` (т.к. `HubClient` — конкретная структура без интерфейса, `client.go:18`)
-- [ ] добавить поле `readyOnce sync.Once`; вызывать onReady с nil-guard: `d.readyOnce.Do(func() { if d.onReady != nil { d.onReady() } })`
-- [ ] выделить `sessionOnce(ctx) (<stream>, error)`: `registerFn` → onReady (через `readyOnce`) → `processInitialDevices` → `subscribeFn`, возвращает стрим
-- [ ] выделить `readStream(ctx, stream)`: текущее тело горутины (L414-428) — читает до `Recv`-ошибки или `ctx.Done()`
-- [ ] добавить `reconnectSession(ctx) <stream>`: цикл `sessionOnce` с backoff `backoffInitial`→`backoffMax`; слушает `ctx.Done()` в `select`, возвращает `nil` при отмене; `Info`-лог при успехе
-- [ ] добавить `supervise(ctx, stream)`: `for { readStream; if ctx.Err()!=nil return; warn "hub session lost"; stream = reconnectSession; if stream==nil return }`
-- [ ] переписать `registerAndSubscribe`: синхронный первый `sessionOnce` (ошибка прерывает старт), затем `go supervise(ctx, stream)`; сохранить порядок и тайминг onReady
-- [ ] тест: `readStream` с fake `pb.HubFuse_SubscribeClient`, возвращающим ошибку → выходит, не зацикливается (лёгкий, без seam)
-- [ ] тест: onReady вызывается ровно один раз при нескольких `sessionOnce` (через seam; nil-guard не паникует при nil onReady)
-- [ ] тест: `reconnectSession` выходит с `nil` при отменённом `ctx` (через seam с фейком, возвращающим ошибку)
-- [ ] прогнать `go test ./internal/agent/...` — должно пройти перед Task 4
-- [ ] коммит + пуш (по workflow `CLAUDE.md`)
+- [x] добавить тестовый seam: поля-функции `registerFn`/`subscribeFn` на `Daemon` (в стиле `Mounter.execCommand`), по умолчанию делегируют `d.hubClient.Register`/`.Subscribe` (т.к. `HubClient` — конкретная структура без интерфейса, `client.go:18`) — дефолты ставятся лениво в `ensureSessionFns` (closures читают `d.hubClient` в момент вызова, т.к. при конструировании он ещё nil)
+- [x] добавить поле `readyOnce sync.Once`; вызывать onReady с nil-guard: `d.readyOnce.Do(func() { if d.onReady != nil { d.onReady() } })`
+- [x] выделить `sessionOnce(ctx) (<stream>, error)`: `registerFn` → onReady (через `readyOnce`) → `processInitialDevices` → `subscribeFn`, возвращает стрим
+- [x] выделить `readStream(ctx, stream)`: текущее тело горутины (L414-428) — читает до `Recv`-ошибки или `ctx.Done()`
+- [x] добавить `reconnectSession(ctx) <stream>`: цикл `sessionOnce` с backoff `backoffInitial`→`backoffMax`; слушает `ctx.Done()` в `select`, возвращает `nil` при отмене; `Info`-лог при успехе
+- [x] добавить `supervise(ctx, stream)`: `for { readStream; if ctx.Err()!=nil return; warn "hub session lost"; stream = reconnectSession; if stream==nil return }`
+- [x] переписать `registerAndSubscribe`: синхронный первый `sessionOnce` (ошибка прерывает старт), затем `go supervise(ctx, stream)`; сохранить порядок и тайминг onReady
+- [x] тест: `readStream` с fake `pb.HubFuse_SubscribeClient`, возвращающим ошибку → выходит, не зацикливается (лёгкий, без seam) — `TestReadStream_ExitsOnRecvError`
+- [x] тест: onReady вызывается ровно один раз при нескольких `sessionOnce` (через seam; nil-guard не паникует при nil onReady) — `TestSessionOnce_OnReadyFiresExactlyOnce` + `TestSessionOnce_NilOnReadyDoesNotPanic`
+- [x] тест: `reconnectSession` выходит с `nil` при отменённом `ctx` (через seam с фейком, возвращающим ошибку) — `TestReconnectSession_ReturnsNilOnCancelledCtx`
+- [x] прогнать `go test ./internal/agent/...` — прошло (зелёный, в т.ч. `-race`); `go build ./...` + `go vet ./...` чисто
+- [x] коммит + пуш (по workflow `CLAUDE.md`) — push пропущен (нет GitHub-кредов в окружении); сделан только локальный коммит
 
 ### Task 4: Сценарные тесты восстановления (`tests/scenarios`)
 

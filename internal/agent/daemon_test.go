@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	pb "github.com/ykhdr/hubfuse/proto"
@@ -613,6 +614,136 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
 	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
 	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
+}
+
+// ─── supervisor: session reconnect (#61) ──────────────────────────────────────
+
+// fakeSubscribeStream is a minimal pb.HubFuse_SubscribeClient for unit tests.
+// Only Recv is implemented; the embedded grpc.ClientStream is left nil because
+// the code under test (readStream) only ever calls Recv. recv supplies the
+// per-call behaviour.
+type fakeSubscribeStream struct {
+	grpc.ClientStream
+	recv func() (*pb.Event, error)
+}
+
+func (f *fakeSubscribeStream) Recv() (*pb.Event, error) { return f.recv() }
+
+// errStream returns a fake stream whose Recv always fails — it models a hub
+// session that has just died.
+func errStream() *fakeSubscribeStream {
+	return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		return nil, errors.New("stream closed")
+	}}
+}
+
+// TestReadStream_ExitsOnRecvError verifies readStream consumes events until Recv
+// returns an error, then returns instead of spinning. No seam is needed: the
+// fake stream is passed directly. (#61)
+func TestReadStream_ExitsOnRecvError(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var calls int
+	stream := &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		calls++
+		if calls == 1 {
+			// A benign event with no payload: handleEvent logs an unknown-type
+			// warning and returns, so the loop advances to the error below.
+			return &pb.Event{}, nil
+		}
+		return nil, errors.New("stream broken")
+	}}
+
+	done := make(chan struct{})
+	go func() {
+		d.readStream(context.Background(), stream)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// returned promptly — good.
+	case <-time.After(2 * time.Second):
+		t.Fatal("readStream did not return after a Recv error — it is looping")
+	}
+
+	assert.GreaterOrEqual(t, calls, 2, "readStream should consume the event then exit on the next Recv error")
+}
+
+// TestSessionOnce_OnReadyFiresExactlyOnce verifies that across multiple
+// sessionOnce calls (modelling the first session plus reconnects) the onReady
+// hook is invoked exactly once. The HubClient seam is overridden with fakes so
+// no live hub is needed. (#61)
+func TestSessionOnce_OnReadyFiresExactlyOnce(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var registerCalls, readyCalls int
+	d.onReady = func() { readyCalls++ }
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		registerCalls++
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	for i := 0; i < 3; i++ {
+		stream, err := d.sessionOnce(context.Background())
+		require.NoError(t, err, "sessionOnce #%d", i)
+		require.NotNil(t, stream, "sessionOnce #%d should return a stream", i)
+	}
+
+	assert.Equal(t, 3, registerCalls, "every sessionOnce must re-register (idempotent on the hub)")
+	assert.Equal(t, 1, readyCalls, "onReady must fire exactly once across multiple sessions")
+}
+
+// TestSessionOnce_NilOnReadyDoesNotPanic verifies the nil-guard inside the
+// readyOnce.Do closure: buildTestDaemon leaves onReady nil, and sessionOnce must
+// not panic (a bare Do(d.onReady) would). (#61)
+func TestSessionOnce_NilOnReadyDoesNotPanic(t *testing.T) {
+	d, _ := buildTestDaemon(t) // onReady is nil
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	require.NotPanics(t, func() {
+		_, err := d.sessionOnce(context.Background())
+		require.NoError(t, err)
+	}, "sessionOnce must not panic when onReady is nil")
+}
+
+// TestReconnectSession_ReturnsNilOnCancelledCtx verifies that reconnectSession
+// stops retrying and returns nil once ctx is cancelled, so supervise can exit
+// cleanly on shutdown. The seam's registerFn always fails, forcing the backoff
+// path where the cancelled ctx is observed. (#61)
+func TestReconnectSession_ReturnsNilOnCancelledCtx(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return nil, errors.New("hub unreachable")
+	}
+	// subscribeFn is never reached because Register always fails.
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		t.Fatal("subscribeFn must not be called when Register fails")
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the first backoff select
+
+	done := make(chan pb.HubFuse_SubscribeClient, 1)
+	go func() { done <- d.reconnectSession(ctx) }()
+
+	select {
+	case stream := <-done:
+		assert.Nil(t, stream, "reconnectSession must return nil when ctx is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnectSession did not return on a cancelled ctx — it is stuck in backoff")
+	}
 }
 
 // ─── preflightMountBinary ──────────────────────────────────────────────────────
