@@ -143,12 +143,12 @@
 - Modify: `tests/scenarios/reconnect_test.go`
 - (при необходимости) Modify: `tests/scenarios/helpers/` — только если не хватает готовых хелперов
 
-- [ ] усилить `TestAgentReconnectsAfterHubRestart`: после `Hub.Restart` (`helpers/hub.go:151-174`, тот же порт → разрыв стрима + транспорт-реконнект) ассертить `PeerStatus(...) == "online"` (`helpers/status.go:30`), а не просто «строка присутствует»
-- [ ] обновить устаревший комментарий теста (`reconnect_test.go:18-21`), который гласит, что ре-регистрация «не реализована»
-- [ ] НЕ создавать `tests/integration/reconnect_test.go` — файл уже существует и не про это; integration-harness (raw `pb.HubFuseClient`) супервизор не гоняет
-- [ ] **remount E2E сознательно НЕ делаем** под scenarios: stub не создаёт реальный FUSE-mount → remount-unmount (реальный `fusermount`/`umount` против обычной директории) не отцепит stub-маркер (`mountpointGoneCtx` через stub'нутый `checkMountpoint` считает mount «не исчез» → entry сохраняется → `RemotePort` не меняется), а рестарт экспортёра на новом ssh-порту harness сегодня не умеет. Endpoint-change remount детерминированно покрыт юнит-тестом mounter (Task 2); зафиксировано в Out of Scope
-- [ ] прогнать `go test ./tests/scenarios/... -timeout 120s` — должно пройти перед Task 5
-- [ ] коммит + пуш (по workflow `CLAUDE.md`)
+- [x] усилить `TestAgentReconnectsAfterHubRestart`: после `Hub.Restart` (`helpers/hub.go:151-174`, тот же порт → разрыв стрима + транспорт-реконнект) ассертить `PeerStatus(...) == "online"` (`helpers/status.go:30`), а не просто «строка присутствует» — финальный `require.Eventually` теперь требует `row.Status == "online"`; окно поллинга расширено до 20s (backoff 1+2+4+8s + старт хаба + RPC)
+- [x] обновить устаревший комментарий теста (`reconnect_test.go:18-21`), который гласит, что ре-регистрация «не реализована» — переписан: супервизор (Task 3) детектит мёртвый Subscribe-стрим и заново прогоняет Register→Subscribe, хаб ре-маркит «online»
+- [x] НЕ создавать `tests/integration/reconnect_test.go` — файл уже существует и не про это; integration-harness (raw `pb.HubFuseClient`) супервизор не гоняет — новый файл не создавался
+- [x] **remount E2E сознательно НЕ делаем** под scenarios: stub не создаёт реальный FUSE-mount → remount-unmount (реальный `fusermount`/`umount` против обычной директории) не отцепит stub-маркер (`mountpointGoneCtx` через stub'нутый `checkMountpoint` считает mount «не исчез» → entry сохраняется → `RemotePort` не меняется), а рестарт экспортёра на новом ssh-порту harness сегодня не умеет. Endpoint-change remount детерминированно покрыт юнит-тестом mounter (Task 2); зафиксировано в Out of Scope — ничего не реализовано, решение оставлено как есть
+- [x] прогнать `go test ./tests/scenarios/... -timeout 120s` — должно пройти перед Task 5 — зелёный; усиленный тест прогнан `-count=5` без флапа (~9s/прогон), полный suite 33s; `go build`/`go vet ./tests/scenarios/...` чисто
+- [x] коммит + пуш (по workflow `CLAUDE.md`) — push пропущен (нет GitHub-кредов в окружении); сделан только локальный коммит
 
 ### Task 5: Проверка критериев приёмки
 

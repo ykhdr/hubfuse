@@ -9,16 +9,17 @@ import (
 )
 
 // TestAgentReconnectsAfterHubRestart verifies that alice's daemon, with its
-// 1s-starting backoff, re-connects to the hub after a restart. Success is
-// observed by `hubfuse devices` returning alice's entry again, which requires
-// the gRPC transport channel to have re-established successfully.
+// 1s-starting backoff, re-registers with the hub after a restart and is reported
+// "online" again. Success is observed by `hubfuse devices` returning alice's
+// entry with status "online", which requires both the gRPC transport channel to
+// have re-established AND the daemon to have called Register a second time.
 //
-// Note: the hub stores device state in SQLite. On restart the hub reloads the
-// store from disk; alice's status is "offline" (set during graceful Stop).
-// Re-registration (and the resulting "online" status) would require the daemon
-// to call Register again — a feature not yet implemented in the daemon. This
-// test therefore validates transport reconnect (devices command reaches the hub
-// and returns alice's row) rather than full re-registration.
+// The hub stores device state in SQLite. On restart the hub reloads the store
+// from disk; alice's status is "offline" (set during graceful Stop). The daemon's
+// session supervisor detects the dead Subscribe stream and re-runs the
+// Register → Subscribe handshake, which re-marks alice "online" on the hub. This
+// test asserts that full re-registration round-trip, not just transport
+// reconnect.
 func TestAgentReconnectsAfterHubRestart(t *testing.T) {
 	hub := helpers.StartHub(t)
 
@@ -34,12 +35,13 @@ func TestAgentReconnectsAfterHubRestart(t *testing.T) {
 
 	hub.Restart(t)
 
-	// Allow up to 15s: the connector backoff starts at 1s and doubles, so
-	// worst-case is roughly 1+2+4+8 = 15s before the fourth attempt succeeds.
-	// We verify the gRPC channel reconnected by confirming `hubfuse devices`
-	// can reach the hub and alice's row is present (in any status).
+	// Allow up to 20s: the supervisor backoff starts at 1s and doubles, so
+	// worst-case is roughly 1+2+4+8 = 15s before the fourth re-register attempt
+	// succeeds, plus the hub's own startup and the devices RPC round-trip. We
+	// verify the daemon re-registered by confirming alice is reported "online"
+	// again — transport reconnect alone would leave the stale "offline" row.
 	require.Eventually(t, func() bool {
-		_, ok := alice.PeerStatus(t, "alice")
-		return ok
-	}, 15*time.Second, 500*time.Millisecond, "alice should reach the hub and see her own entry after restart")
+		row, ok := alice.PeerStatus(t, "alice")
+		return ok && row.Status == "online"
+	}, 20*time.Second, 500*time.Millisecond, "alice should re-register and be online again after restart")
 }
