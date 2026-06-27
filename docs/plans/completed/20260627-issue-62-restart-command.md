@@ -1,5 +1,14 @@
 # Add `hubfuse restart` subcommand (issue #62)
 
+> **Status: completed** (branch `feature/issue-62-restart-command`).
+> Implemented `ChildArgs` override (`spawn_unix.go`), `restartCmd` + shared
+> `spawnAgentDaemon` helper (`main.go`), unit test `TestSpawn_ChildArgsOverride`,
+> and docs. Auto plan-review and a high-effort auto code-review were applied
+> (latent empty-slice fallback, spawn-tail duplication, and logging-parity
+> caveat all addressed). `make build`/`vet`/`test-unit` pass. The full
+> start→restart→stop cycle requires a reachable hub + joined agent and remains
+> manual (see Post-Completion) — it is not runnable in CI without a hub.
+
 ## Overview
 - Add a `restart` subcommand to the `hubfuse` agent binary that stops the running daemon (if any) and starts a fresh detached one.
 - Solves the inconvenience of running `hubfuse stop && hubfuse start -d` by hand after a config change or upgrade.
