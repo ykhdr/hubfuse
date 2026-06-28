@@ -63,6 +63,7 @@ func rootCmd() *cobra.Command {
 		leaveCmd(),
 		startCmd(),
 		stopCmd(),
+		restartCmd(),
 		statusCmd(),
 		pairCmd(),
 		pairConfirmCmd(),
@@ -335,93 +336,123 @@ func bestEffortLeave(dataDir string) error {
 	return nil
 }
 
+// spawnAgentDaemon re-execs the current binary as a detached agent
+// daemon, after ensuring dataDir exists. childArgs overrides the child's
+// argv: pass nil for the normal `start -d` path (Spawn derives args from
+// os.Args), or []string{"start"} from `restart` so the child runs the
+// daemon directly instead of recursing into `restart`.
+func spawnAgentDaemon(dataDir, pidPath, logPath string, childArgs []string) error {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	return daemonize.Spawn(daemonize.SpawnOpts{
+		LogPath:     logPath,
+		PIDFilePath: pidPath,
+		ChildArgs:   childArgs,
+	})
+}
+
 // startCmd implements: hubfuse start
 func startCmd() *cobra.Command {
-	var (
-		logFile  string
-		logLevel string
-		verbose  bool
-		daemon   bool
-	)
+	var opts agentRunOpts
 
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the agent daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dataDir := common.ExpandHome(common.AgentDataDir)
-			cfgPath := filepath.Join(dataDir, common.ConfigFile)
-			pidPath := filepath.Join(dataDir, common.AgentPIDFile)
-			defaultLog := filepath.Join(dataDir, common.AgentLogFile)
-
-			// Reject second concurrent start regardless of daemon flag.
-			if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
-				return fmt.Errorf("check existing agent: %w", err)
-			} else if alive {
-				return fmt.Errorf("agent already running (pid %d)", pid)
-			}
-
-			// If we're the parent and --daemon was requested, re-exec.
-			// The detached child's stdout/stderr (which is where the
-			// console-handler logs land) gets redirected into defaultLog.
-			if daemon && !daemonize.IsChild() {
-				if err := os.MkdirAll(dataDir, 0o700); err != nil {
-					return fmt.Errorf("create data dir: %w", err)
-				}
-				return daemonize.Spawn(daemonize.SpawnOpts{
-					LogPath:     defaultLog,
-					PIDFilePath: pidPath,
-				})
-			}
-
-			logger, err := common.SetupLogger(common.LoggerOptions{
-				LogFile:   logFile,
-				FileLevel: common.ParseLogLevel(logLevel),
-				Verbose:   verbose,
-			})
-			if err != nil {
-				return fmt.Errorf("setup logger: %w", err)
-			}
-
-			d, err := agent.NewDaemon(cfgPath, logger, agent.DaemonOptions{
-				OnReady: func() {
-					if err := daemonize.WritePIDFile(pidPath); err != nil {
-						logger.Warn("write pid file", "path", pidPath, "error", err)
-					}
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("create daemon: %w", err)
-			}
-			defer func() {
-				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
-					logger.Warn("remove pid file", "path", pidPath, "error", err)
-				}
-			}()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-			go func() {
-				<-sigCh
-				cancel()
-			}()
-
-			if err := d.Run(ctx); err != nil {
-				return fmt.Errorf("daemon run: %w", err)
-			}
-			return nil
+			return runAgent(opts, nil)
 		},
 	}
 
-	cmd.Flags().StringVar(&logFile, "log-file", "", "write JSON logs to file (disabled by default)")
-	cmd.Flags().StringVar(&logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "show debug logs in console")
-	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
+	addAgentFlags(cmd, &opts)
 
 	return cmd
+}
+
+// agentRunOpts carries the logging and detach flags shared by the
+// `start` and `restart` subcommands.
+type agentRunOpts struct {
+	logFile  string
+	logLevel string
+	verbose  bool
+	daemon   bool
+}
+
+// addAgentFlags registers the flags shared by `start` and `restart`.
+func addAgentFlags(cmd *cobra.Command, opts *agentRunOpts) {
+	cmd.Flags().StringVar(&opts.logFile, "log-file", "", "write JSON logs to file (disabled by default)")
+	cmd.Flags().StringVar(&opts.logLevel, "log-level", "debug", "log file level (debug, info, warn, error)")
+	cmd.Flags().BoolVarP(&opts.verbose, "verbose", "v", false, "show debug logs in console")
+	cmd.Flags().BoolVarP(&opts.daemon, "daemon", "d", false, "detach from terminal and run in the background")
+}
+
+// runAgent starts the agent daemon according to opts. It refuses to start
+// a second concurrent instance; when opts.daemon is set (and we are not
+// already the detached child) it re-execs into the background, otherwise
+// it runs the daemon in the foreground until signalled. childArgs
+// overrides the detached child's argv: pass nil for `start` (Spawn derives
+// args from os.Args) or []string{"start"} for `restart` so the child runs
+// the daemon directly instead of recursing into `restart`.
+func runAgent(opts agentRunOpts, childArgs []string) error {
+	dataDir := common.ExpandHome(common.AgentDataDir)
+	cfgPath := filepath.Join(dataDir, common.ConfigFile)
+	pidPath := filepath.Join(dataDir, common.AgentPIDFile)
+	defaultLog := filepath.Join(dataDir, common.AgentLogFile)
+
+	// Reject second concurrent start regardless of daemon flag.
+	if pid, alive, err := daemonize.CheckRunning(pidPath); err != nil {
+		return fmt.Errorf("check existing agent: %w", err)
+	} else if alive {
+		return fmt.Errorf("agent already running (pid %d)", pid)
+	}
+
+	// If we're the parent and --daemon was requested, re-exec. The
+	// detached child's stdout/stderr (where the console-handler logs
+	// land) gets redirected into defaultLog.
+	if opts.daemon && !daemonize.IsChild() {
+		return spawnAgentDaemon(dataDir, pidPath, defaultLog, childArgs)
+	}
+
+	logger, err := common.SetupLogger(common.LoggerOptions{
+		LogFile:   opts.logFile,
+		FileLevel: common.ParseLogLevel(opts.logLevel),
+		Verbose:   opts.verbose,
+	})
+	if err != nil {
+		return fmt.Errorf("setup logger: %w", err)
+	}
+
+	d, err := agent.NewDaemon(cfgPath, logger, agent.DaemonOptions{
+		OnReady: func() {
+			if err := daemonize.WritePIDFile(pidPath); err != nil {
+				logger.Warn("write pid file", "path", pidPath, "error", err)
+			}
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create daemon: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+			logger.Warn("remove pid file", "path", pidPath, "error", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	if err := d.Run(ctx); err != nil {
+		return fmt.Errorf("daemon run: %w", err)
+	}
+	return nil
 }
 
 // stopCmd implements: hubfuse stop
@@ -434,6 +465,58 @@ func stopCmd() *cobra.Command {
 			return daemonize.SignalStop(pidPath, "agent")
 		},
 	}
+}
+
+// restartCmd implements: hubfuse restart
+//
+// It stops the running daemon (if any) and starts a fresh one, mirroring
+// the flags of `start`: by default the replacement runs in the foreground,
+// and -d/--daemon detaches it. A detached restart re-execs with
+// ChildArgs=["start"] so the child runs the daemon directly instead of
+// recursing into `restart` (which would error under the IsChild guard and
+// leave no daemon running).
+func restartCmd() *cobra.Command {
+	var opts agentRunOpts
+
+	cmd := &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the agent daemon",
+		Long: "Restart the agent daemon: stop the running daemon (if any), then " +
+			"start a fresh one.\n\n" +
+			"By default the replacement runs in the foreground; pass -d/--daemon to " +
+			"detach and run in the background, exactly like `start`. The --log-file, " +
+			"--log-level and --verbose flags are honored the same way.\n\n" +
+			"Logging flags apply to the foreground form only: a detached restart " +
+			"starts the background daemon with default logging settings.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			pidPath := filepath.Join(dataDir, common.AgentPIDFile)
+
+			// Stop the existing daemon first. Only spawn a replacement
+			// after a confirmed stop — never start a second daemon while
+			// the first may still be alive.
+			pid, alive, err := daemonize.CheckRunning(pidPath)
+			if err != nil {
+				return fmt.Errorf("check existing agent: %w", err)
+			}
+			if alive {
+				if err := daemonize.SignalStop(pidPath, "agent"); err != nil {
+					return fmt.Errorf("stop agent (pid %d): %w", pid, err)
+				}
+			} else {
+				fmt.Println("agent is not running; starting a new daemon")
+			}
+
+			// ChildArgs=["start"] makes a detached child run the daemon
+			// directly; re-execing "restart" would error under the
+			// IsChild guard and leave no daemon running.
+			return runAgent(opts, []string{"start"})
+		},
+	}
+
+	addAgentFlags(cmd, &opts)
+
+	return cmd
 }
 
 // statusCmd implements: hubfuse status

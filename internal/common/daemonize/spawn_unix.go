@@ -27,6 +27,14 @@ type SpawnOpts struct {
 	// ReadyTimeout bounds how long Spawn waits for the PID file to
 	// appear before giving up and killing the child. Defaults to 5s.
 	ReadyTimeout time.Duration
+
+	// ChildArgs overrides the argument vector passed to the re-exec'd
+	// child. When empty (nil or zero-length), Spawn derives the child
+	// args from os.Args (minus the daemon flag). Callers like `restart`
+	// set this to a fixed command (e.g. []string{"start"}) so the
+	// detached child runs the daemon directly instead of recursing into
+	// the parent subcommand.
+	ChildArgs []string
 }
 
 // Spawn re-execs the current binary as a detached child and waits for
@@ -76,7 +84,10 @@ func Spawn(opts SpawnOpts) error {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
 
-	childArgs := stripDaemonFlag(os.Args[1:])
+	childArgs := opts.ChildArgs
+	if len(childArgs) == 0 {
+		childArgs = stripDaemonFlag(os.Args[1:])
+	}
 
 	cmd := exec.Command(exe, childArgs...)
 	cmd.Env = append(os.Environ(), EnvDaemonized+"=1")
