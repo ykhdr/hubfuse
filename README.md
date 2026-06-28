@@ -230,6 +230,8 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 | `share add <path> --alias <name> [--permissions ro\|rw] [--allow ...]` | Share a local directory |
 | `share remove <alias>` | Remove a share |
 | `share list` | List local shares |
+| `share allow <alias> <device>...` | Grant device(s) access to an existing share |
+| `share deny <alias> <device>...` | Revoke device(s) access to an existing share |
 | `mount add <device>:<share> --to <path>` | Mount a remote share |
 | `mount remove <device>:<share>` | Unmount |
 | `mount list` | List mounts |

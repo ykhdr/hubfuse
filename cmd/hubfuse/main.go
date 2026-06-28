@@ -50,7 +50,7 @@ func rootCmd() *cobra.Command {
 		Use:   "share",
 		Short: "Manage shared directories",
 	}
-	shareCmd.AddCommand(shareAddCmd(), shareRemoveCmd(), shareListCmd())
+	shareCmd.AddCommand(shareAddCmd(), shareRemoveCmd(), shareListCmd(), shareAllowCmd(), shareDenyCmd())
 
 	mountCmd := &cobra.Command{
 		Use:   "mount",
@@ -868,6 +868,121 @@ func shareListCmd() *cobra.Command {
 					allowed = "none"
 				}
 				fmt.Printf("%-20s  %-4s  %-30s  %s\n", s.Alias, s.Permissions, s.Path, allowed)
+			}
+			return nil
+		},
+	}
+}
+
+// splitDeviceArgs normalises positional device arguments to match the
+// comma-splitting semantics of `share add --allow` (a cobra StringSlice flag):
+// each arg is split on commas, trimmed, and empty pieces are dropped. So
+// `allow x a,b c` and `allow x a b c` are equivalent.
+func splitDeviceArgs(args []string) []string {
+	var out []string
+	for _, a := range args {
+		for _, piece := range strings.Split(a, ",") {
+			if p := strings.TrimSpace(piece); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// shareAllowCmd implements: hubfuse share allow <alias> <device>...
+func shareAllowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "allow <alias> <device>...",
+		Short: "Grant device(s) access to an existing share",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			alias := args[0]
+			devices := splitDeviceArgs(args[1:])
+			if len(devices) == 0 {
+				return errors.New("no devices specified")
+			}
+
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
+
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+
+			added, err := cfg.AllowDevices(alias, devices)
+			if err != nil {
+				return err
+			}
+
+			if len(added) == 0 {
+				fmt.Printf("share %q: no changes (already allowed)\n", alias)
+				return nil
+			}
+
+			if err := config.Save(cfgPath, cfg); err != nil {
+				return fmt.Errorf("write config: %w", err)
+			}
+
+			fmt.Printf("allowed %v on share %q\n", added, alias)
+			return nil
+		},
+	}
+}
+
+// shareDenyCmd implements: hubfuse share deny <alias> <device>...
+func shareDenyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "deny <alias> <device>...",
+		Short: "Revoke device(s) access to an existing share",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			alias := args[0]
+			devices := splitDeviceArgs(args[1:])
+			if len(devices) == 0 {
+				return errors.New("no devices specified")
+			}
+
+			dataDir := common.ExpandHome(common.AgentDataDir)
+			cfgPath := filepath.Join(dataDir, common.ConfigFile)
+
+			cfg, err := loadConfig(cfgPath)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+
+			removed, notFound, err := cfg.DenyDevices(alias, devices)
+			if err != nil {
+				return err
+			}
+
+			for _, n := range notFound {
+				fmt.Printf("warning: %q was not in the allow list for share %q\n", n, alias)
+			}
+
+			if len(removed) > 0 {
+				if err := config.Save(cfgPath, cfg); err != nil {
+					return fmt.Errorf("write config: %w", err)
+				}
+				fmt.Printf("denied %v from share %q\n", removed, alias)
+			} else {
+				fmt.Printf("share %q: no changes\n", alias)
+			}
+
+			// Denying a specific device on a share that still allows "all" does
+			// not actually revoke access (the ACL short-circuits on AllowAll),
+			// so warn rather than leave a false sense of revocation. This applies
+			// whether or not the named device was in the list.
+			deniedAll := false
+			for _, d := range devices {
+				if d == "all" {
+					deniedAll = true
+					break
+				}
+			}
+			if !deniedAll && cfg.AllowsAll(alias) {
+				fmt.Printf("note: share %q still allows ALL devices; run \"hubfuse share deny %s all\" to change that\n", alias, alias)
 			}
 			return nil
 		},
