@@ -222,7 +222,7 @@ Offline devices older than one week (`168h`) are pruned automatically. Customize
 | `leave [--force-local]` | Permanently remove this device from the hub and wipe local TLS state. Pass `--force-local` to wipe even if the hub is unreachable. |
 | `start [-d]` | Start the agent daemon |
 | `stop` | Stop the running agent |
-| `restart` | Stop the running agent (if any) and start a fresh detached daemon. Starts with default logging settings — to pass custom `--log-file`/`--log-level`, use `stop` then `start -d`. |
+| `restart [-d]` | Stop the running agent (if any) and start a fresh one. Mirrors `start`: runs in the foreground by default, detaches with `-d`, and honors `--log-file`/`--log-level`/`--verbose` (logging flags apply to the foreground form; a detached restart uses default logging). |
 | `status` | Show agent status |
 | `devices` | List all devices known to the hub |
 | `rename <nickname>` | Change this device's nickname |
