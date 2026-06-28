@@ -59,16 +59,32 @@ func resolveBackend(tool string) mountBackend {
 	return mountBackends["sshfs"]
 }
 
+// sshfs reconnect/keepalive options. sshfs honours -o reconnect itself and
+// forwards ServerAlive* to ssh: after sshKeepaliveCountMax unanswered probes
+// spaced sshKeepaliveInterval seconds apart (~45s) the SSH session is detected
+// dead, and reconnect transparently re-establishes it in the background. This
+// heals a same-IP TCP blip (a brief network drop without an address change)
+// without an unmount/remount — the daemon never sees it. (issue #61)
+const (
+	sshKeepaliveInterval = 15
+	sshKeepaliveCountMax = 3
+)
+
 // buildMountArgs builds the argument list for the mount command. It emits the
-// base SSH options, then any backend-specific extraOpts as ordered "-o <opt>"
-// pairs, and finally the "hubfuse@<ip>:<share>" source and "<to>" target
-// operands last (their position is significant to sshfs).
+// base SSH options (including the sshfs reconnect/keepalive options so a
+// same-IP TCP blip self-heals; see sshKeepaliveInterval), then any
+// backend-specific extraOpts as ordered "-o <opt>" pairs, and finally the
+// "hubfuse@<ip>:<share>" source and "<to>" target operands last (their
+// position is significant to sshfs).
 func buildMountArgs(b mountBackend, sshPort int, keyPath, knownHosts, deviceIP, share, to string) []string {
 	args := []string{
 		"-p", strconv.Itoa(sshPort),
 		"-o", "IdentityFile=" + keyPath,
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "UserKnownHostsFile=" + knownHosts,
+		"-o", "reconnect",
+		"-o", "ServerAliveInterval=" + strconv.Itoa(sshKeepaliveInterval),
+		"-o", "ServerAliveCountMax=" + strconv.Itoa(sshKeepaliveCountMax),
 	}
 	for _, opt := range b.extraOpts {
 		args = append(args, "-o", opt)
@@ -281,8 +297,44 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.activeMounts[key]; exists {
-		return fmt.Errorf("share %q from device %q is already mounted", mc.Share, mc.Device)
+	// An existing mount for this key is not necessarily an error. If the peer's
+	// endpoint is unchanged it is a silent no-op; if the peer roamed to a new
+	// IP/port we tear the stale mount down and re-mount at the new endpoint — all
+	// under the same m.mu so a concurrent tryMount (config-watcher goroutine) and
+	// handleDeviceOnline (supervise goroutine) can never interleave a
+	// check-and-remount, and all four Mount call sites get this for free. (#61)
+	if existing, exists := m.activeMounts[key]; exists {
+		if existing.IP == deviceIP && existing.SSHPort == sshPort {
+			// Same endpoint — the live mount already points at the right place.
+			// Return BEFORE guardTarget so a live mount's masked mode is never
+			// clobbered.
+			return nil
+		}
+		// Peer roamed (DHCP address change / SSH port change). Tear down the stale
+		// mount pointing at the now-dead old endpoint, then fall through to the
+		// normal mount flow to attach a fresh mount at the new endpoint.
+		m.logger.Info("re-mounting peer at new endpoint",
+			"device", mc.Device,
+			"share", mc.Share,
+			"old_ip", existing.IP,
+			"old_port", existing.SSHPort,
+			"new_ip", deviceIP,
+			"new_port", sshPort,
+		)
+		// force=true: the old endpoint is most likely unreachable, so the unmount
+		// must escalate (the force ladder reaches umount -l). reguard=false: the
+		// normal flow below re-guards the target via guardTarget. Bound the
+		// unmount with unmountOpTimeout — this remount path has no caller deadline.
+		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
+		err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
+		cancel()
+		if err != nil {
+			// Could not tear down the stale mount — do NOT start a new one; the
+			// stale entry is retained (by unmountKey) for a later retry.
+			return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
+				mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
+		}
+		// Stale entry removed; continue into the normal mount flow below.
 	}
 
 	// Create the mount point directory (if needed) and restrict it immediately so
@@ -310,7 +362,7 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	}
 
 	// Materialise known_hosts under the lock so concurrent Mounts for the same
-	// device cannot race-clobber each other, and so a duplicate-mount rejection
+	// device cannot race-clobber each other, and so the same-endpoint early-return
 	// above cannot leave a rewritten file on disk.
 	knownHostsPath, err := m.writeKnownHostsFile(deviceID, deviceIP, sshPort)
 	if err != nil {
@@ -489,6 +541,21 @@ func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 // is respected as-is so the total budget is not exceeded. (#50 bounded)
 const unmountOpTimeout = 5 * time.Second
 
+// reapMountCmd reaps a finished mount's backend process. sshfs daemonizes — it
+// forks and the parent we Start()ed exits 0 once the mount is up — so by the
+// time a mount is torn down (or reaped as dead) mnt.cmd is a long-exited zombie
+// and Wait() returns immediately; it therefore never blocks the bounded teardown
+// (#50). Without this reap a long-lived, frequently-roaming daemon (#61 remounts
+// on every endpoint change unmount this path) would accumulate unreaped child
+// processes. mnt.cmd is never read after Mount stores it, so reaping here cannot
+// race another reader.
+func reapMountCmd(mnt *Mount) {
+	if mnt == nil || mnt.cmd == nil {
+		return
+	}
+	_ = mnt.cmd.Wait()
+}
+
 // unmountKey is the core unmount implementation. It calls m.unmount(ctx, path,
 // force) and, on failure, re-checks whether the path is still a mountpoint via
 // mountpointGoneCtx. If the path is confirmed gone, the entry is reaped — deleted
@@ -501,10 +568,13 @@ const unmountOpTimeout = 5 * time.Second
 // reguard controls whether to re-restrict the target dir to guardMode after the
 // entry is removed (#49 guard-target). Pass reguard=true for all interactive and
 // device-offline paths (the target stays in config and must be re-restricted so
-// stray writes are blocked until the next mount); pass reguard=false only for
-// shutdown (UnmountAllForce), where the process is exiting and the chmod is
-// pointless. reguard failures are logged at WARN and never returned — a re-guard
-// error must not turn a successful unmount into a failure.
+// stray writes are blocked until the next mount). Pass reguard=false for two
+// callers: shutdown (UnmountAllForce), where the process is exiting and the chmod
+// is pointless; and the remount path (Mount's endpoint-change branch), where the
+// normal mount flow that immediately follows re-guards the target itself, so a
+// reguard here would be redundant work instantly undone. reguard failures are
+// logged at WARN and never returned — a re-guard error must not turn a successful
+// unmount into a failure.
 //
 // The caller must hold m.mu.
 func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard bool) error {
@@ -530,8 +600,10 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard b
 			defer cancel()
 		}
 		if m.mountpointGoneCtx(recheckCtx, mnt.LocalPath) {
-			// Mount is already gone — reap the stale entry and return success.
+			// Mount is already gone — reap the stale entry and its backend
+			// process, then return success.
 			delete(m.activeMounts, key)
+			reapMountCmd(mnt)
 			m.logger.Warn("reaped dead mount entry",
 				"device", key.Device,
 				"share", key.Share,
@@ -552,8 +624,9 @@ func (m *Mounter) unmountKey(ctx context.Context, key mountKey, force, reguard b
 	}
 
 	// Command succeeded — do NOT re-check (lazy unmount may still look mounted
-	// briefly). Delete and log.
+	// briefly). Delete the entry, reap the backend process, and log.
 	delete(m.activeMounts, key)
+	reapMountCmd(mnt)
 	m.logger.Info("unmounted share",
 		"device", key.Device,
 		"share", key.Share,

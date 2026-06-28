@@ -57,7 +57,47 @@ type Daemon struct {
 	// dataDir is the base data directory (~/.hubfuse by default).
 	dataDir string
 
+	// sshPort is the port the embedded SSH server bound at startup. It is
+	// captured once in NewDaemon and never changes: the SSH server binds its port
+	// once and is not restarted on config hot-reload, so every (re)Register must
+	// advertise THIS port — not the live config's ssh-port — or a roaming peer
+	// would remount to an endpoint the daemon isn't actually listening on. Read
+	// without a lock: it is written once, before any goroutine starts. (#61)
+	sshPort int
+
 	onReady func()
+
+	// readyOnce guards onReady so it fires exactly once for the daemon's
+	// lifetime. The supervisor re-runs sessionOnce on every reconnect, but the
+	// PID-file hook (onReady) must run only on the first successful Register.
+	readyOnce sync.Once
+
+	// minReconnectInterval is the floor on how frequently the supervisor starts a
+	// new hub session. It serves two roles, both keyed off the same minimum so a
+	// flapping hub is never hammered: (1) supervise waits out this interval when a
+	// session died sooner than it — a Subscribe stream that re-establishes then
+	// dies almost immediately must not let supervise spin with zero delay (CPU
+	// peg, back-to-back Register+Subscribe, log flood); (2) reconnectSession uses
+	// it as the initial retry backoff, doubling up to backoffMax on repeated
+	// Register failures. Defaults to backoffInitial (set in NewDaemon);
+	// buildTestDaemon leaves it 0 so unit tests neither sleep on the floor nor on
+	// retries. (#61)
+	minReconnectInterval time.Duration
+
+	// registerFn and subscribeFn are injectable seams over the concrete
+	// HubClient (client.go has no interface, so it cannot be stubbed without a
+	// live gRPC connection). NewDaemon wires them to delegate to
+	// d.hubClient.Register / d.hubClient.Subscribe; unit tests override them with
+	// fakes to drive sessionOnce / reconnectSession / supervise without a live hub.
+	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
+	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
+
+	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
+	// config-watcher's share-publish path (onConfigChange) is testable without a
+	// live gRPC connection. NewDaemon wires it to d.hubClient.UpdateShares; unit
+	// tests override it to observe the publish (e.g. assert d.config is already
+	// swapped to the new pointer by the time shares are pushed to the hub). (#61)
+	updateSharesFn func(ctx context.Context, shares []*pb.Share) error
 }
 
 // NewDaemon loads the config and identity, creates the connector, mounter, and
@@ -141,7 +181,24 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		onlineDevices: make(map[string]*OnlineDevice),
 		nicknames:     cachedNicknames,
 		dataDir:       dir,
+		sshPort:       sshPort,
 		onReady:       opts.OnReady,
+
+		minReconnectInterval: backoffInitial,
+	}
+
+	// Wire the hub-session seams to the live client. The closures read d.hubClient
+	// at call time (it is set later, by connect), so eager assignment here is safe
+	// — the codebase idiom (see NewMounter's execCommand/unmount defaults). Unit
+	// tests replace these with fakes before driving the session functions.
+	d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
+		return d.hubClient.Register(ctx, shares, sshPort)
+	}
+	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return d.hubClient.Subscribe(ctx)
+	}
+	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
+		return d.hubClient.UpdateShares(ctx, shares)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
@@ -388,46 +445,167 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 	return nil
 }
 
-// registerAndSubscribe registers with the hub, signals readiness, processes
-// the initial device list, and starts the event stream goroutine.
+// registerAndSubscribe runs the first hub session synchronously (so a hub that
+// is down at startup still surfaces as a startup error and onReady timing for
+// the PID file is preserved), then hands the live stream to a long-running
+// supervisor goroutine that reconnects whenever the session dies. (#61)
 func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
-	shares := configSharesToProto(d.config.Shares)
-	regResp, err := d.hubClient.Register(ctx, shares, d.config.Agent.SSHPort)
+	stream, err := d.sessionOnce(ctx)
 	if err != nil {
-		return fmt.Errorf("register with hub: %w", err)
+		return err
+	}
+
+	go d.supervise(ctx, stream)
+
+	return nil
+}
+
+// sessionOnce runs one hub session setup: Register, signal readiness (exactly
+// once across the daemon's lifetime), process the initial online-device
+// snapshot, then open the event Subscribe stream and return it. The
+// Register → processInitialDevices → Subscribe order is preserved so the full
+// online-device state comes from the RegisterResponse snapshot rather than being
+// reconstructed from events; processInitialDevices runs again on every reconnect,
+// which is how a roaming device refreshes its own mounts. A partial success
+// (Register ok, Subscribe failed) returns an error and the caller retries the
+// whole sessionOnce — a repeat Register is idempotent on the hub.
+func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+	// Snapshot the config pointer under the lock before reading shares: the
+	// supervisor re-runs sessionOnce on every reconnect, concurrently with the
+	// config watcher's onConfigChange, which swaps d.config under d.mu. Read it the
+	// same way every other supervisor-path access does (mountsForOnlineDevice,
+	// guardConfiguredTargets) — onConfigChange only ever replaces the pointer, so a
+	// snapshotted *Config is immutable. The SSH port comes from the immutable
+	// startup value (d.sshPort), never the live config, so a re-register always
+	// advertises the port the embedded SSH server is actually listening on. (#61)
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+
+	shares := configSharesToProto(cfg.Shares)
+	regResp, err := d.registerFn(ctx, shares, d.sshPort)
+	if err != nil {
+		return nil, fmt.Errorf("register with hub: %w", err)
 	}
 	d.logger.Info("registered with hub",
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
-	if d.onReady != nil {
-		d.onReady()
-	}
+	// onReady is optional (nil in tests and when the cmd layer wants no PID
+	// hook), so guard the nil case inside the Once — a bare Do(d.onReady) would
+	// panic on a nil func.
+	d.readyOnce.Do(func() {
+		if d.onReady != nil {
+			d.onReady()
+		}
+	})
 
 	d.processInitialDevices(regResp.DevicesOnline)
 
-	stream, err := d.hubClient.Subscribe(ctx)
+	stream, err := d.subscribeFn(ctx)
 	if err != nil {
-		return fmt.Errorf("subscribe to hub events: %w", err)
+		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
 
-	go func() {
-		for {
-			event, err := stream.Recv()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					d.logger.Warn("event stream error", "error", err)
-					return
-				}
-			}
-			d.handleEvent(event)
-		}
-	}()
+	return stream, nil
+}
 
-	return nil
+// readStream consumes events from the hub subscription until Recv returns an
+// error or ctx is cancelled. A Recv error after ctx cancellation is the normal
+// shutdown path (no warning); otherwise the hub session has died and the caller
+// (supervise) reconnects.
+func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
+	for {
+		event, err := stream.Recv()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				d.logger.Warn("event stream error", "error", err)
+				return
+			}
+		}
+		d.handleEvent(event)
+	}
+}
+
+// reconnectSession retries sessionOnce with exponential backoff
+// (minReconnectInterval → backoffMax) until it succeeds or ctx is cancelled. It
+// returns the live stream on success, or nil when ctx is cancelled (signalling
+// supervise to exit). The same hubClient is reused throughout: gRPC repairs the
+// transport under the hood, so a fresh dial is unnecessary.
+func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClient {
+	delay := d.minReconnectInterval
+	if delay <= 0 {
+		// Floor the FAILURE backoff so a persistent Register failure cannot
+		// busy-spin if minReconnectInterval was left at 0 (the ">0" invariant is
+		// unenforced; NewDaemon sets backoffInitial, but this guards callers that
+		// don't). Only the backoff delay is floored — the success path returns
+		// before this is read, and the supervise floor is independent. (#61)
+		delay = backoffInitial
+	}
+	for {
+		stream, err := d.sessionOnce(ctx)
+		if err == nil {
+			d.logger.Info("hub session re-established")
+			return stream
+		}
+
+		d.logger.Warn("hub session reconnect failed, retrying",
+			"error", err,
+			"backoff", delay,
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > backoffMax {
+			delay = backoffMax
+		}
+	}
+}
+
+// supervise runs the hub session for the daemon's lifetime: it reads the event
+// stream until the session dies, then reconnects (Register → Subscribe again)
+// and resumes. It returns only when ctx is cancelled — either readStream
+// observes the cancellation or reconnectSession returns a nil stream. A floor
+// (minReconnectInterval) is enforced between successive session starts so a
+// session that dies the instant it is established cannot make supervise spin.
+func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
+	for {
+		sessionStart := time.Now()
+		d.readStream(ctx, stream)
+		if ctx.Err() != nil {
+			return
+		}
+		d.logger.Warn("hub session lost; reconnecting")
+
+		// Floor the reconnect cadence. reconnectSession only backs off when
+		// sessionOnce FAILS; a session that re-establishes and then dies almost
+		// immediately (flaky proxy, half-open conn, or two daemons sharing one
+		// device identity each closing the other's Subscribe channel) would
+		// otherwise loop readStream → reconnectSession (instant success) →
+		// readStream with zero delay — pegging CPU and hammering the hub. If the
+		// session lived less than minReconnectInterval, wait out the remainder so
+		// successive session starts are spaced at least that far apart. (#61)
+		if dwell := time.Since(sessionStart); dwell < d.minReconnectInterval {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d.minReconnectInterval - dwell):
+			}
+		}
+
+		stream = d.reconnectSession(ctx)
+		if stream == nil {
+			return
+		}
+	}
 }
 
 // runServices starts the heartbeat ticker and config watcher, then blocks
@@ -495,7 +673,10 @@ func (d *Daemon) Shutdown() error {
 }
 
 // processInitialDevices handles the list of online devices received on Register.
-// For each device that is paired and has a mount configured, it auto-mounts.
+// For each device that is paired, it auto-mounts every share configured for that
+// device. processInitialDevices runs again on every reconnect, so a roaming peer
+// whose endpoint changed has each of its shares re-pointed at the new IP/port by
+// Mount's remount branch. (#61)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	for _, dev := range devices {
 		info := protoToOnlineDevice(dev)
@@ -508,36 +689,65 @@ func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 		// next restart (closes the online-gap window for this peer).
 		d.rememberNickname(dev.DeviceId, dev.Nickname)
 
-		mc, shouldMount := d.shouldMount(dev.Nickname)
-		if !shouldMount {
+		mounts := d.mountsForOnlineDevice(info)
+		if len(mounts) == 0 {
 			continue
 		}
 		if !d.isPaired(dev.DeviceId) {
 			continue
 		}
-		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
-			d.logger.Error("auto-mount failed",
-				"device", dev.Nickname,
-				"share", mc.Share,
-				"error", err,
-			)
+		// Mount/remount EVERY configured share the peer still exports — a
+		// multi-share peer must recover all of its shares on (re)connect, not just
+		// the first, but a share it stopped exporting must not be re-mounted. (#61)
+		for _, mc := range mounts {
+			if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+				d.logger.Error("auto-mount failed",
+					"device", dev.Nickname,
+					"share", mc.Share,
+					"error", err,
+				)
+			}
 		}
 	}
 }
 
-// shouldMount checks whether the config has a mount entry for a device with the
-// given nickname. Returns the MountConfig and true if found.
-func (d *Daemon) shouldMount(deviceNickname string) (agentconfig.MountConfig, bool) {
+// mountsForOnlineDevice returns the configured mounts that should be (re)mounted
+// for an online peer: those whose device nickname matches info.Nickname AND whose
+// share the peer is currently exporting (info.Shares). Both halves matter:
+//
+//   - A single peer can export multiple shares — each its own mount entry — so the
+//     auto-mount/remount paths must act on ALL of them, not just the first, or a
+//     multi-share peer's other shares stay unmounted and, after a roam, stranded
+//     on the dead old endpoint.
+//   - Intersecting with the peer's exported set (from the Register snapshot or the
+//     DeviceOnline event) means a share the peer stopped exporting — a
+//     SharesUpdated removal missed while the event stream was down — is never
+//     (re)mounted to a now-dead share. (We do not unmount an already-stale mount
+//     here; that add-only-no-prune reconnect behaviour is a documented tradeoff.)
+//
+// The config pointer is snapshotted under the lock (onConfigChange swaps it under
+// d.mu). Returns nil when nothing matches. (#61)
+func (d *Daemon) mountsForOnlineDevice(info *OnlineDevice) []agentconfig.MountConfig {
 	d.mu.RLock()
 	cfg := d.config
 	d.mu.RUnlock()
 
-	for _, mc := range cfg.Mounts {
-		if mc.Device == deviceNickname {
-			return mc, true
-		}
+	exported := make(map[string]struct{}, len(info.Shares))
+	for _, s := range info.Shares {
+		exported[s] = struct{}{}
 	}
-	return agentconfig.MountConfig{}, false
+
+	var mounts []agentconfig.MountConfig
+	for _, mc := range cfg.Mounts {
+		if mc.Device != info.Nickname {
+			continue
+		}
+		if _, ok := exported[mc.Share]; !ok {
+			continue
+		}
+		mounts = append(mounts, mc)
+	}
+	return mounts
 }
 
 // isPaired reports whether a device is paired by checking for a public key

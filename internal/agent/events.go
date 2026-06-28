@@ -30,8 +30,8 @@ func (d *Daemon) handleEvent(event *pb.Event) {
 	}
 }
 
-// handleDeviceOnline adds the device to onlineDevices and, if it is paired and
-// has a mount configured, auto-mounts.
+// handleDeviceOnline adds the device to onlineDevices and, if it is paired,
+// auto-mounts every share configured for it.
 func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	d.logger.Info("device came online",
 		"device_id", e.DeviceId,
@@ -60,19 +60,25 @@ func (d *Daemon) handleDeviceOnline(e *pb.DeviceOnlineEvent) {
 	// (closes the online-gap window for this peer — issue #48).
 	d.rememberNickname(e.DeviceId, e.Nickname)
 
-	mc, shouldMount := d.shouldMount(e.Nickname)
-	if !shouldMount {
+	mounts := d.mountsForOnlineDevice(info)
+	if len(mounts) == 0 {
 		return
 	}
 	if !d.isPaired(e.DeviceId) {
 		return
 	}
-	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
-		d.logger.Error("auto-mount on device-online failed",
-			"device", e.Nickname,
-			"share", mc.Share,
-			"error", err,
-		)
+	// Mount/remount EVERY configured share the peer still exports. When the peer
+	// roamed to a new IP/port, Mount's remount branch tears down each stale share
+	// and re-points it at the new endpoint — so a multi-share peer recovers ALL of
+	// its shares, not just the first; a share it stopped exporting is skipped. (#61)
+	for _, mc := range mounts {
+		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+			d.logger.Error("auto-mount on device-online failed",
+				"device", e.Nickname,
+				"share", mc.Share,
+				"error", err,
+			)
+		}
 	}
 }
 
@@ -216,16 +222,16 @@ func (d *Daemon) handlePairingCompleted(e *pb.PairingCompletedEvent) {
 		return
 	}
 
-	mc, shouldMount := d.shouldMount(info.Nickname)
-	if !shouldMount {
-		return
-	}
-
-	if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
-		d.logger.Error("auto-mount after pairing failed",
-			"device", info.Nickname,
-			"share", mc.Share,
-			"error", err,
-		)
+	// Mount EVERY configured share the peer currently exports, not just the first:
+	// a multi-share peer already online when pairing completes must get all of its
+	// shares immediately, consistent with the device-online and reconnect paths. (#61)
+	for _, mc := range d.mountsForOnlineDevice(info) {
+		if err := d.mounter.Mount(context.Background(), mc, info.DeviceID, info.IP, info.SSHPort); err != nil {
+			d.logger.Error("auto-mount after pairing failed",
+				"device", info.Nickname,
+				"share", mc.Share,
+				"error", err,
+			)
+		}
 	}
 }

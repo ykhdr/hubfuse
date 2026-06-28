@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
 	pb "github.com/ykhdr/hubfuse/proto"
@@ -76,6 +78,11 @@ agent {
 		logger:        discardLogger(),
 		onlineDevices: make(map[string]*OnlineDevice),
 		dataDir:       dir,
+		sshPort:       cfg.Agent.SSHPort,
+		// Default no-op share publish so a test that drives onConfigChange's
+		// SharesChanged path does not deref the nil hubClient. Tests that assert on
+		// the publish override this seam.
+		updateSharesFn: func(context.Context, []*pb.Share) error { return nil },
 	}
 
 	return d, dir
@@ -300,6 +307,98 @@ func TestHandleDeviceOnline_NoMountWhenNotPaired(t *testing.T) {
 	assert.False(t, d.mounter.IsActive("laptop", "docs"), "share should NOT be mounted for an unpaired device")
 }
 
+// TestHandleDeviceOnline_AutoMountsAllSharesOfPeer verifies that a peer exporting
+// MULTIPLE configured shares gets ALL of them mounted on DeviceOnline, and that
+// after the peer roams to a new endpoint every share remounts at the new IP — not
+// just the first matching mount entry. (#61 multi-share remount)
+func TestHandleDeviceOnline_AutoMountsAllSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	// Two mount entries for the same peer nickname — one per exported share.
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+
+	writePubKey(t, dir, "device-123")
+
+	online := func(ip string) *pb.DeviceOnlineEvent {
+		return &pb.DeviceOnlineEvent{
+			DeviceId: "device-123",
+			Nickname: "laptop",
+			Ip:       ip,
+			SshPort:  2222,
+			Shares: []*pb.Share{
+				{Alias: "docs", Permissions: "ro"},
+				{Alias: "photos", Permissions: "ro"},
+			},
+		}
+	}
+
+	// First online: BOTH shares must mount at the initial endpoint.
+	d.handleDeviceOnline(online("10.0.0.5"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount on device-online")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"),
+		"photos must also mount on device-online — not just the first configured share")
+
+	// Peer roamed to a new IP. BOTH shares must remount at the new endpoint.
+	d.handleDeviceOnline(online("10.0.0.99"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must stay mounted after roam")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"), "photos must stay mounted after roam")
+
+	endpoints := make(map[string]string)
+	for _, mnt := range d.mounter.ActiveMounts() {
+		endpoints[mnt.Share] = mnt.IP
+	}
+	assert.Equal(t, "10.0.0.99", endpoints["docs"], "docs must remount at the new endpoint after roam")
+	assert.Equal(t, "10.0.0.99", endpoints["photos"],
+		"photos must remount at the new endpoint after roam — every share follows the roam, not just the first")
+}
+
+// TestHandleDeviceOnline_MountsOnlyExportedShares verifies that auto-mount
+// intersects local config with the peer's actually-exported shares: a share the
+// peer no longer exports (e.g. a SharesUpdated removal missed while the stream was
+// down) must NOT be (re)mounted to a now-dead share. (#61)
+func TestHandleDeviceOnline_MountsOnlyExportedShares(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	// Local config mounts BOTH shares...
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// ...but the peer now exports ONLY "docs".
+	evt := &pb.DeviceOnlineEvent{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs", Permissions: "ro"}},
+	}
+
+	d.handleDeviceOnline(evt)
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "the exported share must mount")
+	assert.False(t, d.mounter.IsActive("laptop", "photos"),
+		"a share the peer no longer exports must NOT be mounted")
+}
+
 // ─── handleDeviceOffline ──────────────────────────────────────────────────────
 
 func TestHandleDeviceOffline_RemovesFromKnownDevices(t *testing.T) {
@@ -424,13 +523,14 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 		{Device: "peer-laptop", Share: "docs", To: filepath.Join(dir, "mnt", "docs")},
 	}
 
-	// The peer is online.
+	// The peer is online and exports the configured share.
 	d.mu.Lock()
 	d.onlineDevices["peer-device-999"] = &OnlineDevice{
 		DeviceID: "peer-device-999",
 		Nickname: "peer-laptop",
 		IP:       "10.0.0.7",
 		SSHPort:  2222,
+		Shares:   []string{"docs"},
 	}
 	d.mu.Unlock()
 
@@ -442,6 +542,47 @@ func TestHandlePairingCompleted_AutoMountsWhenOnlineAndConfigured(t *testing.T) 
 	d.handlePairingCompleted(evt)
 
 	assert.True(t, d.mounter.IsActive("peer-laptop", "docs"), "share should be mounted after pairing completed for an online + configured device")
+}
+
+// TestHandlePairingCompleted_AutoMountsAllExportedSharesOfPeer verifies that a
+// multi-share peer already online when pairing completes gets ALL of its
+// configured+exported shares mounted immediately — not just the first. (#61)
+func TestHandlePairingCompleted_AutoMountsAllExportedSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "peer-laptop", Share: "docs", To: docsTo},
+		{Device: "peer-laptop", Share: "photos", To: photosTo},
+	}
+
+	// Peer already online, exporting BOTH shares, at pairing-completion time.
+	d.mu.Lock()
+	d.onlineDevices["peer-device-999"] = &OnlineDevice{
+		DeviceID: "peer-device-999",
+		Nickname: "peer-laptop",
+		IP:       "10.0.0.7",
+		SSHPort:  2222,
+		Shares:   []string{"docs", "photos"},
+	}
+	d.mu.Unlock()
+
+	evt := &pb.PairingCompletedEvent{
+		PeerDeviceId:  "peer-device-999",
+		PeerPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIpeer test@host",
+	}
+
+	d.handlePairingCompleted(evt)
+
+	assert.True(t, d.mounter.IsActive("peer-laptop", "docs"), "docs must mount on pairing completion")
+	assert.True(t, d.mounter.IsActive("peer-laptop", "photos"),
+		"photos must ALSO mount on pairing completion — not just the first configured share")
 }
 
 func TestHandlePairingCompleted_NoMountWhenOffline(t *testing.T) {
@@ -558,6 +699,89 @@ func TestOnConfigChange_MountsRemoved(t *testing.T) {
 	assert.False(t, d.mounter.IsActive("remote", "music"), "share should be inactive after Unmount")
 }
 
+// TestOnConfigChange_SwapsConfigBeforePublishingShares verifies the codex iter3
+// ordering fix: onConfigChange must swap d.config to the new pointer BEFORE it
+// publishes the new shares to the hub. Otherwise a concurrent sessionOnce
+// (re-Register on reconnect) could snapshot the stale d.config and re-Register the
+// old shares AFTER UpdateShares(new) already landed, leaving the hub with obsolete
+// shares. The seam captures d.config exactly when the publish fires. (#61)
+func TestOnConfigChange_SwapsConfigBeforePublishingShares(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	oldCfg := &agentconfig.Config{
+		Shares: []agentconfig.ShareConfig{
+			{Alias: "old-share", Path: "/old", Permissions: "ro", AllowedDevices: []string{"all"}},
+		},
+	}
+	newCfg := &agentconfig.Config{
+		Shares: []agentconfig.ShareConfig{
+			{Alias: "new-share", Path: "/new", Permissions: "rw", AllowedDevices: []string{"all"}},
+		},
+	}
+	d.config = oldCfg
+
+	var (
+		publishCalls    int
+		configAtPublish *agentconfig.Config
+		sharesAtPublish []*pb.Share
+	)
+	d.updateSharesFn = func(_ context.Context, shares []*pb.Share) error {
+		publishCalls++
+		d.mu.RLock()
+		configAtPublish = d.config
+		d.mu.RUnlock()
+		sharesAtPublish = shares
+		return nil
+	}
+
+	d.onConfigChange(oldCfg, newCfg)
+
+	require.Equal(t, 1, publishCalls, "a share change must publish to the hub exactly once")
+	assert.Same(t, newCfg, configAtPublish,
+		"d.config must already be the new pointer by the time shares are published to the hub")
+	require.Len(t, sharesAtPublish, 1)
+	assert.Equal(t, "new-share", sharesAtPublish[0].Alias, "the published shares must be the new ones")
+
+	d.mu.RLock()
+	gotConfig := d.config
+	d.mu.RUnlock()
+	assert.Same(t, newCfg, gotConfig, "d.config must remain the new pointer after onConfigChange")
+}
+
+// TestTryMount_UsesSnapshottedEndpoint verifies the codex iter3 hardening: tryMount
+// resolves the peer endpoint to local primitives under the lock and mounts at THAT
+// endpoint, instead of aliasing the map's *OnlineDevice across the unlocked
+// resolve→Mount handoff (the pointer pattern another goroutine's in-place mutation
+// could later corrupt). (#61)
+func TestTryMount_UsesSnapshottedEndpoint(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	writePubKey(t, dir, "device-xyz")
+	d.mu.Lock()
+	d.onlineDevices["device-xyz"] = &OnlineDevice{
+		DeviceID: "device-xyz",
+		Nickname: "workstation",
+		IP:       "10.1.2.3",
+		SSHPort:  2022,
+	}
+	d.mu.Unlock()
+
+	mc := agentconfig.MountConfig{
+		Device: "workstation",
+		Share:  "docs",
+		To:     filepath.Join(dir, "mnt", "docs"),
+	}
+	t.Cleanup(func() { _ = os.Chmod(mc.To, 0o755) })
+
+	d.tryMount(mc)
+
+	require.True(t, d.mounter.IsActive("workstation", "docs"), "tryMount must mount for an online+paired device")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.1.2.3", mounts[0].IP, "tryMount must mount at the snapshotted peer IP")
+	assert.Equal(t, 2022, mounts[0].SSHPort, "tryMount must mount at the snapshotted peer SSH port")
+}
+
 // ─── isPaired ─────────────────────────────────────────────────────────────────
 
 func TestIsPaired_TrueWhenKeyExists(t *testing.T) {
@@ -573,26 +797,85 @@ func TestIsPaired_FalseWhenKeyMissing(t *testing.T) {
 	assert.False(t, d.isPaired("unknown-device"), "isPaired() = true for a device with no key file, want false")
 }
 
-// ─── shouldMount ──────────────────────────────────────────────────────────────
+// ─── sessionOnce: register port + config-reload race (#61) ─────────────────────
 
-func TestShouldMount_TrueWhenConfigured(t *testing.T) {
-	d, dir := buildTestDaemon(t)
+// TestSessionOnce_RegistersStartupSSHPortNotLiveConfig verifies that a re-register
+// advertises the SSH port the embedded server actually bound at startup
+// (d.sshPort), NOT a value the live config may have hot-reloaded. The SSH server
+// is not restarted on config change, so advertising the config value would point
+// peers at a dead endpoint. (#61)
+func TestSessionOnce_RegistersStartupSSHPortNotLiveConfig(t *testing.T) {
+	d, _ := buildTestDaemon(t) // d.sshPort == 2222 (the bound port)
 
-	d.config.Mounts = []agentconfig.MountConfig{
-		{Device: "laptop", Share: "docs", To: filepath.Join(dir, "mnt")},
+	// Simulate a config hot-reload that changed ssh-port while the server keeps
+	// listening on the original port.
+	d.mu.Lock()
+	d.config.Agent.SSHPort = 9999
+	d.mu.Unlock()
+
+	var gotPort int
+	d.registerFn = func(_ context.Context, _ []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
+		gotPort = sshPort
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
 	}
 
-	mc, ok := d.shouldMount("laptop")
-	require.True(t, ok, "shouldMount() = false, want true for configured device")
-	assert.Equal(t, "docs", mc.Share)
+	_, err := d.sessionOnce(context.Background())
+	require.NoError(t, err, "sessionOnce")
+	assert.Equal(t, 2222, gotPort,
+		"re-register must advertise the SSH server's startup port, not the hot-reloaded config value")
 }
 
-func TestShouldMount_FalseWhenNotConfigured(t *testing.T) {
+// TestSessionOnce_ConcurrentConfigReloadNoRace drives sessionOnce concurrently
+// with onConfigChange (which swaps d.config under d.mu). Under -race this fails if
+// sessionOnce reads d.config without the lock — the exact data race the supervisor
+// introduced, since it re-runs sessionOnce on every reconnect alongside the config
+// watcher. (#61)
+func TestSessionOnce_ConcurrentConfigReloadNoRace(t *testing.T) {
 	d, _ := buildTestDaemon(t)
-	d.config.Mounts = nil
 
-	_, ok := d.shouldMount("unconfigured-device")
-	assert.False(t, ok, "shouldMount() = true for unconfigured device, want false")
+	d.registerFn = func(_ context.Context, shares []*pb.Share, _ int) (*pb.RegisterResponse, error) {
+		_ = len(shares) // touch the snapshot so -race observes the read
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	// Two configs with identical content but distinct pointers: ComputeDiff is
+	// empty, so onConfigChange only swaps the d.config pointer (the racing write)
+	// without touching the nil test hubClient or the mounter.
+	mkCfg := func() *agentconfig.Config {
+		return &agentconfig.Config{
+			Agent: agentconfig.AgentConfig{SSHPort: 2222},
+			Shares: []agentconfig.ShareConfig{
+				{Alias: "docs", Path: "/docs", Permissions: "ro", AllowedDevices: []string{"all"}},
+			},
+		}
+	}
+
+	done := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				d.onConfigChange(mkCfg(), mkCfg())
+			}
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		_, err := d.sessionOnce(context.Background())
+		require.NoError(t, err, "sessionOnce #%d", i)
+	}
+	close(done)
+	<-writerDone
 }
 
 // ─── processInitialDevices ────────────────────────────────────────────────────
@@ -613,6 +896,451 @@ func TestProcessInitialDevices_PopulatesKnownDevices(t *testing.T) {
 	assert.Len(t, d.onlineDevices, 2, "knownDevices len")
 	assert.Contains(t, d.onlineDevices, "dev-1", "knownDevices missing dev-1")
 	assert.Contains(t, d.onlineDevices, "dev-2", "knownDevices missing dev-2")
+}
+
+// TestProcessInitialDevices_AutoMountsAllSharesOfPeer verifies the reconnect path:
+// the RegisterResponse snapshot auto-mounts EVERY configured share of a paired
+// multi-share peer, and a later snapshot reporting a roamed endpoint remounts all
+// of them at the new IP — not just the first. (#61 multi-share remount)
+func TestProcessInitialDevices_AutoMountsAllSharesOfPeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+
+	writePubKey(t, dir, "device-123")
+
+	snapshot := func(ip string) []*pb.DeviceInfo {
+		return []*pb.DeviceInfo{{
+			DeviceId: "device-123",
+			Nickname: "laptop",
+			Ip:       ip,
+			SshPort:  2222,
+			Shares:   []*pb.Share{{Alias: "docs"}, {Alias: "photos"}},
+		}}
+	}
+
+	// Initial register snapshot: both shares mount.
+	d.processInitialDevices(snapshot("10.0.0.5"))
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount from the register snapshot")
+	assert.True(t, d.mounter.IsActive("laptop", "photos"),
+		"photos must also mount from the register snapshot — not just the first share")
+
+	// Reconnect snapshot reports the peer at a new endpoint: both shares remount.
+	d.processInitialDevices(snapshot("10.0.0.99"))
+	endpoints := make(map[string]string)
+	for _, mnt := range d.mounter.ActiveMounts() {
+		endpoints[mnt.Share] = mnt.IP
+	}
+	assert.Equal(t, "10.0.0.99", endpoints["docs"], "docs must remount at the new endpoint on reconnect")
+	assert.Equal(t, "10.0.0.99", endpoints["photos"],
+		"photos must remount at the new endpoint on reconnect — every share follows the roam")
+}
+
+// TestProcessInitialDevices_MountsOnlyExportedShares verifies the reconnect
+// snapshot path intersects local config with the peer's exported shares: a config
+// mount for a share the peer no longer exports in the snapshot must NOT be
+// (re)mounted. (#61)
+func TestProcessInitialDevices_MountsOnlyExportedShares(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	photosTo := filepath.Join(dir, "mnt", "photos")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+		_ = os.Chmod(photosTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+		{Device: "laptop", Share: "photos", To: photosTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// The Register snapshot reports the peer exporting ONLY "docs".
+	d.processInitialDevices([]*pb.DeviceInfo{{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs"}},
+	}})
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"), "the exported share must mount from the snapshot")
+	assert.False(t, d.mounter.IsActive("laptop", "photos"),
+		"a share absent from the snapshot must NOT be mounted")
+}
+
+// ─── supervisor: session reconnect (#61) ──────────────────────────────────────
+
+// fakeSubscribeStream is a minimal pb.HubFuse_SubscribeClient for unit tests.
+// Only Recv is implemented; the embedded grpc.ClientStream is left nil because
+// the code under test (readStream) only ever calls Recv. recv supplies the
+// per-call behaviour.
+type fakeSubscribeStream struct {
+	grpc.ClientStream
+	recv func() (*pb.Event, error)
+}
+
+func (f *fakeSubscribeStream) Recv() (*pb.Event, error) { return f.recv() }
+
+// errStream returns a fake stream whose Recv always fails — it models a hub
+// session that has just died.
+func errStream() *fakeSubscribeStream {
+	return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		return nil, errors.New("stream closed")
+	}}
+}
+
+// TestReadStream_ExitsOnRecvError verifies readStream consumes events until Recv
+// returns an error, then returns instead of spinning. No seam is needed: the
+// fake stream is passed directly. (#61)
+func TestReadStream_ExitsOnRecvError(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var calls int
+	stream := &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		calls++
+		if calls == 1 {
+			// A benign event with no payload: handleEvent logs an unknown-type
+			// warning and returns, so the loop advances to the error below.
+			return &pb.Event{}, nil
+		}
+		return nil, errors.New("stream broken")
+	}}
+
+	done := make(chan struct{})
+	go func() {
+		d.readStream(context.Background(), stream)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// returned promptly — good.
+	case <-time.After(2 * time.Second):
+		t.Fatal("readStream did not return after a Recv error — it is looping")
+	}
+
+	assert.GreaterOrEqual(t, calls, 2, "readStream should consume the event then exit on the next Recv error")
+}
+
+// TestSessionOnce_OnReadyFiresExactlyOnce verifies that across multiple
+// sessionOnce calls (modelling the first session plus reconnects) the onReady
+// hook is invoked exactly once. The HubClient seam is overridden with fakes so
+// no live hub is needed. (#61)
+func TestSessionOnce_OnReadyFiresExactlyOnce(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var registerCalls, readyCalls int
+	d.onReady = func() { readyCalls++ }
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		registerCalls++
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	for i := 0; i < 3; i++ {
+		stream, err := d.sessionOnce(context.Background())
+		require.NoError(t, err, "sessionOnce #%d", i)
+		require.NotNil(t, stream, "sessionOnce #%d should return a stream", i)
+	}
+
+	assert.Equal(t, 3, registerCalls, "every sessionOnce must re-register (idempotent on the hub)")
+	assert.Equal(t, 1, readyCalls, "onReady must fire exactly once across multiple sessions")
+}
+
+// TestSessionOnce_NilOnReadyDoesNotPanic verifies the nil-guard inside the
+// readyOnce.Do closure: buildTestDaemon leaves onReady nil, and sessionOnce must
+// not panic (a bare Do(d.onReady) would). (#61)
+func TestSessionOnce_NilOnReadyDoesNotPanic(t *testing.T) {
+	d, _ := buildTestDaemon(t) // onReady is nil
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	require.NotPanics(t, func() {
+		_, err := d.sessionOnce(context.Background())
+		require.NoError(t, err)
+	}, "sessionOnce must not panic when onReady is nil")
+}
+
+// TestReconnectSession_ReturnsNilOnCancelledCtx verifies that reconnectSession
+// stops retrying and returns nil once ctx is cancelled, so supervise can exit
+// cleanly on shutdown. The seam's registerFn always fails, forcing the backoff
+// path where the cancelled ctx is observed. (#61)
+func TestReconnectSession_ReturnsNilOnCancelledCtx(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return nil, errors.New("hub unreachable")
+	}
+	// subscribeFn is never reached because Register always fails.
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		t.Fatal("subscribeFn must not be called when Register fails")
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the first backoff select
+
+	done := make(chan pb.HubFuse_SubscribeClient, 1)
+	go func() { done <- d.reconnectSession(ctx) }()
+
+	select {
+	case stream := <-done:
+		assert.Nil(t, stream, "reconnectSession must return nil when ctx is cancelled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnectSession did not return on a cancelled ctx — it is stuck in backoff")
+	}
+}
+
+// TestSessionOnce_SubscribeFailureReturnsWrappedError verifies the documented
+// "Register ok, Subscribe failed" partial-success path: sessionOnce returns the
+// "subscribe to hub events" wrapped error, and onReady (which fires after
+// Register, before Subscribe) still fires exactly once when the first Subscribe
+// fails and a later retry succeeds. (#61)
+func TestSessionOnce_SubscribeFailureReturnsWrappedError(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var readyCalls int
+	d.onReady = func() { readyCalls++ }
+
+	var registerCalls atomic.Int32
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		registerCalls.Add(1)
+		return &pb.RegisterResponse{}, nil
+	}
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		if subscribeCalls.Add(1) == 1 {
+			return nil, errors.New("stream setup failed")
+		}
+		return errStream(), nil
+	}
+
+	// First session: Register ok (onReady fires), Subscribe fails → wrapped error.
+	stream, err := d.sessionOnce(context.Background())
+	require.Error(t, err, "sessionOnce must surface a Subscribe failure")
+	assert.Nil(t, stream, "no stream is returned when Subscribe fails")
+	assert.Contains(t, err.Error(), "subscribe to hub events", "error must be wrapped with the Subscribe context")
+
+	// Second session: Subscribe now succeeds.
+	stream, err = d.sessionOnce(context.Background())
+	require.NoError(t, err, "second sessionOnce must succeed")
+	require.NotNil(t, stream, "second sessionOnce must return a stream")
+
+	assert.Equal(t, int32(2), registerCalls.Load(), "both sessions re-register")
+	assert.Equal(t, 1, readyCalls, "onReady must fire exactly once even though the first Subscribe failed")
+}
+
+// TestReconnectSession_SucceedsAfterFailures verifies the success path of the
+// retry loop: registerFn fails several times then succeeds, exercising the
+// fail → backoff (delay doubling) → succeed → return-stream branch that the
+// cancelled-ctx test does not. minReconnectInterval is set tiny so the doubling
+// runs without slowing the test. (#61)
+func TestReconnectSession_SucceedsAfterFailures(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.minReconnectInterval = time.Millisecond // tiny: backoff still doubles (1→2→4ms) but stays fast
+
+	var registerCalls atomic.Int32
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		if registerCalls.Add(1) <= 3 {
+			return nil, errors.New("hub unreachable")
+		}
+		return &pb.RegisterResponse{}, nil
+	}
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		subscribeCalls.Add(1)
+		return errStream(), nil
+	}
+
+	done := make(chan pb.HubFuse_SubscribeClient, 1)
+	go func() { done <- d.reconnectSession(context.Background()) }()
+
+	select {
+	case stream := <-done:
+		require.NotNil(t, stream, "reconnectSession must return the live stream once sessionOnce succeeds")
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnectSession did not return after the hub recovered")
+	}
+
+	assert.Equal(t, int32(4), registerCalls.Load(), "reconnectSession retries Register until success (3 failures + 1 success)")
+	assert.Equal(t, int32(1), subscribeCalls.Load(), "Subscribe runs only on the successful attempt")
+}
+
+// TestSupervise_ReconnectsMultipleTimesThenExitsOnCancel is the direct unit test
+// for supervise — the core of the #61 fix. It drives more than one reconnect (a
+// regression where supervise returns after the FIRST reconnect, e.g. return
+// instead of continue, would never reach the third stream) and asserts a prompt,
+// clean goroutine exit when ctx is cancelled while readStream is blocked.
+// minReconnectInterval stays 0 (buildTestDaemon) so the loop spins fast. (#61)
+func TestSupervise_ReconnectsMultipleTimesThenExitsOnCancel(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var subscribeCalls atomic.Int32
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		// The first two reconnect streams die immediately, forcing supervise to
+		// loop and reconnect again; the third blocks until ctx cancel so we can
+		// assert a prompt, clean exit while readStream is blocked.
+		if subscribeCalls.Add(1) <= 2 {
+			return errStream(), nil
+		}
+		return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// The initial stream also dies immediately (read cycle 1).
+		d.supervise(ctx, errStream())
+		close(done)
+	}()
+
+	// Wait until supervise has reconnected more than once: subscribeFn called
+	// >= 3 times means two immediate-death reconnects plus the blocking one.
+	require.Eventually(t, func() bool {
+		return subscribeCalls.Load() >= 3
+	}, 2*time.Second, 5*time.Millisecond, "supervise must reconnect more than once")
+
+	// supervise is now blocked in readStream on the third stream; cancelling ctx
+	// must make it return promptly without another reconnect.
+	cancel()
+	select {
+	case <-done:
+		// returned promptly — good.
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervise did not return after ctx cancel — it is stuck")
+	}
+	assert.Equal(t, int32(3), subscribeCalls.Load(), "supervise must not reconnect again after ctx cancel")
+}
+
+// TestSupervise_FloorsReconnectAfterImmediateDeath verifies the reconnect floor:
+// when a session is established but its stream dies almost immediately, supervise
+// must wait out minReconnectInterval before reconnecting rather than spinning
+// with zero delay (CPU peg / hub hammering). (#61)
+func TestSupervise_FloorsReconnectAfterImmediateDeath(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.minReconnectInterval = 80 * time.Millisecond
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reconnected := make(chan time.Time, 1)
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		select {
+		case reconnected <- time.Now(): // record the first reconnect's timestamp
+		default:
+		}
+		return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}, nil
+	}
+
+	start := time.Now()
+	go d.supervise(ctx, errStream()) // initial stream dies immediately at ~start
+
+	var reconnectAt time.Time
+	select {
+	case reconnectAt = <-reconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervise never reconnected")
+	}
+
+	// The initial stream died almost immediately, so supervise must have waited
+	// out (most of) the 80ms floor before reconnecting. Generous slack below the
+	// floor absorbs scheduler/timer coarseness; a regression that drops the floor
+	// would reconnect in well under 60ms.
+	elapsed := reconnectAt.Sub(start)
+	assert.GreaterOrEqual(t, elapsed, 60*time.Millisecond,
+		"supervise must wait out minReconnectInterval before reconnecting after an immediate stream death")
+}
+
+// TestSessionOnce_RemountsPeerAtChangedEndpoint covers the daemon-level wiring of
+// the #61 end-user goal: a reconnect re-runs processInitialDevices from the fresh
+// Register snapshot, and a peer whose IP changed is remounted at the new
+// endpoint. Earlier sessionOnce tests pass an empty snapshot, so this is the only
+// coverage of snapshot → Mount → remount through the daemon. (#61)
+func TestSessionOnce_RemountsPeerAtChangedEndpoint(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "peer", Share: "docs", To: mountTo},
+	}
+	writePubKey(t, dir, "peer-device") // pair the peer so auto-mount proceeds
+
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil // returned stream is unused by this test
+	}
+
+	peerAt := func(ip string, port int32) *pb.RegisterResponse {
+		return &pb.RegisterResponse{
+			DevicesOnline: []*pb.DeviceInfo{{
+				DeviceId: "peer-device",
+				Nickname: "peer",
+				Ip:       ip,
+				SshPort:  port,
+				Shares:   []*pb.Share{{Alias: "docs", Permissions: "ro"}},
+			}},
+		}
+	}
+
+	// First session: peer online at 10.0.0.5 → auto-mount there.
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return peerAt("10.0.0.5", 2222), nil
+	}
+	_, err := d.sessionOnce(context.Background())
+	require.NoError(t, err, "first sessionOnce")
+
+	require.True(t, d.mounter.IsActive("peer", "docs"), "peer share must be mounted from the Register snapshot")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.0.0.5", mounts[0].IP, "initial mount endpoint")
+
+	// Peer roamed: the second session reports a new IP. processInitialDevices
+	// re-runs from the fresh snapshot and the mounter remounts at the new endpoint.
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return peerAt("10.0.0.99", 2222), nil
+	}
+	_, err = d.sessionOnce(context.Background())
+	require.NoError(t, err, "second sessionOnce")
+
+	require.True(t, d.mounter.IsActive("peer", "docs"), "peer share must still be mounted after roaming")
+	mounts = d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1, "exactly one mount after remount")
+	assert.Equal(t, "10.0.0.99", mounts[0].IP, "mount must follow the peer to the new endpoint after reconnect")
 }
 
 // ─── preflightMountBinary ──────────────────────────────────────────────────────
