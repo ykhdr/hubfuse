@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +84,18 @@ type Daemon struct {
 	// buildTestDaemon leaves it 0 so unit tests neither sleep on the floor nor on
 	// retries. (#61)
 	minReconnectInterval time.Duration
+
+	// mountMonitorInterval is the cadence of the background mount-health monitor
+	// (runMountMonitor): every tick it probes the active mounts and heals the
+	// ones CONFIRMED dead (see healDeadMounts). The monitor exists for the
+	// event-less windows the Subscribe stream cannot cover — an sshfs that dies
+	// while its peer stays registered at the same endpoint never produces a hub
+	// event at all. NewDaemon sets defaultMountMonitorInterval, overridable via
+	// the HUBFUSE_MOUNT_MONITOR_INTERVAL env var (a test handle for scenario
+	// tests, like HUBFUSE_STUB_MOUNT_DIR); <= 0 disables the monitor.
+	// buildTestDaemon bypasses NewDaemon and leaves this 0, so unit tests never
+	// run the monitor unless they set it explicitly. (#67)
+	mountMonitorInterval time.Duration
 
 	// registerFn and subscribeFn are injectable seams over the concrete
 	// HubClient (client.go has no interface, so it cannot be stubbed without a
@@ -185,6 +198,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		onReady:       opts.OnReady,
 
 		minReconnectInterval: backoffInitial,
+		mountMonitorInterval: mountMonitorIntervalFromEnv(
+			os.Getenv("HUBFUSE_MOUNT_MONITOR_INTERVAL"),
+			defaultMountMonitorInterval, logger),
 	}
 
 	// Wire the hub-session seams to the live client. The closures read d.hubClient
@@ -608,10 +624,11 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 	}
 }
 
-// runServices starts the heartbeat ticker and config watcher, then blocks
-// until ctx is cancelled before shutting down.
+// runServices starts the heartbeat ticker, the mount-health monitor (#67), and
+// the config watcher, then blocks until ctx is cancelled before shutting down.
 func (d *Daemon) runServices(ctx context.Context) error {
 	go d.runHeartbeat(ctx)
+	go d.runMountMonitor(ctx)
 
 	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
 	if err != nil {
@@ -629,6 +646,210 @@ func (d *Daemon) runServices(ctx context.Context) error {
 	d.logger.Info("daemon shutting down")
 
 	return d.Shutdown()
+}
+
+// defaultMountMonitorInterval is the default cadence of the mount-health
+// monitor. It sits between the hub's 10s heartbeat interval and its 30s
+// offline timeout: fast enough that a confirmed-dead mount is usually healed
+// within one heartbeat cycle, slow enough that liveness probes (a stat per
+// active mount per tick) stay negligible. (#67)
+const defaultMountMonitorInterval = 15 * time.Second
+
+// mountMonitorIntervalFromEnv resolves the mount-monitor interval from the raw
+// HUBFUSE_MOUNT_MONITOR_INTERVAL env value. An empty value keeps def; a value
+// time.ParseDuration accepts is used as-is — including zero or negative, which
+// disable the monitor (see runMountMonitor); a malformed value logs a WARN and
+// falls back to def so a typo can never silently disable dead-mount healing.
+// It is a pure helper so the parsing rules are unit-testable without driving
+// NewDaemon (which needs a full on-disk fixture). (#67)
+func mountMonitorIntervalFromEnv(raw string, def time.Duration, logger *slog.Logger) time.Duration {
+	if raw == "" {
+		return def
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil {
+		logger.Warn("invalid HUBFUSE_MOUNT_MONITOR_INTERVAL; using default",
+			"value", raw,
+			"default", def,
+			"error", err,
+		)
+		return def
+	}
+	return interval
+}
+
+// runMountMonitor periodically heals confirmed-dead mounts. It exists for the
+// event-less windows the Subscribe stream cannot cover: an sshfs process that
+// dies while its peer stays registered (same endpoint — the hub never emits
+// any event, so ls on the target serves "Transport endpoint is not connected"
+// forever), or a DeviceOffline missed because our own event stream was down at
+// that moment. Each tick delegates to healDeadMounts synchronously, so a slow
+// heal simply delays the next sweep (time.Ticker drops missed ticks) rather
+// than piling up concurrent sweeps. Returns immediately when
+// mountMonitorInterval <= 0 (monitor disabled); exits when ctx is cancelled.
+// (#67 dead-mount healing)
+func (d *Daemon) runMountMonitor(ctx context.Context) {
+	if d.mountMonitorInterval <= 0 {
+		d.logger.Info("mount monitor disabled", "interval", d.mountMonitorInterval)
+		return
+	}
+
+	ticker := time.NewTicker(d.mountMonitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.healDeadMounts(ctx)
+		}
+	}
+}
+
+// healDeadMounts is one monitor sweep: collect the mounts CONFIRMED dead (see
+// Mounter.DeadMounts — a probe timeout is NOT confirmation, so a
+// wedged-but-possibly-live mount is never touched), then apply the heal policy
+// to each dead mount:
+//
+//   - peer online + mount still configured + share still exported + peer
+//     paired → d.mounter.Mount: its same-endpoint dead branch (or the roam
+//     branch, if the peer also moved during the event-less window) tears the
+//     zombie down and re-attaches atomically under m.mu (#67, #61);
+//   - peer offline → d.mounter.UnmountDevice, mirroring handleDeviceOffline
+//     (force + reguard) for the DeviceOffline we evidently missed; the next
+//     DeviceOnline then mounts cleanly from scratch;
+//   - mount no longer in config → the interactive d.mounter.Unmount (its
+//     recheck-reap collects the zombie), mirroring onConfigChange's
+//     MountsRemoved path;
+//   - peer online but share no longer exported, or peer not paired → skip with
+//     a WARN: re-mounting would target a dead share (or an unauthorized peer),
+//     and unmounting is not this monitor's call — SharesUpdated / config
+//     changes own that cleanup (the documented add-only-no-prune tradeoff, see
+//     mountsForOnlineDevice).
+//
+// Heal errors are logged and retried on the next tick — no dedicated backoff
+// in v1. The natural retry works because a failed TEARDOWN retains the
+// activeMounts entry (unmountKey), so the next sweep re-detects the same dead
+// mount. (A teardown that succeeds but whose fresh mount then fails leaves no
+// entry behind — recovery for that case comes from the next
+// DeviceOnline/reconnect, the same as any other failed mount.)
+//
+// Lock discipline (mirrors handleDeviceOnline): everything needed from daemon
+// state — the config pointer and a DEEP snapshot of onlineDevices — is taken
+// under d.mu and the lock is RELEASED before any mounter call. Mount and the
+// Unmount* family take m.mu and can block up to mountVerifyTimeout (10s) in
+// the verify poll; holding d.mu across a sweep would stall every event handler
+// for the whole accumulated budget. The mounter never takes d.mu, so there is
+// no lock-order deadlock either way — only latency — but the snapshot keeps a
+// heal sweep from freezing the daemon. OnlineDevice values are copied
+// (including the Shares slice) rather than aliased: handleSharesUpdated
+// mutates info.Shares in place under d.mu, and this sweep reads them after
+// unlocking. The snapshotted cfg pointer is immutable — onConfigChange only
+// ever swaps the pointer. (#67)
+func (d *Daemon) healDeadMounts(ctx context.Context) {
+	dead := d.mounter.DeadMounts(ctx)
+	if len(dead) == 0 {
+		return
+	}
+
+	d.mu.RLock()
+	cfg := d.config
+	peers := make(map[string]OnlineDevice, len(d.onlineDevices))
+	for _, dev := range d.onlineDevices {
+		cp := *dev
+		cp.Shares = append([]string(nil), dev.Shares...)
+		peers[dev.Nickname] = cp
+	}
+	d.mu.RUnlock()
+
+	// UnmountDevice sweeps ALL of a peer's mounts at once, so when an offline
+	// peer left several dead mounts behind one call suffices — dedupe to avoid
+	// redundant sweeps (and duplicate log noise) within a single tick.
+	offlineHandled := make(map[string]bool)
+
+	for _, mnt := range dead {
+		if ctx.Err() != nil {
+			return // daemon shutting down — abandon the sweep
+		}
+
+		peer, online := peers[mnt.Device]
+		if !online {
+			if offlineHandled[mnt.Device] {
+				continue
+			}
+			offlineHandled[mnt.Device] = true
+			d.logger.Info("mount monitor: peer offline, removing its dead mount(s)",
+				"device", mnt.Device,
+				"share", mnt.Share,
+			)
+			if err := d.mounter.UnmountDevice(mnt.Device); err != nil {
+				d.logger.Warn("mount monitor: unmount dead mounts of offline peer",
+					"device", mnt.Device,
+					"error", err,
+				)
+			}
+			continue
+		}
+
+		mc, configured := mountConfigFor(cfg, mnt.Device, mnt.Share)
+		if !configured {
+			d.logger.Info("mount monitor: dead mount no longer in config, unmounting",
+				"device", mnt.Device,
+				"share", mnt.Share,
+			)
+			if err := d.mounter.Unmount(mnt.Device, mnt.Share); err != nil {
+				d.logger.Warn("mount monitor: unmount dead unconfigured mount",
+					"device", mnt.Device,
+					"share", mnt.Share,
+					"error", err,
+				)
+			}
+			continue
+		}
+
+		if !slices.Contains(peer.Shares, mnt.Share) {
+			d.logger.Warn("mount monitor: peer no longer exports the dead mount's share; skipping heal",
+				"device", mnt.Device,
+				"share", mnt.Share,
+			)
+			continue
+		}
+
+		if !d.isPaired(peer.DeviceID) {
+			d.logger.Warn("mount monitor: peer is not paired; skipping heal of its dead mount",
+				"device", mnt.Device,
+				"share", mnt.Share,
+				"device_id", peer.DeviceID,
+			)
+			continue
+		}
+
+		d.logger.Info("mount monitor: healing dead mount",
+			"device", mnt.Device,
+			"share", mnt.Share,
+			"ip", peer.IP,
+			"port", peer.SSHPort,
+		)
+		if err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort); err != nil {
+			d.logger.Error("mount monitor: re-mount of dead mount failed",
+				"device", mnt.Device,
+				"share", mnt.Share,
+				"error", err,
+			)
+		}
+	}
+}
+
+// mountConfigFor returns the configured mount entry matching (device, share),
+// if any. cfg must be a snapshotted config pointer (immutable once taken).
+func mountConfigFor(cfg *agentconfig.Config, device, share string) (agentconfig.MountConfig, bool) {
+	for _, mc := range cfg.Mounts {
+		if mc.Device == device && mc.Share == share {
+			return mc, true
+		}
+	}
+	return agentconfig.MountConfig{}, false
 }
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH

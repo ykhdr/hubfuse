@@ -215,28 +215,43 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 - Modify: `internal/agent/daemon.go`
 - Modify: `internal/agent/daemon_test.go`
 
-- [ ] поле `mountMonitorInterval time.Duration`; в `NewDaemon` default 15s + env-override
+- [x] поле `mountMonitorInterval time.Duration`; в `NewDaemon` default 15s + env-override
       `HUBFUSE_MOUNT_MONITOR_INTERVAL` (некорректное значение → WARN + default)
-- [ ] `runMountMonitor(ctx)`: тикер с `mountMonitorInterval`, на тик — `healDeadMounts(ctx)`;
+- [x] `runMountMonitor(ctx)`: тикер с `mountMonitorInterval`, на тик — `healDeadMounts(ctx)`;
       выход по `ctx.Done()`; не запускается при `<= 0`
-- [ ] `healDeadMounts(ctx)`: политика из Technical Details (онлайн → Mount; офлайн →
+- [x] `healDeadMounts(ctx)`: политика из Technical Details (онлайн → Mount; офлайн →
       UnmountDevice; нет в конфиге → Unmount; непарный → скип+WARN; ошибки → лог)
-- [ ] старт `go d.runMountMonitor(ctx)` в `runServices`
-- [ ] `healDeadMounts`: снапшот `onlineDevices`/`cfg` под `d.mu`, отпустить лок ДО вызовов
-      маунтера (зеркало `handleDeviceOnline`; см. Technical Details)
-- [ ] тесты (у `Daemon.mounter` нет интерфейса — ассертить через сиды реального `Mounter`:
+      (➕ также «пир онлайн, но share больше не экспортирует» → скип+WARN — консервативно,
+      unmount-cleanup этого кейса принадлежит SharesUpdated/config-путям)
+- [x] старт `go d.runMountMonitor(ctx)` в `runServices`
+- [x] `healDeadMounts`: снапшот `onlineDevices`/`cfg` под `d.mu`, отпустить лок ДО вызовов
+      маунтера (зеркало `handleDeviceOnline`; см. Technical Details; `OnlineDevice`
+      копируются по значению вместе со slice `Shares` — `handleSharesUpdated` мутирует
+      `info.Shares` in-place под `d.mu`)
+- [x] тесты (у `Daemon.mounter` нет интерфейса — ассертить через сиды реального `Mounter`:
       `execCommand`-capture, `SetMountpointCheckForTests`, `SetUnmountForTests`, затем
       состояние `IsActive`/`ActiveMounts`; `buildTestDaemon` обходит `NewDaemon`, поэтому
       `mountMonitorInterval` выставлять на тест-демоне напрямую):
       мёртвый маунт + пир онлайн (экспортирует share, парный) → перемонтирован: в
       captured-args нового exec актуальные IP/port пира, entry обновлён
-- [ ] тесты: мёртвый маунт + пир офлайн → запись снята (unmount-сид вызван), живые маунты
-      не тронуты
-- [ ] тесты: маунт удалён из конфига → запись снята; непарный пир → ничего не вызвано
-- [ ] тесты: `runMountMonitor` — срабатывает по тику, останавливается по ctx, не стартует
+      (`TestHealDeadMounts_PeerOnlineRemounts` — таблица: same-endpoint dead-ветка и
+      roamed-endpoint remount-ветка)
+- [x] тесты: мёртвый маунт + пир офлайн → запись снята (unmount-сид вызван), живые маунты
+      не тронуты (`TestHealDeadMounts_PeerOfflineUnmountsDeadOnly`)
+- [x] тесты: маунт удалён из конфига → запись снята; непарный пир → ничего не вызвано
+      (`TestHealDeadMounts_RemovedFromConfigUnmounts`,
+      `TestHealDeadMounts_SkipsUnpairedAndUnexportedPeers` — таблица: непарный и
+      не-экспортируемый share)
+- [x] тесты: `runMountMonitor` — срабатывает по тику, останавливается по ctx, не стартует
       при интервале 0; env-override `HUBFUSE_MOUNT_MONITOR_INTERVAL` тестировать отдельным
       юнитом функции парсинга (путь через `NewDaemon` юнитам недоступен)
-- [ ] `go test ./internal/agent/...` — зелёные перед задачей 4
+      (`TestRunMountMonitor_TicksAndStopsOnCancel`,
+      `TestRunMountMonitor_DisabledIntervalReturnsImmediately`,
+      `TestMountMonitorIntervalFromEnv`; ➕ wiring через `NewDaemon` оказался юнитам
+      доступен — `TestNewDaemon_MountMonitorIntervalDefaultAndEnvOverride` покрывает
+      default и env-override end-to-end)
+- [x] `go test ./internal/agent/...` — зелёные перед задачей 4 (+ `go build ./...`,
+      `go vet ./...`, `-race` прогон)
 
 ### Task 4: Пересборка `onlineDevices` из Register-снапшота
 
