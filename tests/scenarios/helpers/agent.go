@@ -484,8 +484,18 @@ func (a *Agent) env() []string {
 	return append(base, a.envExtra...)
 }
 
-// sanitizeForMarker mirrors the stub's sanitize function to compute the JSON
-// marker filename for a given mount destination path.
+// sanitizeForMarker computes the JSON marker filename stem for a given mount
+// destination path.
+//
+// KEEP IN SYNC — this transformation exists in THREE packages that cannot
+// import each other (a main package, this test helper package, and the agent):
+//   - sanitize() in tests/tools/stub-sshfs/main.go (marker writer)
+//   - sanitizeForMarker() here (test-side reader)
+//   - stubSanitizePath() in internal/agent/stubmount.go (agent-side liveness
+//     check + stub unmount, issue #67)
+//
+// Any drift makes the agent look for markers at the wrong path: every mount
+// verify-poll would time out and every liveness probe would read "dead".
 func sanitizeForMarker(p string) string {
 	r := strings.NewReplacer("/", "_", `\`, "_", ":", "_", " ", "_")
 	return r.Replace(strings.TrimPrefix(p, "/"))

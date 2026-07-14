@@ -277,17 +277,25 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 - Modify: `internal/agent/mounter.go` (`NewMounter` — подключение стаб-функций)
 - Modify: `tests/scenarios/*` (аудит/починка тестов, полагавшихся на старое поведение)
 
-- [ ] `stubMountpointCheck(markerDir)`: маркер отсутствует/нечитаем/PID мёртв → `(false, nil)`;
-      PID жив → `(true, nil)`; sanitize зеркалит стаб
-- [ ] `stubUnmount(markerDir)`: SIGTERM PID из маркера → ждать исчезновения маркера (≤2s);
-      нет маркера → nil; не исчез → error
-- [ ] `NewMounter`: в стаб-режиме ставить обе функции (вместо `(true,nil)`-хардкода и
+- [x] `stubMountpointCheck(markerDir)`: маркер отсутствует/нечитаем/PID мёртв → `(false, nil)`;
+      PID жив → `(true, nil)`; sanitize зеркалит стаб (sync-комментарий добавлен во все
+      ТРИ копии: стаб, helpers, stubmount.go)
+- [x] `stubUnmount(markerDir)`: SIGTERM PID из маркера → ждать исчезновения маркера (≤2s);
+      нет маркера → nil; не исчез → error (➕ уточнения: битый маркер без PID → быстрый
+      error; ESRCH при живом маркере → error «killed without SIGTERM» — зомби-каветка;
+      ожидание уважает ctx вызывающего)
+- [x] `NewMounter`: в стаб-режиме ставить обе функции (вместо `(true,nil)`-хардкода и
       `unmountPath`)
-- [ ] юнит-тесты stubmount: жив/убит/нет маркера/битый JSON; stubUnmount успех и таймаут
-- [ ] прогнать `make test-scenarios`; аудит только маунтящих сценариев (`mount_test.go`,
+- [x] юнит-тесты stubmount: жив/убит/нет маркера/битый JSON; stubUnmount успех и таймаут
+      (`TestStubMountpointCheck_Classification`, `TestStubPIDAlive_ZombieCaveat`,
+      `TestStubUnmount_*` ×5, `TestNewMounter_StubModeInstallsMarkerHarness`,
+      `TestNewMounter_NoStubEnvKeepsRealHarness`, `TestStubSanitizePath`)
+- [x] прогнать `make test-scenarios`; аудит только маунтящих сценариев (`mount_test.go`,
       `pair_confirm_test.go` — остальные маунтов не создают) — маунт теперь честно ждёт
-      маркер
-- [ ] `go test ./internal/agent/... && make test-scenarios` — зелёные перед задачей 6
+      маркер (все сценарии зелёные без правок: оба маунтящих теста дожидаются пар/маркеров
+      и удовлетворяют достоверной семантике; verify-полл демона проходит по живому маркеру)
+- [x] `go test ./internal/agent/... && make test-scenarios` — зелёные перед задачей 6
+      (+ `go build ./...`, `go vet ./...`, `-race` прогон)
 
 ### Task 6: Сценарные тесты самолечения (репро пользователя)
 

@@ -242,11 +242,14 @@ type Mounter struct {
 
 	// execCommand is used to build commands; override in tests.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
-	// unmount is used to unmount a path; override in tests. (#50 bounded/force)
+	// unmount is used to unmount a path; override in tests. Defaults to
+	// unmountPath; in stub mode it is stubUnmount (SIGTERM the stub process and
+	// wait for its marker to vanish — see stubmount.go). (#50 bounded/force;
+	// #67 truthful stub)
 	unmount func(ctx context.Context, path string, force bool) error
-	// checkMountpoint reports whether path is currently a mountpoint. Defaults to
-	// isMountpoint; override in tests (or when stub-sshfs is in use) to skip the
-	// real filesystem check.
+	// checkMountpoint reports whether path is currently a mountpoint. Defaults
+	// to isMountpoint; in stub mode it is stubMountpointCheck (marker exists +
+	// stub PID alive — see stubmount.go); override in tests. (#67 truthful stub)
 	checkMountpoint func(path string) (bool, error)
 	// mountVerifyTimeout is the maximum time to wait for the mountpoint to appear
 	// after cmd.Start() returns. Defaults to 10 seconds.
@@ -261,15 +264,22 @@ type Mounter struct {
 // "sshfs" profile (see resolveBackend).
 //
 // When HUBFUSE_STUB_MOUNT_DIR is set (the scenario-test harness that uses
-// stub-sshfs, which never creates a real FUSE mountpoint), mountpoint
-// verification is bypassed so that scenario tests do not time out waiting for
-// a filesystem that the stub intentionally never creates.
+// stub-sshfs, which never creates a real FUSE mountpoint), the real
+// isMountpoint/unmountPath are replaced by marker-protocol implementations
+// (see stubmount.go): a mount is "alive" while the stub's JSON marker exists
+// and its recorded PID is alive, and unmounting SIGTERMs the stub and waits
+// for the marker to vanish. This keeps the stub lifecycle faithful — Mount's
+// verify poll genuinely waits for the stub to come up, a killed stub is
+// genuinely detected as a dead mount (so scenario tests can exercise
+// dead-mount healing), and unmount genuinely tears the stub down instead of
+// always failing against a nonexistent mountpoint. (#67 truthful stub)
 func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logger *slog.Logger) *Mounter {
-	stubMode := os.Getenv("HUBFUSE_STUB_MOUNT_DIR") != ""
+	stubMarkerDir := os.Getenv("HUBFUSE_STUB_MOUNT_DIR")
 	check := isMountpoint
-	if stubMode {
-		// Stub harness: skip real mountpoint verification.
-		check = func(string) (bool, error) { return true, nil }
+	unmountFn := unmountPath
+	if stubMarkerDir != "" {
+		check = stubMountpointCheck(stubMarkerDir)
+		unmountFn = stubUnmount(stubMarkerDir)
 	}
 	return &Mounter{
 		keyPath:             keyPath,
@@ -278,9 +288,9 @@ func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logge
 		backend:             resolveBackend(mountTool),
 		logger:              logger,
 		activeMounts:        make(map[mountKey]*Mount),
-		stub:                stubMode,
+		stub:                stubMarkerDir != "",
 		execCommand:         exec.CommandContext,
-		unmount:             unmountPath,
+		unmount:             unmountFn,
 		checkMountpoint:     check,
 		mountVerifyTimeout:  10 * time.Second,
 		mountVerifyInterval: 200 * time.Millisecond,
@@ -966,8 +976,10 @@ func (m *Mounter) SetUnmountForTests(fn func(ctx context.Context, path string, f
 	m.unmount = fn
 }
 
-// SetMountpointCheckForTests overrides the mountpoint check (used in tests and
-// in the stub-sshfs scenario harness where a real FUSE mount is never created).
+// SetMountpointCheckForTests overrides the mountpoint check (used in tests).
+// The stub-sshfs scenario harness does not go through this seam — NewMounter
+// installs stubMountpointCheck directly when HUBFUSE_STUB_MOUNT_DIR is set
+// (see stubmount.go). (#67 truthful stub)
 func (m *Mounter) SetMountpointCheckForTests(fn func(string) (bool, error)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
