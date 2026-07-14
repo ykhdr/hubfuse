@@ -982,6 +982,68 @@ func TestProcessInitialDevices_MountsOnlyExportedShares(t *testing.T) {
 		"a share absent from the snapshot must NOT be mounted")
 }
 
+// TestProcessInitialDevices_PrunesPeersAbsentFromSnapshot verifies the Register
+// snapshot is authoritative in BOTH directions (#67): a peer that went offline
+// while our event stream was dead (its DeviceOffline never reached us) must be
+// pruned from onlineDevices on re-registration, peers still present must be
+// refreshed in place — and, crucially, the vanished peer's mount must NOT be
+// touched in this path. The prune only reconciles the map; unmounting is owned
+// by the mount monitor, which acts solely on probe-confirmed-dead mounts.
+func TestProcessInitialDevices_PrunesPeersAbsentFromSnapshot(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// Any unmount in this path would violate the conservative contract — the
+	// snapshot proves the HUB lost the peer, not that the SSH data path died.
+	unmountCalls := 0
+	d.mounter.SetUnmountForTests(func(context.Context, string, bool) error {
+		unmountCalls++
+		return nil
+	})
+
+	laptop := &pb.DeviceInfo{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs"}},
+	}
+	tablet := func(ip string) *pb.DeviceInfo {
+		return &pb.DeviceInfo{DeviceId: "device-456", Nickname: "tablet", Ip: ip, SshPort: 2222}
+	}
+
+	// First session: both peers online, laptop's share auto-mounts.
+	d.processInitialDevices([]*pb.DeviceInfo{laptop, tablet("10.0.0.6")})
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount from the first snapshot")
+
+	// Reconnect snapshot: laptop vanished while the stream was dead, tablet
+	// roamed to a new IP.
+	d.processInitialDevices([]*pb.DeviceInfo{tablet("10.0.0.66")})
+
+	d.mu.RLock()
+	_, laptopOnline := d.onlineDevices["device-123"]
+	tabletInfo, tabletOnline := d.onlineDevices["device-456"]
+	d.mu.RUnlock()
+
+	assert.False(t, laptopOnline,
+		"a peer absent from the re-register snapshot must be pruned from onlineDevices")
+	require.True(t, tabletOnline, "a peer present in the snapshot must stay in onlineDevices")
+	assert.Equal(t, "10.0.0.66", tabletInfo.IP, "a surviving peer's entry must be refreshed in place")
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"),
+		"the vanished peer's mount must survive the prune — only the monitor may remove it, and only when confirmed dead")
+	assert.Zero(t, unmountCalls, "processInitialDevices must never unmount anything")
+}
+
 // ─── supervisor: session reconnect (#61) ──────────────────────────────────────
 
 // fakeSubscribeStream is a minimal pb.HubFuse_SubscribeClient for unit tests.

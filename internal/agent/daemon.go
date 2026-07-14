@@ -894,11 +894,53 @@ func (d *Daemon) Shutdown() error {
 }
 
 // processInitialDevices handles the list of online devices received on Register.
-// For each device that is paired, it auto-mounts every share configured for that
-// device. processInitialDevices runs again on every reconnect, so a roaming peer
-// whose endpoint changed has each of its shares re-pointed at the new IP/port by
-// Mount's remount branch. (#61)
+// The snapshot is AUTHORITATIVE for who is online right now, in both directions:
+//
+//   - Devices present in the snapshot are added/refreshed in onlineDevices, and
+//     each paired one has every configured share it exports (re)mounted.
+//     processInitialDevices runs again on every reconnect, so a roaming peer
+//     whose endpoint changed has each of its shares re-pointed at the new
+//     IP/port by Mount's remount branch. (#61)
+//   - Devices ABSENT from the snapshot are pruned from onlineDevices: a peer
+//     that went offline while our event stream was dead never delivered its
+//     DeviceOffline, and an add/update-only reconciliation would leave the
+//     stale entry lying forever — misleading every consumer of the map
+//     (healDeadMounts would keep re-mounting a gone peer's dead mounts at its
+//     dead endpoint instead of removing them). (#67)
+//
+// Nothing is unmounted in this path, deliberately. A missing snapshot entry
+// proves only that the HUB lost the peer — not that the SSH data path did — so
+// tearing down a possibly-live mount here would be exactly the
+// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
+// prune feeds the conservative division of labour: once the entry is gone, the
+// mount monitor's next sweep sees the peer as offline and removes its mounts
+// IF AND ONLY IF their probes confirm them dead (healDeadMounts); a mount that
+// is still alive is left untouched. (#67)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
+	present := make(map[string]struct{}, len(devices))
+	for _, dev := range devices {
+		present[dev.DeviceId] = struct{}{}
+	}
+
+	d.mu.Lock()
+	var pruned []*OnlineDevice
+	for id, info := range d.onlineDevices {
+		if _, ok := present[id]; !ok {
+			pruned = append(pruned, info)
+			delete(d.onlineDevices, id)
+		}
+	}
+	d.mu.Unlock()
+
+	// Log outside the lock — no daemon state is read here, and the entries were
+	// exclusively ours the moment they left the map.
+	for _, info := range pruned {
+		d.logger.Info("peer absent from register snapshot, dropping stale online entry",
+			"device_id", info.DeviceID,
+			"nickname", info.Nickname,
+		)
+	}
+
 	for _, dev := range devices {
 		info := protoToOnlineDevice(dev)
 
