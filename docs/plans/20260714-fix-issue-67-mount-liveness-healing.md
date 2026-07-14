@@ -366,10 +366,13 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 
 ### Task 8: Документация и финализация
 
-- [ ] CLAUDE.md: дополнить описания `daemon.go`/`mounter.go` в Agent internals (монитор
+- [x] CLAUDE.md: дополнить описания `daemon.go`/`mounter.go` в Agent internals (монитор
       здоровья, dead-ветка Mount, достоверный стаб) со ссылкой (issue #67)
-- [ ] обновить план: все чекбоксы, ➕/⚠️ по факту
-- [ ] переместить план в `docs/plans/completed/`
+      (плюс новый буллет «Scenario tests» в Key Patterns — семантика достоверного стаба
+      маркер+PID описана там, где описаны тесты)
+- [x] обновить план: все чекбоксы, ➕/⚠️ по факту (Tasks 1–7 полностью `[x]`,
+      ➕-аннотации Tasks 2/3/5/6 сохранены; ⚠️-блокеров не возникало)
+- [x] переместить план в `docs/plans/completed/` (moved by harness after reviews)
 
 ## Post-Completion
 
