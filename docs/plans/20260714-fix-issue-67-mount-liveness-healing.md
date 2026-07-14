@@ -338,14 +338,31 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 
 ### Task 7: Проверка критериев приёмки
 
-- [ ] мёртвый маунт + `DeviceOnline` с тем же эндпоинтом → перемонтирован (событийный путь)
-- [ ] мёртвый маунт + никаких событий → перемонтирован монитором в пределах интервала
-- [ ] мёртвый маунт + пир офлайн → снят и заguarжен; следующий `DeviceOnline` монтирует
-      начисто
-- [ ] висящая проба → маунт не тронут (ни в `Mount`, ни в мониторе)
-- [ ] `onlineDevices` после ре-регистрации соответствует снапшоту
-- [ ] пути #47/#49/#50/#61 не деградировали (существующие тесты зелёные)
-- [ ] полный прогон: `make build && make vet && make test`
+- [x] мёртвый маунт + `DeviceOnline` с тем же эндпоинтом → перемонтирован (событийный путь)
+      — dead-ветка `Mount` (`mounter.go` same-endpoint probe + teardown):
+      `TestMount_SameEndpointDeadRemounts` (юнит) + сценарий
+      `TestOfflineOnlineCycleRemountsMount` (offline-reap → чистый remount по событию)
+- [x] мёртвый маунт + никаких событий → перемонтирован монитором в пределах интервала
+      — `runMountMonitor`/`healDeadMounts`: `TestHealDeadMounts_PeerOnlineRemounts`,
+      `TestRunMountMonitor_TicksAndStopsOnCancel` (юниты) + сценарий
+      `TestMonitorRemountsDeadMount` (kill stub → новый PID без событий, монитор 1s)
+- [x] мёртвый маунт + пир офлайн → снят и заguarжен; следующий `DeviceOnline` монтирует
+      начисто — `healDeadMounts` → `UnmountDevice` (`unmountKey(force=true, reguard=true)`,
+      `mounter.go:792`): `TestHealDeadMounts_PeerOfflineUnmountsDeadOnly` (юнит) + сценарий
+      `TestOfflineOnlineCycleRemountsMount` (новый маркер/PID после DeviceOnline)
+- [x] висящая проба → маунт не тронут (ни в `Mount`, ни в мониторе)
+      — `TestMount_SameEndpointHangingProbeIsNoOp` (Mount) +
+      `TestDeadMounts_Classification` (висящая проба → «не подтверждено» → жив) +
+      `TestDeadMounts_ProbesOutsideLock` (висящая проба не блокирует маунтер)
+- [x] `onlineDevices` после ре-регистрации соответствует снапшоту
+      — `processInitialDevices` прунит отсутствующих (`daemon.go:919-933`):
+      `TestProcessInitialDevices_PrunesPeersAbsentFromSnapshot`
+- [x] пути #47/#49/#50/#61 не деградировали (существующие тесты зелёные:
+      `internal/agent` полностью зелёный, включая -race -count=1; #50 bounded/force,
+      #49 guard, #61 remount/supervise-сьюты в `mounter_test.go`/`daemon_test.go`)
+- [x] полный прогон: `make build && make vet && make test` — exit 0
+      (+ контрольные `go test ./tests/scenarios/... -count=1` 51s и
+      `go test ./internal/agent/... -race -count=1` без кэша)
 
 ### Task 8: Документация и финализация
 
