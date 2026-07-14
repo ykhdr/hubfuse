@@ -811,6 +811,54 @@ func (m *Mounter) ActiveMounts() []*Mount {
 	return result
 }
 
+// DeadMounts probes every active mount and returns the ones CONFIRMED dead:
+// the liveness probe positively reported the path is no longer a mountpoint,
+// or errored (a dead sshfs makes stat fail with ENOTCONN). Each mount gets its
+// own probe context bounded by mountProbeTimeout (further capped by ctx); a
+// probe that hangs past its deadline is "not confirmed dead" and the mount is
+// reported alive — a wedged-but-possibly-live FUSE mount must never be offered
+// up for healing on a mere timeout (mountpointGoneCtx's timeout-is-not-evidence
+// semantics). This is the daemon mount-monitor's detection primitive. (#67
+// dead-mount healing)
+//
+// The activeMounts snapshot is taken under m.mu but the probes run OUTSIDE the
+// lock: a wedged FUSE stat parks its probe goroutine for up to
+// mountProbeTimeout, and holding m.mu across a multi-mount sweep would stall
+// every other mounter operation (Mount, Unmount*, IsActive) for the whole
+// accumulated probe budget.
+//
+// Probing unlocked races a concurrent unmount/remount, and that is harmless by
+// design: DeadMounts only OBSERVES and returns the snapshot entries. Every
+// heal action goes through Mount / Unmount* / UnmountDevice, which re-examine
+// activeMounts under m.mu before touching anything — an entry that was
+// unmounted or replaced after the snapshot is re-verified (or found missing)
+// there, so a stale verdict can never tear down state it did not re-check.
+func (m *Mounter) DeadMounts(ctx context.Context) []*Mount {
+	m.mu.Lock()
+	snapshot := make([]*Mount, 0, len(m.activeMounts))
+	for _, mnt := range m.activeMounts {
+		snapshot = append(snapshot, mnt)
+	}
+	m.mu.Unlock()
+
+	var dead []*Mount
+	for _, mnt := range snapshot {
+		if ctx.Err() != nil {
+			// Caller gave up — stop the sweep without spawning further probe
+			// goroutines. Unprobed mounts are simply "not confirmed dead"
+			// this round; the next monitor tick re-probes them.
+			return dead
+		}
+		pctx, cancel := context.WithTimeout(ctx, mountProbeTimeout)
+		gone := m.mountpointGoneCtx(pctx, mnt.LocalPath)
+		cancel()
+		if gone {
+			dead = append(dead, mnt)
+		}
+	}
+	return dead
+}
+
 // guardTarget creates the target directory if absent and chmods it to guardMode
 // so an unmounted target cannot silently absorb local writes (EACCES on entry
 // creation/deletion). It is idempotent. (#49 guard-target)

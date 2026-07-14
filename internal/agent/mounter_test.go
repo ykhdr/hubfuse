@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1301,6 +1302,205 @@ func TestActiveMounts_ReturnsSnapshot(t *testing.T) {
 
 	mounts = m.ActiveMounts()
 	assert.Len(t, mounts, 1)
+}
+
+// ─── DeadMounts (#67 dead-mount healing) ─────────────────────────────────────
+
+// mountShareForTest mounts device/share on m (backend exec and mountpoint
+// check are already stubbed to succeed by newTestMounter) and returns the
+// local mount path. Used by DeadMounts tests to seed activeMounts entries.
+func mountShareForTest(t *testing.T, m *Mounter, dir, device, share string) string {
+	t.Helper()
+	mountTo := filepath.Join(dir, "mnt", device, share)
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	mc := agentconfig.MountConfig{Device: device, Share: share, To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, device, "10.0.0.1", 2222), "Mount(%s/%s)", device, share)
+	return mountTo
+}
+
+// TestDeadMounts_Classification verifies the probe-verdict table: only
+// positive evidence — (false, nil) or a probe error — marks a mount dead; a
+// live report or a probe that hangs past its deadline counts as alive ("not
+// confirmed dead"), so a wedged-but-possibly-live FUSE mount is never offered
+// up for healing. (#67 dead-mount healing)
+func TestDeadMounts_Classification(t *testing.T) {
+	tests := []struct {
+		name     string
+		probeMnt bool
+		probeErr error
+		hang     bool
+		wantDead bool
+	}{
+		{name: "alive (true, nil)", probeMnt: true, probeErr: nil, wantDead: false},
+		{name: "dead (false, nil)", probeMnt: false, probeErr: nil, wantDead: true},
+		{name: "dead (false, ENOTCONN)", probeMnt: false, probeErr: syscall.ENOTCONN, wantDead: true},
+		{name: "hanging probe counts as alive", hang: true, wantDead: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			knownDir := filepath.Join(dir, common.KnownDevicesDir)
+			keyPath := filepath.Join(dir, "id_ed25519")
+			writePubKeyFile(t, knownDir, "device-a")
+
+			m := newTestMounter(t, knownDir, keyPath, nil, nil)
+			mountTo := mountShareForTest(t, m, dir, "device-a", "docs")
+
+			ctx := context.Background()
+			if tt.hang {
+				// The probe wedges (blocking FUSE stat simulation). The per-mount
+				// probe context derives from the caller's ctx, so a short caller
+				// deadline bounds the wait and the test does not sit out the full
+				// mountProbeTimeout. Release the parked goroutine on cleanup.
+				blocked := make(chan struct{})
+				t.Cleanup(func() { close(blocked) })
+				m.SetMountpointCheckForTests(func(string) (bool, error) {
+					<-blocked
+					return true, nil
+				})
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer cancel()
+			} else {
+				m.SetMountpointCheckForTests(func(string) (bool, error) {
+					return tt.probeMnt, tt.probeErr
+				})
+			}
+
+			start := time.Now()
+			dead := m.DeadMounts(ctx)
+			elapsed := time.Since(start)
+
+			assert.Less(t, elapsed, 2*time.Second, "DeadMounts must return promptly even when a probe hangs")
+			if tt.wantDead {
+				require.Len(t, dead, 1, "the mount must be reported confirmed-dead")
+				assert.Equal(t, "device-a", dead[0].Device)
+				assert.Equal(t, "docs", dead[0].Share)
+				assert.Equal(t, mountTo, dead[0].LocalPath)
+			} else {
+				assert.Empty(t, dead, "an alive / not-confirmed mount must NOT be reported dead")
+			}
+			// DeadMounts only observes — the entry must be retained either way.
+			assert.True(t, m.IsActive("device-a", "docs"), "DeadMounts must never remove entries")
+		})
+	}
+}
+
+// TestDeadMounts_MixedReturnsOnlyConfirmedDead verifies a multi-mount sweep:
+// with one live and one dead mount active, only the confirmed-dead one is
+// returned and both entries stay in activeMounts. (#67 dead-mount healing)
+func TestDeadMounts_MixedReturnsOnlyConfirmedDead(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	writePubKeyFile(t, knownDir, "device-a")
+	writePubKeyFile(t, knownDir, "device-b")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	alivePath := mountShareForTest(t, m, dir, "device-a", "docs")
+	deadPath := mountShareForTest(t, m, dir, "device-b", "music")
+
+	m.SetMountpointCheckForTests(func(path string) (bool, error) {
+		if path == deadPath {
+			return false, nil // device-b's sshfs died
+		}
+		return true, nil
+	})
+
+	dead := m.DeadMounts(context.Background())
+
+	require.Len(t, dead, 1, "exactly one mount is confirmed dead")
+	assert.Equal(t, "device-b", dead[0].Device)
+	assert.Equal(t, "music", dead[0].Share)
+	assert.Equal(t, deadPath, dead[0].LocalPath)
+
+	assert.True(t, m.IsActive("device-a", "docs"), "live entry retained (path %s)", alivePath)
+	assert.True(t, m.IsActive("device-b", "music"), "dead entry retained — healing is the caller's job")
+}
+
+// TestDeadMounts_EmptyAndCancelledCtx verifies the degenerate paths: an empty
+// activeMounts returns an empty result without probing, and an
+// already-cancelled ctx stops the sweep before any probe is spawned — the
+// unprobed mounts are "not confirmed dead". (#67 dead-mount healing)
+func TestDeadMounts_EmptyAndCancelledCtx(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+
+	var probeCalls atomic.Int32
+	countingProbe := func(string) (bool, error) {
+		probeCalls.Add(1)
+		return false, nil // would be "confirmed dead" if ever consulted
+	}
+
+	// Empty activeMounts → empty result, no probes.
+	m.SetMountpointCheckForTests(countingProbe)
+	assert.Empty(t, m.DeadMounts(context.Background()), "no active mounts → nothing dead")
+	assert.Zero(t, probeCalls.Load(), "no probe may run when there is nothing to probe")
+
+	// Seed one (dead-probing) mount, then call with a cancelled ctx: the sweep
+	// must respect ctx and return without confirming anything.
+	m.SetMountpointCheckForTests(func(string) (bool, error) { return true, nil })
+	mountShareForTest(t, m, dir, "device-a", "docs")
+	m.SetMountpointCheckForTests(countingProbe)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.Empty(t, m.DeadMounts(ctx), "a cancelled ctx must yield no confirmed-dead mounts")
+	assert.Zero(t, probeCalls.Load(), "a cancelled ctx must stop the sweep before any probe")
+	assert.True(t, m.IsActive("device-a", "docs"), "entry retained")
+}
+
+// TestDeadMounts_ProbesOutsideLock verifies the lock discipline documented on
+// DeadMounts: the liveness probes run outside m.mu, so a hanging probe must
+// not block other mounter operations (IsActive here) for its duration.
+// (#67 dead-mount healing)
+func TestDeadMounts_ProbesOutsideLock(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, nil)
+	mountShareForTest(t, m, dir, "device-a", "docs")
+
+	started := make(chan struct{})
+	blocked := make(chan struct{})
+	var once sync.Once
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		once.Do(func() { close(started) })
+		<-blocked
+		return true, nil
+	})
+
+	resultCh := make(chan []*Mount, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resultCh <- m.DeadMounts(ctx)
+	}()
+
+	// Wait until the probe is provably in flight, then hit another lock-taking
+	// mounter operation: it must return promptly because DeadMounts released
+	// m.mu before probing.
+	<-started
+	callStart := time.Now()
+	active := m.IsActive("device-a", "docs")
+	elapsed := time.Since(callStart)
+	assert.True(t, active, "entry is present while the probe is in flight")
+	assert.Less(t, elapsed, time.Second, "IsActive must not be blocked by an in-flight probe — probes run outside m.mu")
+
+	// Release the probe; the alive verdict means nothing is reported dead.
+	close(blocked)
+	select {
+	case dead := <-resultCh:
+		assert.Empty(t, dead, "probe reported alive → no dead mounts")
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeadMounts did not return after the probe was released")
+	}
 }
 
 // ─── Mountpoint verification ──────────────────────────────────────────────────

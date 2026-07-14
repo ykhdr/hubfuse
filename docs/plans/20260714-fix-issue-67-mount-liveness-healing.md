@@ -196,13 +196,18 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
 
-- [ ] метод `DeadMounts(ctx context.Context) []*Mount`: снапшот под `m.mu`, пробы вне лока,
+- [x] метод `DeadMounts(ctx context.Context) []*Mount`: снапшот под `m.mu`, пробы вне лока,
       per-mount `mountProbeTimeout`, вернуть подтверждённо-мёртвые
-- [ ] докомментарий: почему пробы вне лока и почему гонка с параллельным unmount безвредна
-- [ ] тесты (таблица классификации): `(true,nil)` → жив; `(false,nil)` → мёртв;
+- [x] докомментарий: почему пробы вне лока и почему гонка с параллельным unmount безвредна
+- [x] тесты (таблица классификации): `(true,nil)` → жив; `(false,nil)` → мёртв;
       `(false,err)` → мёртв; проба висит → жив («не подтверждено»)
-- [ ] тест: пустой `activeMounts` → nil/пусто, ctx уважается
-- [ ] `go test ./internal/agent/...` — зелёные перед задачей 3
+      (`TestDeadMounts_Classification`; плюс ➕ `TestDeadMounts_MixedReturnsOnlyConfirmedDead`
+      — мульти-маунт свип возвращает только мёртвые, записи сохранены, и
+      ➕ `TestDeadMounts_ProbesOutsideLock` — висящая проба не блокирует `IsActive`)
+- [x] тест: пустой `activeMounts` → nil/пусто, ctx уважается
+      (`TestDeadMounts_EmptyAndCancelledCtx` — отменённый ctx прерывает свип до проб)
+- [x] `go test ./internal/agent/...` — зелёные перед задачей 3 (+ `go build ./...`,
+      `go vet ./...`, `-race` прогон)
 
 ### Task 3: Монитор здоровья маунтов в daemon
 
