@@ -187,7 +187,48 @@ func (a *Agent) TryRun(t *testing.T, args ...string) (string, bool) {
 func (a *Agent) StartDaemon(t *testing.T) {
 	t.Helper()
 
-	// Pick a free port if not already set.
+	a.launchDaemon(t)
+
+	// Add exports via CLI AFTER the daemon is running so the config-file watcher
+	// fires and the SSH server's alias→path map is updated. Writing shares to
+	// config.kdl before start does NOT populate the SSH server because the
+	// watcher's onChange callback is only triggered by file-change events, not
+	// by the initial file state at startup.
+	for _, s := range a.exports {
+		if mkErr := os.MkdirAll(s.path, 0o755); mkErr != nil {
+			t.Fatalf("mkdir export %s: %v", s.path, mkErr)
+		}
+		args := []string{"share", "add", s.path, "--alias", s.alias}
+		if s.permissions != "" {
+			args = append(args, "--permissions", s.permissions)
+		}
+		for _, dev := range s.allow {
+			args = append(args, "--allow", dev)
+		}
+		a.run(t, args...)
+	}
+}
+
+// RestartDaemon relaunches the daemon after Stop, reusing the SSH port picked
+// on first start and deliberately NOT re-running `share add`: the exports were
+// persisted into config.kdl by the first StartDaemon (share add writes them
+// there), and NewDaemon installs the initial ACL snapshot from the loaded
+// config, so a restarted daemon serves its shares immediately without any
+// config-watcher event. Calling StartDaemon a second time would instead re-run
+// `share add` and duplicate the share entries in config.kdl.
+func (a *Agent) RestartDaemon(t *testing.T) {
+	t.Helper()
+	a.launchDaemon(t)
+}
+
+// launchDaemon is the daemon-process core shared by StartDaemon and
+// RestartDaemon: it prepares config.kdl (SSH port) and the stub-marker dir,
+// starts `hubfuse start` with the stub-sshfs PATH override, and returns once
+// the SSH server port is confirmed listening. It does NOT touch exports.
+func (a *Agent) launchDaemon(t *testing.T) {
+	t.Helper()
+
+	// Pick a free port if not already set (RestartDaemon keeps the first one).
 	if a.SSHPort == 0 {
 		a.SSHPort = FreePort(t)
 	}
@@ -249,25 +290,6 @@ func (a *Agent) StartDaemon(t *testing.T) {
 
 	// Wait until the SSH server is accepting connections.
 	WaitForPort(t, a.SSHPort, 5*time.Second)
-
-	// Add exports via CLI AFTER the daemon is running so the config-file watcher
-	// fires and the SSH server's alias→path map is updated. Writing shares to
-	// config.kdl before start does NOT populate the SSH server because the
-	// watcher's onChange callback is only triggered by file-change events, not
-	// by the initial file state at startup.
-	for _, s := range a.exports {
-		if mkErr := os.MkdirAll(s.path, 0o755); mkErr != nil {
-			t.Fatalf("mkdir export %s: %v", s.path, mkErr)
-		}
-		args := []string{"share", "add", s.path, "--alias", s.alias}
-		if s.permissions != "" {
-			args = append(args, "--permissions", s.permissions)
-		}
-		for _, dev := range s.allow {
-			args = append(args, "--allow", dev)
-		}
-		a.run(t, args...)
-	}
 }
 
 // Stop signals the daemon to exit and waits up to 5s for it to do so.
@@ -426,6 +448,58 @@ func (a *Agent) Mount(t *testing.T, src, dst string) {
 // mount destination. The marker exists only while the stub process is running.
 func (a *Agent) MountMarker(dst string) string {
 	return filepath.Join(a.StubMountDir, sanitizeForMarker(dst)+".json")
+}
+
+// WaitForDaemonLog polls this agent's captured daemon stdout/stderr until it
+// contains substr, failing the test after timeout. Use it to sequence a
+// scenario on the daemon's own progress rather than on external side effects.
+// The canonical example: after Mount(), waiting for "mounted share" proves the
+// daemon's verify-poll completed and the mount is recorded in activeMounts —
+// the stub marker alone appears up to one verify poll-interval EARLIER, and
+// killing the stub inside that window aborts the still-in-flight mount (no
+// activeMounts entry, nothing to heal) instead of creating a dead mount.
+func (a *Agent) WaitForDaemonLog(t *testing.T, substr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(a.logBuf.String(), substr) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("WaitForDaemonLog: %q did not appear in %s's daemon log within %s", substr, a.Nickname, timeout)
+}
+
+// KillStubMount simulates "the sshfs process died" (issue #67) for this
+// agent's mount at dst: it SIGTERMs the stub-sshfs process recorded in the
+// mount's marker and waits for the marker to disappear (the stub's defer
+// removes it on the way out). Strictly SIGTERM, never SIGKILL — a SIGKILLed
+// stub skips its defer and strands the marker, and the agent-side liveness
+// probe then reads the unreaped zombie as ALIVE (see the zombie caveat in
+// internal/agent/stubmount.go), which would defeat the very healing this
+// helper exists to provoke.
+//
+// No hub event accompanies the kill: the peer stays registered at an
+// unchanged endpoint, so this reproduces exactly the event-less dead-mount
+// window that only the mount monitor can cover.
+func (a *Agent) KillStubMount(t *testing.T, dst string) {
+	t.Helper()
+	markerPath := a.MountMarker(dst)
+	marker := ReadMarker(t, markerPath)
+	if marker.PID <= 0 {
+		t.Fatalf("KillStubMount: marker %s has no usable pid: %+v", markerPath, marker)
+	}
+	if err := syscall.Kill(marker.PID, syscall.SIGTERM); err != nil {
+		t.Fatalf("KillStubMount: SIGTERM stub pid %d: %v", marker.PID, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("KillStubMount: marker %s still present 5s after SIGTERM to stub pid %d", markerPath, marker.PID)
 }
 
 // HasPeer returns true if `hubfuse devices` lists the given nickname.

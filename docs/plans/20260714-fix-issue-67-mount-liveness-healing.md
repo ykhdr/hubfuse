@@ -305,18 +305,18 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
   маркера; хелпер RestartDaemon — повторный старт БЕЗ повторного `share add`, шары уже
   в config.kdl)
 
-- [ ] хелпер `KillStubMount`: убить stub-sshfs процесс маунта по PID из маркера
+- [x] хелпер `KillStubMount`: убить stub-sshfs процесс маунта по PID из маркера
       (строго SIGTERM — см. зомби-каветку Task 5), дождаться исчезновения маркера —
       симуляция «sshfs умер»
-- [ ] хелпер `RestartDaemon`: как `StartDaemon`, но без повторного добавления экспортов
+- [x] хелпер `RestartDaemon`: как `StartDaemon`, но без повторного добавления экспортов
       (сегодня повторный `StartDaemon` дублирует `share add`; ни один сценарий пока не
-      делает Stop→Start одного агента)
-- [ ] `TestMonitorRemountsDeadMount`: монитор 1s (env); alice экспортирует, bob маунтит;
+      делает Stop→Start одного агента) — общее ядро вынесено в `launchDaemon`
+- [x] `TestMonitorRemountsDeadMount`: монитор 1s (env); alice экспортирует, bob маунтит;
       убить stub bob'а; без каких-либо offline/online циклов ждать нового маркера с новым
       PID (Eventually ≤15s) — закрывает «IP не менялся, событий нет»; это ЖЕ прогоняет
       dead-ветку `Mount` end-to-end (heal идёт через `healDeadMounts` → `Mount` →
       same-endpoint dead-branch)
-- [ ] `TestOfflineOnlineCycleRemountsMount`: монитор выключен (env 10m); bob маунтит;
+- [x] `TestOfflineOnlineCycleRemountsMount`: монитор выключен (env 10m); bob маунтит;
       graceful-рестарт alice (`Stop` → `RestartDaemon`, тот же ssh-порт) → у bob
       `DeviceOffline` реально снимает маунт (truthful stubUnmount убивает стаб), затем
       `DeviceOnline` монтирует начисто (новый маркер, новый PID). Проверяет цепочку
@@ -324,7 +324,17 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
       ПРИМЕЧАНИЕ ревью: событийный путь через dead-ветку `Mount` сценарно недостижим при
       живом хабе (graceful restart всегда шлёт DeviceOffline первым → entry снята до
       DeviceOnline); dead-ветка покрыта юнитами Task 1 и сценарием монитора выше
-- [ ] `make test-scenarios` — зелёные перед задачей 7
+- ➕ хелпер `WaitForDaemonLog` (agent.go): обнаруженная гонка — `Mount()` возвращается по
+      появлению маркера, до одного verify poll-interval (200ms) РАНЬШЕ, чем демон запишет
+      маунт в `activeMounts`; убийство стаба в этом окне абортирует in-flight mount
+      (записи нет — монитору нечего лечить). Оба heal-сценария ждут строки «mounted share»
+      в логе демона перед kill/Stop
+- ➕ хелпер `TryReadMarker` (marker.go): нефатальный reader маркера для
+      `require.Eventually`-поллеров (stub пишет маркер неатомарно — поллер обязан
+      переживать полузаписанный файл, `ReadMarker` фаталит)
+- [x] `make test-scenarios` — зелёные перед задачей 7 (50.9s, оба новых сценария ×3
+      без флейков; `go build ./...`, `go vet ./...`, `go test ./internal/agent/...`
+      также зелёные)
 
 ### Task 7: Проверка критериев приёмки
 
