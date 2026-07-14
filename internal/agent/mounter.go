@@ -298,31 +298,59 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	defer m.mu.Unlock()
 
 	// An existing mount for this key is not necessarily an error. If the peer's
-	// endpoint is unchanged it is a silent no-op; if the peer roamed to a new
-	// IP/port we tear the stale mount down and re-mount at the new endpoint — all
-	// under the same m.mu so a concurrent tryMount (config-watcher goroutine) and
+	// endpoint is unchanged AND the mount is still alive it is a silent no-op;
+	// if the peer roamed to a new IP/port (#61) — or came back at the SAME
+	// endpoint while our sshfs died underneath, leaving an ENOTCONN zombie
+	// (#67) — we tear the stale mount down and re-mount. All under the same
+	// m.mu so a concurrent tryMount (config-watcher goroutine) and
 	// handleDeviceOnline (supervise goroutine) can never interleave a
-	// check-and-remount, and all four Mount call sites get this for free. (#61)
+	// check-and-remount, and all four Mount call sites get this for free.
+	// (#61 endpoint change, #67 dead-mount healing)
 	if existing, exists := m.activeMounts[key]; exists {
 		if existing.IP == deviceIP && existing.SSHPort == sshPort {
-			// Same endpoint — the live mount already points at the right place.
-			// Return BEFORE guardTarget so a live mount's masked mode is never
-			// clobbered.
-			return nil
+			// Same endpoint — probe the existing mountpoint before deciding.
+			// mountpointGoneCtx returns true only on positive evidence the
+			// mount is gone: checkMountpoint reported (false, nil), or errored
+			// (a dead sshfs makes stat fail with ENOTCONN). A probe that hangs
+			// past mountProbeTimeout returns false — a wedged-but-possibly-live
+			// FUSE mount must never be torn down on a mere timeout. (#67)
+			pctx, pcancel := context.WithTimeout(ctx, mountProbeTimeout)
+			gone := m.mountpointGoneCtx(pctx, existing.LocalPath)
+			pcancel()
+			if !gone {
+				// Alive (or not confirmed dead) — the live mount already points
+				// at the right place. Return BEFORE guardTarget so a live
+				// mount's masked mode is never clobbered.
+				return nil
+			}
+			// Confirmed dead: the sshfs process behind this entry is gone and
+			// the path serves "Transport endpoint is not connected". Tear the
+			// zombie down and fall through to the normal mount flow to
+			// re-attach at the same endpoint. (#67)
+			m.logger.Info("re-mounting dead mount at same endpoint",
+				"device", mc.Device,
+				"share", mc.Share,
+				"ip", deviceIP,
+				"port", sshPort,
+				"local_path", existing.LocalPath,
+			)
+		} else {
+			// Peer roamed (DHCP address change / SSH port change). Tear down
+			// the stale mount pointing at the now-dead old endpoint, then fall
+			// through to the normal mount flow to attach a fresh mount at the
+			// new endpoint. (#61)
+			m.logger.Info("re-mounting peer at new endpoint",
+				"device", mc.Device,
+				"share", mc.Share,
+				"old_ip", existing.IP,
+				"old_port", existing.SSHPort,
+				"new_ip", deviceIP,
+				"new_port", sshPort,
+			)
 		}
-		// Peer roamed (DHCP address change / SSH port change). Tear down the stale
-		// mount pointing at the now-dead old endpoint, then fall through to the
-		// normal mount flow to attach a fresh mount at the new endpoint.
-		m.logger.Info("re-mounting peer at new endpoint",
-			"device", mc.Device,
-			"share", mc.Share,
-			"old_ip", existing.IP,
-			"old_port", existing.SSHPort,
-			"new_ip", deviceIP,
-			"new_port", sshPort,
-		)
-		// force=true: the old endpoint is most likely unreachable, so the unmount
-		// must escalate (the force ladder reaches umount -l). reguard=false: the
+		// Shared teardown for both re-mount causes. force=true: the old mount is
+		// dead (#67) or its endpoint unreachable (#61), so the unmount must
+		// escalate (the force ladder reaches umount -l). reguard=false: the
 		// normal flow below re-guards the target via guardTarget. Bound the
 		// unmount with unmountOpTimeout — this remount path has no caller deadline.
 		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
@@ -540,6 +568,15 @@ func (m *Mounter) mountpointGoneCtx(ctx context.Context, path string) bool {
 // shutdown path (UnmountAllForce) passes its own already-bounded context, which
 // is respected as-is so the total budget is not exceeded. (#50 bounded)
 const unmountOpTimeout = 5 * time.Second
+
+// mountProbeTimeout bounds a single liveness probe of an existing mountpoint
+// (Mount's same-endpoint branch). It matches the 3s window unmountKey grants
+// its post-failure re-check: long enough for a healthy stat to return, short
+// enough that a wedged FUSE stat cannot stall the caller for long. A probe
+// that exceeds this budget is "not confirmed dead" — the possibly-live mount
+// is left alone (mountpointGoneCtx's timeout-is-not-evidence semantics).
+// (#67 dead-mount healing)
+const mountProbeTimeout = 3 * time.Second
 
 // reapMountCmd reaps a finished mount's backend process. sshfs daemonizes — it
 // forks and the parent we Start()ed exits 0 once the mount is up — so by the

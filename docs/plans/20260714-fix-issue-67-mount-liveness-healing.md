@@ -171,19 +171,24 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
 
-- [ ] добавить `mountProbeTimeout = 3 * time.Second` рядом с `unmountOpTimeout`
-- [ ] в same-endpoint ветке `Mount` заменить безусловный `return nil` на bounded-пробу
+- [x] добавить `mountProbeTimeout = 3 * time.Second` рядом с `unmountOpTimeout`
+- [x] в same-endpoint ветке `Mount` заменить безусловный `return nil` на bounded-пробу
       `mountpointGoneCtx`; «не подтверждено мёртв» (жив или таймаут) → `return nil`;
       «подтверждено мёртв» → INFO-лог и переход в существующую teardown+remount ветку
       (`unmountKey(force=true, reguard=false)` + fall-through)
-- [ ] обновить комментарий ветки (#61 → #61+#67 семантика)
-- [ ] тесты: живой маунт → no-op (unmount не вызывался, entry сохранён)
-- [ ] тесты: мёртвый — `(false, nil)` и `(false, ENOTCONN-err)` → teardown + новый mount
+- [x] обновить комментарий ветки (#61 → #61+#67 семантика)
+- [x] тесты: живой маунт → no-op (unmount не вызывался, entry сохранён)
+      (`TestMount_SameEndpointAliveProbeIsNoOp` + существующий
+      `TestMount_SameEndpointIsSilentNoOp` не деградировал)
+- [x] тесты: мёртвый — `(false, nil)` и `(false, ENOTCONN-err)` → teardown + новый mount
       на том же эндпоинте (unmount вызван, exec вызван, entry обновлён)
-- [ ] тесты: проба висит дольше таймаута → no-op (никакого teardown возможно-живого маунта)
-- [ ] тесты: мёртвый + unmount падает + recheck говорит «всё ещё маунтпоинт» → ошибка,
-      entry сохранён
-- [ ] `go test ./internal/agent/...` — зелёные перед задачей 2
+      (`TestMount_SameEndpointDeadRemounts`, таблица)
+- [x] тесты: проба висит дольше таймаута → no-op (никакого teardown возможно-живого маунта)
+      (`TestMount_SameEndpointHangingProbeIsNoOp`)
+- [x] тесты: мёртвый + unmount падает + recheck говорит «всё ещё маунтпоинт» → ошибка,
+      entry сохранён (`TestMount_SameEndpointDeadUnmountFailureAborts`)
+- [x] `go test ./internal/agent/...` — зелёные перед задачей 2 (+ `go build ./...`,
+      `go vet ./...`)
 
 ### Task 2: `Mounter.DeadMounts` — bounded-обход активных маунтов
 

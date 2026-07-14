@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -645,6 +646,232 @@ func TestMount_RemountUnmountFailureAborts(t *testing.T) {
 	mounts := m.ActiveMounts()
 	require.Len(t, mounts, 1, "stale entry must be retained for retry")
 	assert.Equal(t, "10.0.0.1", mounts[0].IP, "retained entry must still hold the old endpoint")
+}
+
+// ─── Same-endpoint liveness probe (#67 dead-mount healing) ────────────────────
+
+// TestMount_SameEndpointAliveProbeIsNoOp verifies that a same-endpoint re-Mount
+// PROBES the existing mountpoint and, when the probe reports it alive, is a
+// silent no-op: no teardown, no new backend invocation, entry retained.
+// (#67 dead-mount healing)
+func TestMount_SameEndpointAliveProbeIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Install a probe-aware check AFTER the first Mount: alive, and record the
+	// probed path so we can prove the same-endpoint branch actually consulted it.
+	var probeCalls atomic.Int32
+	var probedPath atomic.Value
+	m.SetMountpointCheckForTests(func(path string) (bool, error) {
+		probeCalls.Add(1)
+		probedPath.Store(path)
+		return true, nil
+	})
+
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222),
+		"same-endpoint re-Mount of a LIVE mount must be a silent no-op")
+
+	assert.Equal(t, int32(1), probeCalls.Load(), "the same-endpoint branch must probe the mountpoint exactly once")
+	assert.Equal(t, mountTo, probedPath.Load(), "the probe must target the existing mount's local path")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "a live mount must NOT be torn down")
+	assert.Equal(t, int32(1), execCalls.Load(), "a live mount must NOT trigger a new backend invocation")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the live entry must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
+}
+
+// TestMount_SameEndpointDeadRemounts verifies the #67 core fix: a same-endpoint
+// re-Mount whose liveness probe CONFIRMS the mount dead — checkMountpoint says
+// "not a mountpoint" or errors (the ENOTCONN zombie) — tears the zombie down
+// (force unmount) and re-mounts at the same endpoint, re-invoking the backend
+// and refreshing the entry. (#67 dead-mount healing)
+func TestMount_SameEndpointDeadRemounts(t *testing.T) {
+	tests := []struct {
+		name     string
+		probeMnt bool
+		probeErr error
+	}{
+		{name: "not a mountpoint", probeMnt: false, probeErr: nil},
+		{name: "probe errors with ENOTCONN", probeMnt: false, probeErr: syscall.ENOTCONN},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			knownDir := filepath.Join(dir, common.KnownDevicesDir)
+			keyPath := filepath.Join(dir, "id_ed25519")
+			mountTo := filepath.Join(dir, "mnt", "docs")
+			t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+			writePubKeyFile(t, knownDir, "device-a")
+
+			var execCalls, unmountCalls atomic.Int32
+			var unmountForce atomic.Bool
+			var capturedArgs []string
+			m := newTestMounter(t, knownDir, keyPath, &capturedArgs, func(_ context.Context, _ string, force bool) error {
+				unmountCalls.Add(1)
+				unmountForce.Store(force)
+				return nil
+			})
+			base := m.execCommand
+			m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				execCalls.Add(1)
+				return base(ctx, name, args...)
+			}
+
+			mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+			require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+			// After the first Mount, the sshfs behind the entry "dies": the FIRST
+			// check call (the liveness probe) reports the configured dead result;
+			// subsequent calls (the new mount's verify poll) see the fresh mount.
+			var checkCalls atomic.Int32
+			m.SetMountpointCheckForTests(func(string) (bool, error) {
+				if checkCalls.Add(1) == 1 {
+					return tt.probeMnt, tt.probeErr
+				}
+				return true, nil
+			})
+
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222),
+				"re-Mount of a confirmed-dead mount at the same endpoint must succeed")
+
+			assert.Equal(t, int32(1), unmountCalls.Load(), "the dead mount must be torn down exactly once")
+			assert.True(t, unmountForce.Load(), "dead-mount teardown must be forced (mirrors the #61 remount branch)")
+			assert.Equal(t, int32(2), execCalls.Load(), "the backend must be re-invoked for the fresh mount")
+			assert.Contains(t, capturedArgs, "hubfuse@10.0.0.1:docs",
+				"the fresh mount must target the SAME endpoint")
+
+			mounts := m.ActiveMounts()
+			require.Len(t, mounts, 1, "exactly one active mount after healing")
+			assert.Equal(t, "10.0.0.1", mounts[0].IP, "healed entry keeps the same IP")
+			assert.Equal(t, 2222, mounts[0].SSHPort, "healed entry keeps the same port")
+			assert.Equal(t, mountTo, mounts[0].LocalPath)
+		})
+	}
+}
+
+// TestMount_SameEndpointHangingProbeIsNoOp verifies the "timeout is not
+// evidence" guarantee end-to-end through Mount: when the liveness probe hangs
+// past its deadline, the mount is NOT confirmed dead, so the possibly-live
+// mount is left untouched — no teardown, no new backend invocation, nil return.
+// (#67 dead-mount healing, no false teardown)
+func TestMount_SameEndpointHangingProbeIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// The probe wedges (blocking FUSE stat simulation). The probe context is
+	// derived from Mount's ctx, so a short caller deadline bounds the wait and
+	// the test does not sit out the full mountProbeTimeout.
+	blocked := make(chan struct{}) // never closed
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		<-blocked
+		return true, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := m.Mount(ctx, mc, "device-a", "10.0.0.1", 2222)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "an unconfirmed (hanging) probe must be treated as alive → no-op nil")
+	assert.Less(t, elapsed, 2*time.Second, "Mount must return promptly once the probe deadline fires")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "a possibly-live mount must NEVER be torn down on a probe timeout")
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation on a probe timeout")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the possibly-live entry must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+}
+
+// TestMount_SameEndpointDeadUnmountFailureAborts verifies that when the probe
+// confirms the mount dead but the teardown fails (unmount errors AND the
+// re-check still sees a mountpoint), Mount returns an error and does NOT start
+// a new mount — the entry is retained (by unmountKey) for the next retry.
+// (#67 dead-mount healing; mirrors the #61 TestMount_RemountUnmountFailureAborts)
+func TestMount_SameEndpointDeadUnmountFailureAborts(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		return errors.New("device is busy")
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Probe (1st call) says dead; unmountKey's post-failure re-check (2nd call)
+	// still sees a mountpoint → the entry must be retained and an error returned.
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		if checkCalls.Add(1) == 1 {
+			return false, nil
+		}
+		return true, nil
+	})
+
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "healing must fail when the dead mount cannot be torn down")
+	assert.Contains(t, err.Error(), "unmount stale endpoint", "error must explain the teardown failure")
+
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation when teardown fails")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the entry must be retained for a later retry")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
 }
 
 // TestMount_NoExistingMountProceedsNormally verifies the baseline path is
