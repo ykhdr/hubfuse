@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -86,15 +85,17 @@ type Daemon struct {
 	minReconnectInterval time.Duration
 
 	// mountMonitorInterval is the cadence of the background mount-health monitor
-	// (runMountMonitor): every tick it probes the active mounts and heals the
-	// ones CONFIRMED dead (see healDeadMounts). The monitor exists for the
-	// event-less windows the Subscribe stream cannot cover — an sshfs that dies
-	// while its peer stays registered at the same endpoint never produces a hub
-	// event at all. NewDaemon sets defaultMountMonitorInterval, overridable via
-	// the HUBFUSE_MOUNT_MONITOR_INTERVAL env var (a test handle for scenario
+	// (runMountMonitor): every tick it runs reconcileMounts — desired-state
+	// reconciliation that probes mounts and heals confirmed-dead ones through
+	// Mount's generation-bound single-flight Ensure semantics. The monitor
+	// exists for the event-less windows the Subscribe stream cannot cover — an
+	// sshfs that dies while its peer stays registered at the same endpoint
+	// never produces a hub event at all. NewDaemon sets
+	// defaultMountMonitorInterval, overridable via the
+	// HUBFUSE_MOUNT_MONITOR_INTERVAL env var (a test handle for scenario
 	// tests, like HUBFUSE_STUB_MOUNT_DIR); <= 0 disables the monitor.
-	// buildTestDaemon bypasses NewDaemon and leaves this 0, so unit tests never
-	// run the monitor unless they set it explicitly. (#67)
+	// buildTestDaemon bypasses NewDaemon and leaves this 0, so unit tests
+	// never run the monitor unless they set it explicitly. (#67)
 	mountMonitorInterval time.Duration
 
 	// registerFn and subscribeFn are injectable seams over the concrete
@@ -678,16 +679,17 @@ func mountMonitorIntervalFromEnv(raw string, def time.Duration, logger *slog.Log
 	return interval
 }
 
-// runMountMonitor periodically heals confirmed-dead mounts. It exists for the
-// event-less windows the Subscribe stream cannot cover: an sshfs process that
-// dies while its peer stays registered (same endpoint — the hub never emits
-// any event, so ls on the target serves "Transport endpoint is not connected"
-// forever), or a DeviceOffline missed because our own event stream was down at
-// that moment. Each tick delegates to healDeadMounts synchronously, so a slow
-// heal simply delays the next sweep (time.Ticker drops missed ticks) rather
-// than piling up concurrent sweeps. Returns immediately when
-// mountMonitorInterval <= 0 (monitor disabled); exits when ctx is cancelled.
-// (#67 dead-mount healing)
+// runMountMonitor periodically reconciles the desired mount state against
+// actual mounts. It replaces the previous detect-then-act healDeadMounts
+// with a unified desired-state loop: on each tick, snapshot config and
+// online devices, build the desired set, and call Mounter.Mount for every
+// desired entry. Mount's generation-safe Ensure semantics probe live mounts
+// (a no-op), tear down and remount confirmed-dead ones, and establish
+// missing ones. A slow sweep simply delays the next tick — no overlapping
+// sweeps. (#67 desired-state reconciliation)
+//
+// Returns immediately when mountMonitorInterval <= 0 (monitor disabled);
+// exits when ctx is cancelled.
 func (d *Daemon) runMountMonitor(ctx context.Context) {
 	if d.mountMonitorInterval <= 0 {
 		d.logger.Info("mount monitor disabled", "interval", d.mountMonitorInterval)
@@ -702,139 +704,69 @@ func (d *Daemon) runMountMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.healDeadMounts(ctx)
+			d.reconcileMounts(ctx)
 		}
 	}
 }
 
-// healDeadMounts is one monitor sweep: collect the mounts CONFIRMED dead (see
-// Mounter.DeadMounts — a probe timeout is NOT confirmation, so a
-// wedged-but-possibly-live mount is never touched), then apply the heal policy
-// to each dead mount:
+// reconcileMounts is the desired-state reconciliation loop. Each tick:
+//  1. Snapshots config and online devices under d.mu.
+//  2. Builds the desired mount set: configured mounts whose peer is online,
+//     paired, and exports the matching share.
+//  3. Calls Mounter.Mount for each desired mount — Mount's Ensure semantics
+//     probe the existing entry (a no-op if healthy/unknown), tear down and
+//     remount if confirmed-dead, or establish a new mount.
 //
-//   - peer online + mount still configured + share still exported + peer
-//     paired → d.mounter.Mount: its same-endpoint dead branch (or the roam
-//     branch, if the peer also moved during the event-less window) tears the
-//     zombie down and re-attaches atomically under m.mu (#67, #61);
-//   - peer offline → d.mounter.UnmountDevice, mirroring handleDeviceOffline
-//     (force + reguard) for the DeviceOffline we evidently missed; the next
-//     DeviceOnline then mounts cleanly from scratch;
-//   - mount no longer in config → the interactive d.mounter.Unmount (its
-//     recheck-reap collects the zombie), mirroring onConfigChange's
-//     MountsRemoved path;
-//   - peer online but share no longer exported, or peer not paired → skip with
-//     a WARN: re-mounting would target a dead share (or an unauthorized peer),
-//     and unmounting is not this monitor's call — SharesUpdated / config
-//     changes own that cleanup (the documented add-only-no-prune tradeoff, see
-//     mountsForOnlineDevice).
-//
-// Heal errors are logged and retried on the next tick — no dedicated backoff
-// in v1. The natural retry works because a failed TEARDOWN retains the
-// activeMounts entry (unmountKey), so the next sweep re-detects the same dead
-// mount. (A teardown that succeeds but whose fresh mount then fails leaves no
-// entry behind — recovery for that case comes from the next
-// DeviceOnline/reconnect, the same as any other failed mount.)
-//
-// Lock discipline (mirrors handleDeviceOnline): everything needed from daemon
-// state — the config pointer and a DEEP snapshot of onlineDevices — is taken
-// under d.mu and the lock is RELEASED before any mounter call. Mount and the
-// Unmount* family take m.mu and can block up to mountVerifyTimeout (10s) in
-// the verify poll; holding d.mu across a sweep would stall every event handler
-// for the whole accumulated budget. The mounter never takes d.mu, so there is
-// no lock-order deadlock either way — only latency — but the snapshot keeps a
-// heal sweep from freezing the daemon. OnlineDevice values are copied
-// (including the Shares slice) rather than aliased: handleSharesUpdated
-// mutates info.Shares in place under d.mu, and this sweep reads them after
-// unlocking. The snapshotted cfg pointer is immutable — onConfigChange only
-// ever swaps the pointer. (#67)
-func (d *Daemon) healDeadMounts(ctx context.Context) {
-	dead := d.mounter.DeadMounts(ctx)
-	if len(dead) == 0 {
-		return
-	}
-
+// Unlike healDeadMounts, reconcileMounts does NOT detect-then-act from a
+// stale snapshot: it goes directly to the desired set and delegates every
+// mount decision to Mount's generation-bound single-flight probe. A mount
+// that was removed from config or whose peer went offline is NOT touched
+// here — event paths (DeviceOffline, onConfigChange) own that cleanup.
+// (#67 desired-state reconciliation)
+func (d *Daemon) reconcileMounts(ctx context.Context) {
 	d.mu.RLock()
 	cfg := d.config
-	peers := make(map[string]OnlineDevice, len(d.onlineDevices))
+	peers := make(map[string]*OnlineDevice, len(d.onlineDevices))
 	for _, dev := range d.onlineDevices {
 		cp := *dev
 		cp.Shares = append([]string(nil), dev.Shares...)
-		peers[dev.Nickname] = cp
+		peers[dev.Nickname] = &cp
 	}
 	d.mu.RUnlock()
 
-	// UnmountDevice sweeps ALL of a peer's mounts at once, so when an offline
-	// peer left several dead mounts behind one call suffices — dedupe to avoid
-	// redundant sweeps (and duplicate log noise) within a single tick.
-	offlineHandled := make(map[string]bool)
-
-	for _, mnt := range dead {
+	for _, mc := range cfg.Mounts {
 		if ctx.Err() != nil {
-			return // daemon shutting down — abandon the sweep
+			return
 		}
 
-		peer, online := peers[mnt.Device]
+		peer, online := peers[mc.Device]
 		if !online {
-			if offlineHandled[mnt.Device] {
-				continue
-			}
-			offlineHandled[mnt.Device] = true
-			d.logger.Info("mount monitor: peer offline, removing its dead mount(s)",
-				"device", mnt.Device,
-				"share", mnt.Share,
-			)
-			if err := d.mounter.UnmountDevice(mnt.Device); err != nil {
-				d.logger.Warn("mount monitor: unmount dead mounts of offline peer",
-					"device", mnt.Device,
-					"error", err,
-				)
-			}
+			// Peer offline — nothing to reconcile. The DeviceOffline event
+			// path owns teardown; if it was missed, a future DeviceOnline
+			// re-establishes the mount.
 			continue
 		}
 
-		mc, configured := mountConfigFor(cfg, mnt.Device, mnt.Share)
-		if !configured {
-			d.logger.Info("mount monitor: dead mount no longer in config, unmounting",
-				"device", mnt.Device,
-				"share", mnt.Share,
-			)
-			if err := d.mounter.Unmount(mnt.Device, mnt.Share); err != nil {
-				d.logger.Warn("mount monitor: unmount dead unconfigured mount",
-					"device", mnt.Device,
-					"share", mnt.Share,
-					"error", err,
-				)
+		// Verify the peer still exports this share.
+		shareExported := false
+		for _, s := range peer.Shares {
+			if s == mc.Share {
+				shareExported = true
+				break
 			}
-			continue
 		}
-
-		if !slices.Contains(peer.Shares, mnt.Share) {
-			d.logger.Warn("mount monitor: peer no longer exports the dead mount's share; skipping heal",
-				"device", mnt.Device,
-				"share", mnt.Share,
-			)
+		if !shareExported {
 			continue
 		}
 
 		if !d.isPaired(peer.DeviceID) {
-			d.logger.Warn("mount monitor: peer is not paired; skipping heal of its dead mount",
-				"device", mnt.Device,
-				"share", mnt.Share,
-				"device_id", peer.DeviceID,
-			)
 			continue
 		}
 
-		d.logger.Info("mount monitor: healing dead mount",
-			"device", mnt.Device,
-			"share", mnt.Share,
-			"ip", peer.IP,
-			"port", peer.SSHPort,
-		)
 		if err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort); err != nil {
-			d.logger.Error("mount monitor: re-mount of dead mount failed",
-				"device", mnt.Device,
-				"share", mnt.Share,
+			d.logger.Error("mount reconcile: mount failed",
+				"device", mc.Device,
+				"share", mc.Share,
 				"error", err,
 			)
 		}
@@ -902,20 +834,20 @@ func (d *Daemon) Shutdown() error {
 //     whose endpoint changed has each of its shares re-pointed at the new
 //     IP/port by Mount's remount branch. (#61)
 //   - Devices ABSENT from the snapshot are pruned from onlineDevices: a peer
-//     that went offline while our event stream was dead never delivered its
-//     DeviceOffline, and an add/update-only reconciliation would leave the
-//     stale entry lying forever — misleading every consumer of the map
-//     (healDeadMounts would keep re-mounting a gone peer's dead mounts at its
-//     dead endpoint instead of removing them). (#67)
-//
-// Nothing is unmounted in this path, deliberately. A missing snapshot entry
-// proves only that the HUB lost the peer — not that the SSH data path did — so
-// tearing down a possibly-live mount here would be exactly the
-// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
-// prune feeds the conservative division of labour: once the entry is gone, the
-// mount monitor's next sweep sees the peer as offline and removes its mounts
-// IF AND ONLY IF their probes confirm them dead (healDeadMounts); a mount that
-// is still alive is left untouched. (#67)
+	//     that went offline while our event stream was dead never delivered its
+	//     DeviceOffline, and an add/update-only reconciliation would leave the
+	//     stale entry lying forever — misleading every consumer of the map
+	//     (reconcileMounts would keep re-mounting a gone peer's mounts at its
+	//     dead endpoint instead of leaving them for the offline event path).
+	//     (#67)
+	//
+	// Nothing is unmounted in this path, deliberately. A missing snapshot entry
+	// proves only that the HUB lost the peer — not that the SSH data path did — so
+	// tearing down a possibly-live mount here would be exactly the
+	// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
+	// prune feeds the conservative division of labour: once the entry is gone, the
+	// mount monitor's next sweep sees the peer as offline and skips its mounts
+	// (reconcileMounts); a mount that is still alive is left untouched. (#67)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	present := make(map[string]struct{}, len(devices))
 	for _, dev := range devices {

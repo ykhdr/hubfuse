@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -205,12 +207,67 @@ type Mount struct {
 	cmd       *exec.Cmd
 }
 
+// mountHealth represents the result of a mount liveness probe: tri-state
+// so that only confirmed-dead outcomes trigger teardown. (#67)
+type mountHealth int
+
+const (
+	// mountHealthHealthy means the probe confirmed the mount is alive:
+	// checkMountpoint returned (true, nil).
+	mountHealthHealthy mountHealth = iota
+	// mountHealthDead means the probe confirmed the mount is gone:
+	// checkMountpoint returned (false, nil), or errored with ENOTCONN
+	// or a missing-path error — positive evidence the FUSE transport
+	// is gone and the mount can be safely torn down.
+	mountHealthDead
+	// mountHealthUnknown means the probe could not determine liveness:
+	// timeout, cancellation, EACCES, EINTR, or any other error not in
+	// the confirmed-dead set. An unknown mount must NEVER be torn down.
+	mountHealthUnknown
+)
+
+// classifyMountHealth maps a raw checkMountpoint result to the tri-state model.
+// This is the single source of truth for what constitutes a confirmed-dead
+// mount vs. an ambiguous/live one. (#67)
+func classifyMountHealth(isMnt bool, err error) mountHealth {
+	if err != nil {
+		// Confirmed-dead errors: ENOTCONN (dead FUSE transport) and
+		// missing-path (mountpoint directory deleted or stat target gone).
+		if errors.Is(err, syscall.ENOTCONN) || errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err) {
+			return mountHealthDead
+		}
+		// Timeout, cancellation, EACCES, EINTR, and all other errors are
+		// ambiguous — never teardown on unknown.
+		return mountHealthUnknown
+	}
+	if isMnt {
+		return mountHealthHealthy
+	}
+	return mountHealthDead
+}
 // guardMode is the restricted mode applied to an unmounted mount target:
 // r-x for owner, nothing for group/other. The cleared write bit blocks entry
 // creation/deletion (so stray local writes fail with EACCES); the set execute
 // bit still lets the agent traverse the path. A live FUSE mount masks this mode
 // while active, and it is re-applied on unmount/reap.
 const guardMode os.FileMode = 0o500
+
+// probeEntry tracks a single in-flight health probe. It is scoped to a
+// mountKey + generation (the *Mount pointer): a probe that completes after
+// the mount was replaced is discarded. (#67 single-flight)
+type probeEntry struct {
+	mount  *Mount       // the generation this probe is bound to
+	result chan probeResult // buffered(1), written exactly once before close
+}
+
+// probeResult carries the outcome of a health probe.
+type probeResult struct {
+	health mountHealth
+}
+
+// probeKey is the identifier for a probe — the mountKey only, because
+// generation is checked by pointer identity after the probe returns.
+type probeKey mountKey
 
 // mountableMode is applied to the mount point immediately before invoking the
 // mount backend. fusermount3 (Linux) refuses to mount onto a directory the user
@@ -231,6 +288,12 @@ type Mounter struct {
 	logger          *slog.Logger
 	activeMounts    map[mountKey]*Mount
 	mu              sync.Mutex
+
+	// probeMu guards the probe registry. It is a separate lock from m.mu so
+	// that a probe can be registered/looked up without holding the main lock —
+	// a hanging probe goroutine must not block mounter operations.
+	probeMu sync.Mutex
+	probes  map[mountKey]*probeEntry
 
 	// stub is true when HUBFUSE_STUB_MOUNT_DIR is set (scenario-test harness).
 	// guardTarget/unguardTarget/targetHasLocalContents are no-ops under the stub:
@@ -288,6 +351,7 @@ func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logge
 		backend:             resolveBackend(mountTool),
 		logger:              logger,
 		activeMounts:        make(map[mountKey]*Mount),
+		probes:              make(map[mountKey]*probeEntry),
 		stub:                stubMarkerDir != "",
 		execCommand:         exec.CommandContext,
 		unmount:             unmountFn,
@@ -316,27 +380,29 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	// handleDeviceOnline (supervise goroutine) can never interleave a
 	// check-and-remount, and all four Mount call sites get this for free.
 	// (#61 endpoint change, #67 dead-mount healing)
+	//
+	// Generation-bound single-flight: the health probe releases m.mu while
+	// running (a hanging FUSE stat cannot block other mounter operations),
+	// then re-acquires m.mu and verifies the mount generation is unchanged
+	// before acting on the result. (#67)
 	if existing, exists := m.activeMounts[key]; exists {
 		if existing.IP == deviceIP && existing.SSHPort == sshPort {
-			// Same endpoint — probe the existing mountpoint before deciding.
-			// mountpointGoneCtx returns true only on positive evidence the
-			// mount is gone: checkMountpoint reported (false, nil), or errored
-			// (a dead sshfs makes stat fail with ENOTCONN). A probe that hangs
-			// past mountProbeTimeout returns false — a wedged-but-possibly-live
-			// FUSE mount must never be torn down on a mere timeout. (#67)
-			pctx, pcancel := context.WithTimeout(ctx, mountProbeTimeout)
-			gone := m.mountpointGoneCtx(pctx, existing.LocalPath)
-			pcancel()
-			if !gone {
-				// Alive (or not confirmed dead) — the live mount already points
-				// at the right place. Return BEFORE guardTarget so a live
-				// mount's masked mode is never clobbered.
+			// Same endpoint — probe liveness using the generation-bound
+			// single-flight mechanism. probeGenerationLocked temporarily
+			// releases m.mu, runs the probe, re-acquires m.mu, and
+			// re-verifies generation identity. If the generation changed
+			// while the probe was in flight, it returns unknown.
+			health := m.probeGenerationLocked(ctx, key, existing)
+			if health == mountHealthHealthy || health == mountHealthUnknown {
+				// Alive (or not confirmed dead) — the live mount already
+				// points at the right place. Return BEFORE guardTarget so
+				// a live mount's masked mode is never clobbered.
 				return nil
 			}
-			// Confirmed dead: the sshfs process behind this entry is gone and
-			// the path serves "Transport endpoint is not connected". Tear the
-			// zombie down and fall through to the normal mount flow to
-			// re-attach at the same endpoint. (#67)
+			// Confirmed dead: the sshfs process behind this entry is gone
+			// and the path serves "Transport endpoint is not connected".
+			// Tear the zombie down and fall through to the normal mount
+			// flow to re-attach at the same endpoint. (#67)
 			m.logger.Info("re-mounting dead mount at same endpoint",
 				"device", mc.Device,
 				"share", mc.Share,
@@ -588,6 +654,96 @@ const unmountOpTimeout = 5 * time.Second
 // (#67 dead-mount healing)
 const mountProbeTimeout = 3 * time.Second
 
+// probeHealth runs checkMountpoint(path) and classifies the result. It is a
+// pure function (no side effects on Mounter state) so it can be called from
+// the single-flight goroutine without holding any lock.
+func (m *Mounter) probeHealth(ctx context.Context, path string) mountHealth {
+	done := make(chan struct{})
+	var isMnt bool
+	var err error
+	go func() {
+		isMnt, err = m.checkMountpoint(path)
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		// Timeout or cancellation — we could not confirm anything.
+		m.logger.Warn("mountpoint health probe did not complete within deadline; treating as unknown", "path", path)
+		return mountHealthUnknown
+	case <-done:
+		return classifyMountHealth(isMnt, err)
+	}
+}
+
+// probeGenerationLocked performs a generation-bound single-flight health probe
+// for the given mountKey and its current *Mount. It must be called with m.mu
+// held (to read the current *Mount). It releases m.mu while the probe runs
+// so a hanging FUSE stat does not block other mounter operations, then
+// re-acquires m.mu to verify generation identity before returning.
+//
+// Returns the probe health, or mountHealthUnknown if the generation changed
+// (the mount was replaced/removed while the probe was in flight).
+func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *Mount) mountHealth {
+	// Register or join the single-flight probe under probeMu.
+	m.probeMu.Lock()
+	existing, hasExisting := m.probes[key]
+	if hasExisting && existing.mount == mnt {
+		// Same generation — join the existing probe. Release m.mu while
+		// waiting so the running probe can complete (it needs m.mu to
+		// write the result and clean up its entry).
+		probe := existing
+		m.probeMu.Unlock()
+		m.mu.Unlock()
+		r := <-probe.result
+		m.mu.Lock()
+		// Re-check generation: the mount may have been replaced while
+		// we were waiting.
+		if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
+			return mountHealthUnknown
+		}
+		return r.health
+	}
+	// Start a new probe for this key+generation.
+	entry := &probeEntry{
+		mount:  mnt,
+		result: make(chan probeResult, 1),
+	}
+	m.probes[key] = entry
+	m.probeMu.Unlock()
+
+	// Release m.mu while the probe runs.
+	m.mu.Unlock()
+
+	// Run the probe. Use the caller's ctx so the probe respects the
+	// caller's deadline/cancellation, capped at mountProbeTimeout.
+	pctx, pcancel := context.WithTimeout(ctx, mountProbeTimeout)
+	defer pcancel()
+	health := m.probeHealth(pctx, mnt.LocalPath)
+
+	// Store the result (non-blocking, channel is buffered(1)).
+	entry.result <- probeResult{health: health}
+
+	// Re-acquire m.mu to re-check generation.
+	m.mu.Lock()
+
+	// Clean up the probe entry under probeMu.
+	m.probeMu.Lock()
+	if m.probes[key] == entry {
+		delete(m.probes, key)
+	}
+	m.probeMu.Unlock()
+
+	// Check if the generation is still valid.
+	if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
+		// Mount was replaced or removed while probe was in flight.
+		// The result is stale — return unknown so the caller retries.
+		m.logger.Debug("stale health probe result discarded; mount generation changed",
+			"device", key.Device, "share", key.Share)
+		return mountHealthUnknown
+	}
+	return health
+}
+
 // reapMountCmd reaps a finished mount's backend process. sshfs daemonizes — it
 // forks and the parent we Start()ed exits 0 once the mount is up — so by the
 // time a mount is torn down (or reaped as dead) mnt.cmd is a long-exited zombie
@@ -819,54 +975,6 @@ func (m *Mounter) ActiveMounts() []*Mount {
 		result = append(result, mnt)
 	}
 	return result
-}
-
-// DeadMounts probes every active mount and returns the ones CONFIRMED dead:
-// the liveness probe positively reported the path is no longer a mountpoint,
-// or errored (a dead sshfs makes stat fail with ENOTCONN). Each mount gets its
-// own probe context bounded by mountProbeTimeout (further capped by ctx); a
-// probe that hangs past its deadline is "not confirmed dead" and the mount is
-// reported alive — a wedged-but-possibly-live FUSE mount must never be offered
-// up for healing on a mere timeout (mountpointGoneCtx's timeout-is-not-evidence
-// semantics). This is the daemon mount-monitor's detection primitive. (#67
-// dead-mount healing)
-//
-// The activeMounts snapshot is taken under m.mu but the probes run OUTSIDE the
-// lock: a wedged FUSE stat parks its probe goroutine for up to
-// mountProbeTimeout, and holding m.mu across a multi-mount sweep would stall
-// every other mounter operation (Mount, Unmount*, IsActive) for the whole
-// accumulated probe budget.
-//
-// Probing unlocked races a concurrent unmount/remount, and that is harmless by
-// design: DeadMounts only OBSERVES and returns the snapshot entries. Every
-// heal action goes through Mount / Unmount* / UnmountDevice, which re-examine
-// activeMounts under m.mu before touching anything — an entry that was
-// unmounted or replaced after the snapshot is re-verified (or found missing)
-// there, so a stale verdict can never tear down state it did not re-check.
-func (m *Mounter) DeadMounts(ctx context.Context) []*Mount {
-	m.mu.Lock()
-	snapshot := make([]*Mount, 0, len(m.activeMounts))
-	for _, mnt := range m.activeMounts {
-		snapshot = append(snapshot, mnt)
-	}
-	m.mu.Unlock()
-
-	var dead []*Mount
-	for _, mnt := range snapshot {
-		if ctx.Err() != nil {
-			// Caller gave up — stop the sweep without spawning further probe
-			// goroutines. Unprobed mounts are simply "not confirmed dead"
-			// this round; the next monitor tick re-probes them.
-			return dead
-		}
-		pctx, cancel := context.WithTimeout(ctx, mountProbeTimeout)
-		gone := m.mountpointGoneCtx(pctx, mnt.LocalPath)
-		cancel()
-		if gone {
-			dead = append(dead, mnt)
-		}
-	}
-	return dead
 }
 
 // guardTarget creates the target directory if absent and chmods it to guardMode

@@ -16,7 +16,7 @@ import (
 // nothing roamed), so before #67 the mount stayed a "Transport endpoint is not
 // connected" zombie forever. The mount monitor must confirm the mount dead on
 // its next tick and heal it through Mount's same-endpoint dead branch — so
-// this scenario also drives that branch end-to-end (healDeadMounts → Mount →
+// this scenario also drives that branch end-to-end (reconcileMounts → Mount →
 // probe says dead → teardown → fresh mount at the same IP/port).
 func TestMonitorRemountsDeadMount(t *testing.T) {
 	hub := helpers.StartHub(t)

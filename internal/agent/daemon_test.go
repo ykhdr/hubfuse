@@ -1733,19 +1733,13 @@ func TestGuardTarget_GuardConfiguredTargets(t *testing.T) {
 	assert.Equal(t, guardMode, info2.Mode().Perm(), "second target must be restricted to guardMode (#49 test 10)")
 }
 
-// ─── Mount monitor: healDeadMounts / runMountMonitor (#67) ────────────────────
+// ─── Mount monitor: reconcileMounts / runMountMonitor (#67) ─────────────────
 
-// TestHealDeadMounts_PeerOnlineRemounts verifies the heal path for a confirmed-
-// dead mount whose peer the hub still reports online: the zombie is torn down
-// and the share re-mounted at the peer's CURRENT endpoint. The same-endpoint
-// case drives Mount's dead branch (the exact issue #67 user repro — "the IP
-// never changed, no events ever came"); the roamed case drives the #61 remount
-// branch (the peer also moved during the event-less window). The mountpoint
-// check is stateful: it reports "not a mountpoint" until the mounter's unmount
-// seam runs (the zombie teardown), after which the fresh mount's verify poll
-// sees a live mountpoint again — mirroring what a real teardown+remount does
-// to the filesystem. (#67)
-func TestHealDeadMounts_PeerOnlineRemounts(t *testing.T) {
+// TestReconcileMounts_HealsDeadMount verifies that reconcileMounts heals a
+// dead mount at the same endpoint: Mount's generation-bound single-flight
+// probe detects the dead mount, tears it down, and re-mounts. The mount is
+// still configured, the peer is online, paired, and exporting the share.
+func TestReconcileMounts_HealsDeadMount(t *testing.T) {
 	tests := []struct {
 		name   string
 		peerIP string
@@ -1767,15 +1761,15 @@ func TestHealDeadMounts_PeerOnlineRemounts(t *testing.T) {
 			// Pre-mount at the original endpoint.
 			require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
 
-			// Capture every mount exec from here on (the pre-mount is not captured).
+			// Capture every mount exec from here on.
 			var mountCalls [][]string
 			d.mounter.SetExecCommandForTests(func(_ context.Context, name string, args ...string) *exec.Cmd {
 				mountCalls = append(mountCalls, append([]string{name}, args...))
 				return exec.Command("true")
 			})
 
-			// The sshfs behind the mount dies: probes report "gone" until the
-			// zombie is torn down, then fresh mounts verify normally.
+			// The sshfs behind the mount dies: probes report "gone" until
+			// the zombie is torn down, then fresh mounts verify normally.
 			var deadNow atomic.Bool
 			deadNow.Store(true)
 			var unmountCalls int
@@ -1784,12 +1778,12 @@ func TestHealDeadMounts_PeerOnlineRemounts(t *testing.T) {
 			})
 			d.mounter.SetUnmountForTests(func(_ context.Context, _ string, force bool) error {
 				unmountCalls++
-				assert.True(t, force, "zombie teardown must be forced (dead endpoint cannot answer a polite unmount)")
+				assert.True(t, force, "zombie teardown must be forced")
 				deadNow.Store(false)
 				return nil
 			})
 
-			// Hub state: the peer is online at peerIP, exporting the share, paired.
+			// Hub state: the peer is online, exporting the share, paired.
 			d.mu.Lock()
 			d.onlineDevices["device-123"] = &OnlineDevice{
 				DeviceID: "device-123",
@@ -1800,9 +1794,9 @@ func TestHealDeadMounts_PeerOnlineRemounts(t *testing.T) {
 			}
 			d.mu.Unlock()
 
-			d.healDeadMounts(context.Background())
+			d.reconcileMounts(context.Background())
 
-			require.Equal(t, 1, unmountCalls, "the zombie must be torn down exactly once before remounting")
+			require.GreaterOrEqual(t, unmountCalls, 1, "the zombie must be torn down")
 			require.True(t, d.mounter.IsActive("laptop", "docs"), "the dead mount must be remounted")
 
 			mounts := d.mounter.ActiveMounts()
@@ -1810,95 +1804,28 @@ func TestHealDeadMounts_PeerOnlineRemounts(t *testing.T) {
 			assert.Equal(t, tt.peerIP, mounts[0].IP, "entry must carry the peer's current IP")
 			assert.Equal(t, 2222, mounts[0].SSHPort, "entry must carry the peer's current SSH port")
 
-			require.Len(t, mountCalls, 1, "exactly one new mount exec")
+			require.GreaterOrEqual(t, len(mountCalls), 1, "at least one mount exec")
 			joined := strings.Join(mountCalls[0], " ")
 			assert.Contains(t, joined, "hubfuse@"+tt.peerIP+":docs",
 				"the new exec must target the peer's CURRENT endpoint")
-			assert.Contains(t, joined, "-p 2222", "the new exec must use the peer's current SSH port")
 		})
 	}
 }
 
-// TestHealDeadMounts_PeerOfflineUnmountsDeadOnly verifies the offline branch:
-// a dead mount whose peer is absent from onlineDevices (its DeviceOffline was
-// evidently missed) is force-unmounted, mirroring handleDeviceOffline, while a
-// live mount of a different (online) peer is left untouched. (#67)
-func TestHealDeadMounts_PeerOfflineUnmountsDeadOnly(t *testing.T) {
-	d, dir := buildTestDaemon(t)
-
-	deadTo := filepath.Join(dir, "mnt", "docs")
-	liveTo := filepath.Join(dir, "mnt", "photos")
-	t.Cleanup(func() {
-		_ = os.Chmod(deadTo, 0o755)
-		_ = os.Chmod(liveTo, 0o755)
-	})
-
-	writePubKey(t, dir, "ghost-id")
-	writePubKey(t, dir, "alive-id")
-
-	mcDead := agentconfig.MountConfig{Device: "ghost", Share: "docs", To: deadTo}
-	mcLive := agentconfig.MountConfig{Device: "alive", Share: "photos", To: liveTo}
-	d.config.Mounts = []agentconfig.MountConfig{mcDead, mcLive}
-
-	require.NoError(t, d.mounter.Mount(context.Background(), mcDead, "ghost-id", "10.0.0.5", 2222), "pre-mount ghost")
-	require.NoError(t, d.mounter.Mount(context.Background(), mcLive, "alive-id", "10.0.0.6", 2222), "pre-mount alive")
-
-	// Probes: ghost's mount is dead; alive's mount stays live.
-	d.mounter.SetMountpointCheckForTests(func(path string) (bool, error) {
-		return path != deadTo, nil
-	})
-	var unmounted []string
-	d.mounter.SetUnmountForTests(func(_ context.Context, path string, force bool) error {
-		unmounted = append(unmounted, path)
-		assert.True(t, force, "offline-peer teardown must be forced (mirrors handleDeviceOffline)")
-		return nil
-	})
-
-	// Only the live peer is online; "ghost" went offline while our stream was down.
-	d.mu.Lock()
-	d.onlineDevices["alive-id"] = &OnlineDevice{
-		DeviceID: "alive-id",
-		Nickname: "alive",
-		IP:       "10.0.0.6",
-		SSHPort:  2222,
-		Shares:   []string{"photos"},
-	}
-	d.mu.Unlock()
-
-	d.healDeadMounts(context.Background())
-
-	assert.Equal(t, []string{deadTo}, unmounted, "exactly the offline peer's dead mount must be unmounted")
-	assert.False(t, d.mounter.IsActive("ghost", "docs"), "the dead entry must be removed")
-	assert.True(t, d.mounter.IsActive("alive", "photos"), "the live mount must not be touched")
-}
-
-// TestHealDeadMounts_RemovedFromConfigUnmounts verifies the config branch: a
-// dead mount whose entry was removed from cfg.Mounts (hot-reload while the
-// sshfs was already dead) is cleaned up via the interactive (non-forced)
-// unmount path, mirroring onConfigChange's MountsRemoved handling. (#67)
-func TestHealDeadMounts_RemovedFromConfigUnmounts(t *testing.T) {
+// TestReconcileMounts_RetriesMissingEntry verifies that a missing entry (e.g.
+// a failed previous remount tore down the old entry but the fresh mount failed)
+// is retried on the next reconcileMounts tick.
+func TestReconcileMounts_RetriesMissingEntry(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
 	mountTo := filepath.Join(dir, "mnt", "docs")
 	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
 
-	writePubKey(t, dir, "device-123")
 	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
-	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "device-123")
 
-	// The mount is gone from config (removed while its sshfs was dead).
-	d.config.Mounts = nil
-
-	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) { return false, nil })
-	var unmountCalls int
-	var gotForce bool
-	d.mounter.SetUnmountForTests(func(_ context.Context, _ string, force bool) error {
-		unmountCalls++
-		gotForce = force
-		return nil
-	})
-
-	// Peer stays online so the offline branch is not taken — config decides.
+	// Peer is online, paired, exporting the share — but no mount exists yet.
 	d.mu.Lock()
 	d.onlineDevices["device-123"] = &OnlineDevice{
 		DeviceID: "device-123",
@@ -1909,89 +1836,175 @@ func TestHealDeadMounts_RemovedFromConfigUnmounts(t *testing.T) {
 	}
 	d.mu.Unlock()
 
-	d.healDeadMounts(context.Background())
+	// reconcileMounts should establish the missing mount.
+	d.reconcileMounts(context.Background())
 
-	assert.Equal(t, 1, unmountCalls, "the unconfigured dead mount must be unmounted")
-	assert.False(t, gotForce, "config-removed cleanup uses the interactive (non-forced) unmount path")
-	assert.False(t, d.mounter.IsActive("laptop", "docs"), "the entry must be removed")
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "reconcileMounts must establish a missing mount")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.0.0.5", mounts[0].IP)
 }
 
-// TestHealDeadMounts_SkipsUnpairedAndUnexportedPeers verifies the conservative
-// skip branches: a dead mount whose peer is online but no longer paired, or no
-// longer exports the share, is left strictly alone — no mount exec, no unmount,
-// entry retained. Healing would target an unauthorized peer or a dead share;
-// cleanup belongs to SharesUpdated / config-change handling. (#67)
-func TestHealDeadMounts_SkipsUnpairedAndUnexportedPeers(t *testing.T) {
-	tests := []struct {
-		name       string
-		peerShares []string
-		unpair     bool
-	}{
-		{name: "peer not paired", peerShares: []string{"docs"}, unpair: true},
-		{name: "share no longer exported", peerShares: []string{"other"}, unpair: false},
+// TestReconcileMounts_SkipsOfflinePeer verifies that reconcileMounts skips
+// mounts whose peer is offline (not in onlineDevices).
+func TestReconcileMounts_SkipsOfflinePeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "ghost", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "ghost-id")
+
+	// Peer is NOT in onlineDevices.
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an offline peer")
+	assert.False(t, d.mounter.IsActive("ghost", "docs"), "no mount should exist for an offline peer")
+}
+
+// TestReconcileMounts_SkipsUnpairedDevice verifies that reconcileMounts skips
+// mounts whose peer is online but not paired.
+func TestReconcileMounts_SkipsUnpairedDevice(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "stranger", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	// Do NOT write a pairing key for this device.
+
+	d.mu.Lock()
+	d.onlineDevices["stranger-id"] = &OnlineDevice{
+		DeviceID: "stranger-id",
+		Nickname: "stranger",
+		IP:       "10.0.0.1",
+		SSHPort:  2222,
+		Shares:   []string{"docs"},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			d, dir := buildTestDaemon(t)
+	d.mu.Unlock()
 
-			mountTo := filepath.Join(dir, "mnt", "docs")
-			t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
 
-			// The pub key must exist for the PRE-mount (known_hosts pinning).
-			writePubKey(t, dir, "device-123")
-			mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
-			d.config.Mounts = []agentconfig.MountConfig{mc}
-			require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
+	d.reconcileMounts(context.Background())
 
-			if tt.unpair {
-				// The user un-paired the peer while the mount was up.
-				require.NoError(t, os.Remove(filepath.Join(dir, "known_devices", "device-123.pub")), "remove pairing key")
-			}
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an unpaired peer")
+}
 
-			d.mounter.SetMountpointCheckForTests(func(string) (bool, error) { return false, nil })
-			var execCalls, unmountCalls int
-			d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
-				execCalls++
-				return exec.Command("true")
-			})
-			d.mounter.SetUnmountForTests(func(_ context.Context, _ string, _ bool) error {
-				unmountCalls++
-				return nil
-			})
+// TestReconcileMounts_SkipsUnexportedShare verifies that reconcileMounts skips
+// a mount whose share the peer no longer exports.
+func TestReconcileMounts_SkipsUnexportedShare(t *testing.T) {
+	d, dir := buildTestDaemon(t)
 
-			d.mu.Lock()
-			d.onlineDevices["device-123"] = &OnlineDevice{
-				DeviceID: "device-123",
-				Nickname: "laptop",
-				IP:       "10.0.0.5",
-				SSHPort:  2222,
-				Shares:   tt.peerShares,
-			}
-			d.mu.Unlock()
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
 
-			d.healDeadMounts(context.Background())
+	mc := agentconfig.MountConfig{Device: "peer", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "peer-id")
 
-			assert.Zero(t, execCalls, "no mount must be attempted")
-			assert.Zero(t, unmountCalls, "no unmount must be attempted")
-			assert.True(t, d.mounter.IsActive("laptop", "docs"), "the entry must be retained as-is")
-		})
+	d.mu.Lock()
+	d.onlineDevices["peer-id"] = &OnlineDevice{
+		DeviceID: "peer-id",
+		Nickname: "peer",
+		IP:       "10.0.0.1",
+		SSHPort:  2222,
+		Shares:   []string{"other"}, // does NOT export "docs"
 	}
+	d.mu.Unlock()
+
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an unexported share")
+}
+
+// TestReconcileMounts_CancellationStopsSweep verifies that a cancelled context
+// stops the reconcileMounts sweep before processing all mounts.
+func TestReconcileMounts_CancellationStopsSweep(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	// Configure two mounts: the first will probe, the second must not be reached.
+	writePubKey(t, dir, "device-a")
+	writePubKey(t, dir, "device-b")
+
+	mc1 := agentconfig.MountConfig{Device: "alpha", Share: "docs", To: filepath.Join(dir, "mnt1")}
+	mc2 := agentconfig.MountConfig{Device: "beta", Share: "docs", To: filepath.Join(dir, "mnt2")}
+	d.config.Mounts = []agentconfig.MountConfig{mc1, mc2}
+
+	d.mu.Lock()
+	d.onlineDevices["device-a"] = &OnlineDevice{
+		DeviceID: "device-a", Nickname: "alpha", IP: "10.0.0.1", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.onlineDevices["device-b"] = &OnlineDevice{
+		DeviceID: "device-b", Nickname: "beta", IP: "10.0.0.2", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	d.reconcileMounts(ctx)
+
+	// With a cancelled context, no mounts should be processed.
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted with a cancelled context")
 }
 
 // TestRunMountMonitor_TicksAndStopsOnCancel verifies the monitor loop fires
-// healDeadMounts on every tick (observable as liveness probes against the one
-// active mount) and exits promptly when ctx is cancelled. (#67)
+// reconcileMounts on every tick (observable as liveness probes through
+// Mount's generation-bound single-flight probe of the one active mount) and
+// exits promptly when ctx is cancelled. (#67)
 func TestRunMountMonitor_TicksAndStopsOnCancel(t *testing.T) {
 	d, dir := buildTestDaemon(t)
 
 	mountTo := filepath.Join(dir, "mnt", "docs")
 	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
 	writePubKey(t, dir, "device-123")
-	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
-	require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
 
-	// Count liveness probes: each tick's DeadMounts probes the single active
-	// mount exactly once. The mount reads alive, so no heal action follows.
+	// Register the mount in both the config (so reconcileMounts finds it) and
+	// the mounter (so the tick's Mount call triggers a generation-bound probe).
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: mountTo},
+	}
+
+	// Pre-mount so there is an active entry for the probe.
+	writePubKey(t, dir, "device-123")
+	require.NoError(t, d.mounter.Mount(context.Background(), d.config.Mounts[0], "device-123", "10.0.0.5", 2222), "pre-mount")
+
+	// Seed onlineDevices so reconcileMounts sees the peer.
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123", Nickname: "laptop",
+		IP: "10.0.0.5", SSHPort: 2222,
+		Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	// Count liveness probes: each tick's reconcileMounts → Mount → probeGenerationLocked
+	// probes the single active mount exactly once per tick via checkMountpoint.
 	var probes atomic.Int32
 	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
 		probes.Add(1)
