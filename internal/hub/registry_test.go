@@ -242,6 +242,10 @@ func TestHeartbeat_RecoversOfflineDevice(t *testing.T) {
 
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()
+	// dev-1's own subscription stands in for its live daemon: an open stream is
+	// how the hub tells "demoted while connected" from "deregistered on
+	// purpose" (Registry.canRecover). It doubles as the assertion below that
+	// the recovered device is not sent its own event.
 	selfCh, selfUnsub := r.Subscribe("dev-1")
 	defer selfUnsub()
 
@@ -281,6 +285,74 @@ func TestHeartbeat_RecoversOfflineDevice(t *testing.T) {
 	}
 }
 
+// TestHeartbeat_DoesNotResurrectDeregisteredDevice — being offline is not by
+// itself proof that the hub gave up on a live device. A device that shut down
+// cleanly is offline too, and a heartbeat still in flight when its Deregister
+// lands must not bring it back: peers would be told to mount a daemon that has
+// already exited.
+func TestHeartbeat_DoesNotResurrectDeregisteredDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+
+	_, unsub := r.Subscribe("dev-1") // a connected daemon, as after a real Register
+	defer unsub()
+
+	watchCh, watchUnsub := r.Subscribe("dev-2")
+	defer watchUnsub()
+
+	require.NoError(t, r.Deregister(ctx, "dev-1"), "Deregister")
+	select {
+	case event := <-watchCh:
+		require.NotNil(t, event.GetDeviceOffline(), "expected DeviceOffline, got %T", event.GetPayload())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DeviceOffline")
+	}
+
+	// The late heartbeat the departing daemon had already sent.
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "late Heartbeat")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status, "a deregistered device must stay offline")
+
+	select {
+	case event := <-watchCh:
+		t.Fatalf("a deregistered device must not be announced online again, got %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHeartbeat_DrainingHubDoesNotRecover — hub shutdown marks every device
+// offline while the gRPC server still answers. A heartbeat inside that window
+// would otherwise leave a phantom-online row behind for the next hub start.
+func TestHeartbeat_DrainingHubDoesNotRecover(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+	_, unsub := r.Subscribe("dev-1")
+	defer unsub()
+
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	demoted, err := r.MarkOffline(ctx, d1, time.Now().Add(time.Minute))
+	require.NoError(t, err, "MarkOffline")
+	require.True(t, demoted)
+
+	r.Drain()
+
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat while draining")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status, "a draining hub must not bring devices back online")
+}
+
 // TestHeartbeat_OfflineDeviceWithoutSSHPortIsNotRecovered — a device that never
 // completed a Register has no endpoint the hub could announce; recovering it
 // would broadcast a mount target of port 0.
@@ -291,6 +363,9 @@ func TestHeartbeat_OfflineDeviceWithoutSSHPortIsNotRecovered(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice", "")
 	joinDevice(t, r, "dev-2", "bob", "")
 	require.NoError(t, r.store.UpdateDeviceStatus(ctx, "dev-1", store.StatusOffline, "10.0.0.1", 0), "UpdateDeviceStatus")
+
+	_, selfUnsub := r.Subscribe("dev-1") // connected, so only the missing port can block recovery
+	defer selfUnsub()
 
 	ch, unsub := r.Subscribe("dev-2")
 	defer unsub()

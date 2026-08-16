@@ -98,6 +98,17 @@ func TestIntegration_HeartbeatRecoversDemotedDevice(t *testing.T) {
 
 	subCtx, cancelSub := context.WithCancel(ctx)
 	t.Cleanup(cancelSub)
+
+	// The sharer subscribes because a real daemon does: sessionOnce runs
+	// Register → Subscribe. That live subscription is also what tells the hub
+	// this device was demoted while connected, rather than having deregistered
+	// on purpose — see Registry.canRecover.
+	sharerStream, err := sharer.Subscribe(subCtx)
+	require.NoError(t, err, "subscribe sharer")
+	sharerReady, err := sharerStream.Recv()
+	require.NoError(t, err, "sharer subscribe ready")
+	require.NotNil(t, sharerReady.GetSubscribeReady(), "expected SubscribeReady, got %T", sharerReady.GetPayload())
+
 	stream, err := watcher.Subscribe(subCtx)
 	require.NoError(t, err, "subscribe watcher")
 	ready, err := stream.Recv()

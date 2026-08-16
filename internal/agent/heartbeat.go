@@ -45,6 +45,11 @@ func heartbeatIntervalFromEnv(raw string, def time.Duration, logger *slog.Logger
 	return interval
 }
 
+// minHeartbeatRPCTimeout floors the per-call deadline of a heartbeat RPC, so a
+// shortened test cadence does not become a hair-trigger against a hub that
+// needs a moment to answer. (#69)
+const minHeartbeatRPCTimeout = 2 * time.Second
+
 // startHeartbeat launches the heartbeat loop exactly once for the daemon's
 // lifetime, whichever caller gets there first.
 //
@@ -88,6 +93,13 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 		// build a Daemon literally, where time.NewTicker(0) would panic.
 		interval = defaultHeartbeatInterval
 	}
+	rpcTimeout := interval
+	if rpcTimeout < minHeartbeatRPCTimeout {
+		// A very short cadence (scenario tests run at sub-second intervals)
+		// must not turn every beat into a deadline error on a hub that needs a
+		// moment to answer.
+		rpcTimeout = minHeartbeatRPCTimeout
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -96,7 +108,17 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := d.heartbeatFn(ctx); err != nil {
+			// Bound every call. A heartbeat RPC on a half-open connection can
+			// hang indefinitely, and the loop would then stop beating entirely
+			// (ticks are dropped while it is blocked) — the hub demotes the
+			// device and its peers unmount, which is the very outcome this loop
+			// exists to prevent. One interval is the natural budget: a call
+			// that has not answered by the time the next beat is due is already
+			// too late to be useful. (#69)
+			beatCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+			err := d.heartbeatFn(beatCtx)
+			cancel()
+			if err != nil {
 				d.logger.Warn("heartbeat failed", "error", err)
 			}
 		}

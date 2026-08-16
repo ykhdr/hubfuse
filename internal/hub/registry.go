@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -18,13 +19,17 @@ import (
 
 // Registry manages device registration and event broadcasting.
 type Registry struct {
-	store         store.Store
-	caCert        *x509.Certificate
-	caKey         *rsa.PrivateKey
-	subscribers   map[string]chan *pb.Event // device_id -> event channel
-	mu            sync.RWMutex
-	logger        *slog.Logger
-	joinTokenTTL  time.Duration
+	store        store.Store
+	caCert       *x509.Certificate
+	caKey        *rsa.PrivateKey
+	subscribers  map[string]chan *pb.Event // device_id -> event channel
+	mu           sync.RWMutex
+	logger       *slog.Logger
+	joinTokenTTL time.Duration
+
+	// draining is set once by Drain (hub shutdown) and only ever read
+	// afterwards; an atomic keeps it out of the subscriber lock. See canRecover.
+	draining atomic.Bool
 }
 
 // NewRegistry creates a new Registry backed by the given store. joinTokenTTL
@@ -107,17 +112,20 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, err
 	}
 
+	// Every write below is translated the same way as the read above: a prune
+	// can land between them, and the agent must get the actionable
+	// "device unknown, re-join" answer no matter which statement noticed.
 	storeShares := sharesFromProto(deviceID, shares)
 	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
-		return nil, err
+		return nil, deviceErr(err)
 	}
 
 	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
-		return nil, err
+		return nil, deviceErr(err)
 	}
 
 	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
-		return nil, err
+		return nil, deviceErr(err)
 	}
 
 	current := &store.Device{
@@ -202,6 +210,11 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 		// Ordinary case: nothing to announce.
 		return nil
 	}
+	if !r.canRecover(deviceID) {
+		// Offline for a reason other than "the hub gave up on a live device".
+		// See canRecover.
+		return nil
+	}
 	if device.SSHPort == 0 {
 		// The device has an offline row but never completed a Register, so the
 		// hub has no endpoint to announce. Its own Register will announce it.
@@ -251,6 +264,35 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 	return nil
 }
 
+// canRecover reports whether a heartbeat may bring deviceID back online.
+//
+// Being offline is not by itself evidence that the hub "gave up on a live
+// device". A device that deregistered on purpose (`hubfuse stop`) is offline
+// too, and a heartbeat still in flight when its Deregister lands must not
+// resurrect it: peers would be told to mount a daemon that has exited. The two
+// cases are distinguishable by the event subscription — MarkOffline leaves it
+// open (the device is still connected, just late), while Deregister and Leave
+// close it before touching the status, and a draining hub refuses recovery
+// outright. (#69)
+func (r *Registry) canRecover(deviceID string) bool {
+	if r.draining.Load() {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, subscribed := r.subscribers[deviceID]
+	return subscribed
+}
+
+// Drain stops heartbeat-driven recovery for the rest of this hub's life. Hub
+// shutdown marks every online device offline and then waits for in-flight RPCs
+// to finish; without this, a heartbeat processed inside that window would flip
+// a device back to online and leave a phantom-online row behind for the next
+// hub start to serve to its peers. (#69)
+func (r *Registry) Drain() {
+	r.draining.Store(true)
+}
+
 // deviceErr translates the store's own not-found sentinel into the
 // protocol-level error the RPC layer speaks, and passes everything else
 // through. It exists so the data layer can keep its errors free of gRPC
@@ -288,11 +330,19 @@ func (r *Registry) UpdateShares(ctx context.Context, deviceID string, shares []*
 func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {
-		return err
+		return deviceErr(err)
 	}
 
+	// Close the subscription BEFORE writing the status. A heartbeat from this
+	// device may still be in flight, and canRecover treats an open subscription
+	// as "the device is connected, the hub merely lost patience". Closing first
+	// means such a heartbeat either arrives while the device is still online (a
+	// no-op) or finds no subscription to vouch for it — either way it cannot
+	// resurrect a device that deliberately went away. (#69)
+	r.removeSubscriber(deviceID)
+
 	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOffline, device.LastIP, device.SSHPort); err != nil {
-		return err
+		return deviceErr(err)
 	}
 
 	event := &pb.Event{
@@ -304,13 +354,6 @@ func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 		},
 	}
 	r.Broadcast(event, deviceID)
-
-	r.mu.Lock()
-	if ch, ok := r.subscribers[deviceID]; ok {
-		delete(r.subscribers, deviceID)
-		close(ch)
-	}
-	r.mu.Unlock()
 
 	return nil
 }

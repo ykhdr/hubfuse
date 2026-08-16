@@ -157,6 +157,13 @@ func (h *Hub) Start(ctx context.Context) error {
 func (h *Hub) Stop() error {
 	ctx := context.Background()
 
+	// Refuse heartbeat-driven recovery from here on. The sweep below marks every
+	// online device offline while the gRPC server is still answering, so without
+	// this a heartbeat processed inside that window would flip a device back to
+	// online and leave a phantom-online row for the next hub start to serve to
+	// its peers. (#69)
+	h.registry.Drain()
+
 	online, err := h.store.ListOnlineDevices(ctx)
 	if err != nil {
 		h.logger.Warn("stop: list online devices", slog.Any("error", err))

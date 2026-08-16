@@ -613,10 +613,25 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 			return stream
 		}
 
-		d.logger.Warn("hub session reconnect failed, retrying",
-			"error", err,
-			"backoff", delay,
-		)
+		// Separate "the hub is unreachable" from "the hub answered and said no".
+		// The latter is usually not something retrying can fix — a pruned or
+		// removed device needs `hubfuse join`, and the hub's own message says
+		// so — and burying that instruction in a warn loop that repeats every
+		// few minutes forever is how the failure stayed invisible in the first
+		// place. Retrying continues either way: some refusals (a hub-side store
+		// error) really are transient, and the daemon cannot tell which from a
+		// human-readable reason. (#69)
+		if errors.Is(err, ErrHubRejected) {
+			d.logger.Error("hub refused this device's session; retrying, but this likely needs operator action",
+				"error", err,
+				"backoff", delay,
+			)
+		} else {
+			d.logger.Warn("hub session reconnect failed, retrying",
+				"error", err,
+				"backoff", delay,
+			)
+		}
 
 		select {
 		case <-ctx.Done():
