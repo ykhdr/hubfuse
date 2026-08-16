@@ -255,19 +255,18 @@ const guardMode os.FileMode = 0o500
 // probeEntry tracks a single in-flight health probe. It is scoped to a
 // mountKey + generation (the *Mount pointer): a probe that completes after
 // the mount was replaced is discarded. (#67 single-flight)
+//
+// done is the broadcast channel: the probe owner writes health and then closes
+// done exactly once. Closing (rather than sending) is what makes the result
+// readable by an UNBOUNDED number of joiners — a send on a buffered channel
+// would be drained by whichever joiner received first, wedging the rest
+// forever. The close/receive pair also establishes the happens-before edge
+// that makes the health read race-free.
 type probeEntry struct {
-	mount  *Mount       // the generation this probe is bound to
-	result chan probeResult // buffered(1), written exactly once before close
+	mount  *Mount        // the generation this probe is bound to
+	done   chan struct{} // closed exactly once, after health is written
+	health mountHealth   // written before close(done); immutable afterwards
 }
-
-// probeResult carries the outcome of a health probe.
-type probeResult struct {
-	health mountHealth
-}
-
-// probeKey is the identifier for a probe — the mountKey only, because
-// generation is checked by pointer identity after the probe returns.
-type probeKey mountKey
 
 // mountableMode is applied to the mount point immediately before invoking the
 // mount backend. fusermount3 (Linux) refuses to mount onto a directory the user
@@ -694,19 +693,29 @@ func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *
 		probe := existing
 		m.probeMu.Unlock()
 		m.mu.Unlock()
-		r := <-probe.result
+		// Wait for the owner's broadcast, but never outlive our own ctx:
+		// a caller with a short deadline must not be pinned to the owner's
+		// (up to mountProbeTimeout) probe. Both paths re-acquire m.mu
+		// because the caller holds it across this call.
+		select {
+		case <-ctx.Done():
+			m.mu.Lock()
+			return mountHealthUnknown
+		case <-probe.done:
+		}
+		health := probe.health // safe: written before close(done)
 		m.mu.Lock()
 		// Re-check generation: the mount may have been replaced while
 		// we were waiting.
 		if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
 			return mountHealthUnknown
 		}
-		return r.health
+		return health
 	}
 	// Start a new probe for this key+generation.
 	entry := &probeEntry{
-		mount:  mnt,
-		result: make(chan probeResult, 1),
+		mount: mnt,
+		done:  make(chan struct{}),
 	}
 	m.probes[key] = entry
 	m.probeMu.Unlock()
@@ -715,13 +724,18 @@ func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *
 	m.mu.Unlock()
 
 	// Run the probe. Use the caller's ctx so the probe respects the
-	// caller's deadline/cancellation, capped at mountProbeTimeout.
+	// caller's deadline/cancellation, capped at mountProbeTimeout. If the
+	// OWNER's ctx dies early, joiners observe the resulting unknown — which
+	// is conservative (unknown never tears a mount down) and bounds every
+	// joiner's wait by mountProbeTimeout even when the joiner passed a ctx
+	// without a deadline.
 	pctx, pcancel := context.WithTimeout(ctx, mountProbeTimeout)
 	defer pcancel()
 	health := m.probeHealth(pctx, mnt.LocalPath)
 
-	// Store the result (non-blocking, channel is buffered(1)).
-	entry.result <- probeResult{health: health}
+	// Publish the result to every joiner: write before close, never send.
+	entry.health = health
+	close(entry.done)
 
 	// Re-acquire m.mu to re-check generation.
 	m.mu.Lock()

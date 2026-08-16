@@ -2047,17 +2047,24 @@ func TestProbeGenerationLocked_SingleFlightJoin(t *testing.T) {
 	// Install a checkMountpoint that blocks until released, and counts calls.
 	checkStarted := make(chan struct{})
 	releaseCheck := make(chan struct{})
+	var startOnce sync.Once
 	var checkCalls atomic.Int32
 	m.SetMountpointCheckForTests(func(string) (bool, error) {
 		checkCalls.Add(1)
-		close(checkStarted) // signal that the probe has started
-		<-releaseCheck      // block until released
+		// sync.Once, not a bare close: if single-flight ever regresses and a
+		// second probe starts, the test must fail on the call-count assertion
+		// below rather than panic on a double close.
+		startOnce.Do(func() { close(checkStarted) })
+		<-releaseCheck // block until released
 		return true, nil
 	})
 
-	// Launch 2 concurrent callers (initiator + 1 joiner is the currently
-	// supported configuration with the buffered(1) result channel).
-	const numCallers = 2
+	// Launch one initiator plus SEVERAL joiners. The count is deliberately >2:
+	// the result is broadcast by closing probeEntry.done, so an unbounded
+	// number of joiners observes it. An earlier implementation sent the result
+	// on a buffered(1) channel, where the first joiner drained the buffer and
+	// every subsequent joiner blocked forever — this test caps at 2 no longer.
+	const numCallers = 5
 	errs := make([]error, numCallers)
 	done := make(chan struct{})
 	go func() {
@@ -2076,7 +2083,7 @@ func TestProbeGenerationLocked_SingleFlightJoin(t *testing.T) {
 	// Wait for the probe to start (checkMountpoint called once).
 	<-checkStarted
 
-	// Give the joiner time to reach the <-probe.result wait.
+	// Give the joiners time to reach the <-probe.done wait.
 	time.Sleep(50 * time.Millisecond)
 
 	// Exactly one checkMountpoint call so far.
@@ -2085,8 +2092,14 @@ func TestProbeGenerationLocked_SingleFlightJoin(t *testing.T) {
 	// Release the probe.
 	close(releaseCheck)
 
-	// Wait for all callers to complete.
-	<-done
+	// Wait for all callers to complete. Bounded: a joiner that never observes
+	// the broadcast would otherwise hang the package until the test binary's
+	// global timeout, hiding which test wedged.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("joiners did not observe the probe result — single-flight broadcast is wedged")
+	}
 
 	// All callers must return nil (healthy probe → no-op).
 	for i, err := range errs {
@@ -2104,6 +2117,70 @@ func TestProbeGenerationLocked_SingleFlightJoin(t *testing.T) {
 	mounts := m.ActiveMounts()
 	require.Len(t, mounts, 1, "the original mount must be retained")
 	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+}
+
+// TestProbeGenerationLocked_JoinerHonoursOwnContext verifies that a caller that
+// JOINS an in-flight probe is bounded by its own ctx rather than by the probe
+// owner's. A joiner that ignored ctx.Done() would stay pinned to the owner for
+// up to mountProbeTimeout, blowing past its own deadline. The cancelled joiner
+// must return unknown — which Mount treats as a no-op, never a teardown.
+// (#67 single-flight)
+func TestProbeGenerationLocked_JoinerHonoursOwnContext(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	checkStarted := make(chan struct{})
+	releaseCheck := make(chan struct{})
+	var startOnce sync.Once
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		startOnce.Do(func() { close(checkStarted) })
+		<-releaseCheck
+		return true, nil
+	})
+
+	// Owner: blocks inside the probe until releaseCheck is closed.
+	ownerDone := make(chan struct{})
+	go func() {
+		defer close(ownerDone)
+		_ = m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	}()
+	<-checkStarted
+	time.Sleep(50 * time.Millisecond) // let the owner settle inside the probe
+
+	// Joiner: same key/generation, but its ctx expires almost immediately.
+	jctx, jcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer jcancel()
+	start := time.Now()
+	err := m.Mount(jctx, mc, "device-a", "10.0.0.1", 2222)
+	elapsed := time.Since(start)
+
+	assert.NoError(t, err, "a cancelled joiner yields unknown, which Mount treats as a no-op")
+	assert.Less(t, elapsed, 2*time.Second,
+		"joiner must return on its own ctx deadline, not wait out the owner's probe")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "unknown health must never tear a mount down")
+
+	// The mount is untouched, and the owner still completes cleanly.
+	require.Len(t, m.ActiveMounts(), 1, "the original mount must be retained")
+
+	close(releaseCheck)
+	select {
+	case <-ownerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("probe owner did not finish after release")
+	}
 }
 
 // ─── Test 3: probeGenerationLocked stale-generation safety ────────────────────
