@@ -1610,6 +1610,206 @@ func TestReconnectSession_LogsHubRefusalLoudly(t *testing.T) {
 	assert.Contains(t, logged, "not registered on the hub", "the hub's own instruction must reach the log")
 }
 
+// failHeartbeatUntilSessionDrops reports the number of consecutive failures
+// that ends a session, driving the production trigger rather than a test-only
+// shortcut.
+func failHeartbeatUntilSessionDrops(d *Daemon) {
+	for i := 0; i < maxHeartbeatFailures; i++ {
+		d.noteHeartbeatFailure()
+	}
+}
+
+// TestSessionOnce_BoundsRegister — a connection that is dead but not closed
+// swallows a Register whole. Without a deadline the reconnect attempt blocks
+// there forever and the supervisor's backoff never runs, so the daemon looks
+// like it is retrying when it is not. (#72)
+func TestSessionOnce_BoundsRegister(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var hadDeadline bool
+	var budget time.Duration
+	d.registerFn = func(ctx context.Context, _ []*pb.Share, _ int) (*pb.RegisterResponse, error) {
+		deadline, ok := ctx.Deadline()
+		hadDeadline = ok
+		budget = time.Until(deadline)
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := d.sessionOnce(ctx)
+	require.NoError(t, err, "sessionOnce")
+
+	require.True(t, hadDeadline, "the registration must be bounded")
+	assert.Positive(t, budget)
+	assert.LessOrEqual(t, budget, registerTimeout)
+}
+
+// TestSessionOnce_SubscribeGetsTheSessionContext — the event stream must run on
+// the session's own context, because cancelling it is how the daemon ends a
+// session it has decided is dead. If Subscribe kept the
+// daemon-lifetime context, nothing short of shutdown could end the session.
+func TestSessionOnce_SubscribeGetsTheSessionContext(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var subCtx context.Context
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+		subCtx = ctx
+		return errStream(), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := d.sessionOnce(ctx)
+	require.NoError(t, err, "sessionOnce")
+	require.NotNil(t, subCtx, "Subscribe must have been called")
+	require.NoError(t, subCtx.Err(), "the stream context starts live")
+
+	failHeartbeatUntilSessionDrops(d)
+
+	assert.Error(t, subCtx.Err(), "ending the session must cancel the stream it runs on")
+	assert.NoError(t, ctx.Err(), "the daemon context must be untouched")
+}
+
+// TestSessionOnce_FailuresBeforeTheStreamCannotKillTheFirstSession — the first
+// session has no supervisor behind it: if a heartbeat failure could cancel the
+// context Subscribe is about to use, sessionOnce would fail, Run would return,
+// and the daemon would exit for good instead of retrying. Failures that land
+// before the stream exists therefore have nothing to cancel, and the session
+// that follows starts clean. (#72)
+func TestSessionOnce_FailuresBeforeTheStreamCannotKillTheFirstSession(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Everything a blocked registration path could accumulate before the
+	// stream exists — the mount reconciliation can take minutes.
+	failHeartbeatUntilSessionDrops(d)
+	failHeartbeatUntilSessionDrops(d)
+
+	var subCtx context.Context
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
+		subCtx = ctx
+		return errStream(), nil
+	}
+
+	stream, err := d.sessionOnce(ctx)
+	require.NoError(t, err, "the first session must survive failures that predate it")
+	require.NotNil(t, stream)
+	require.NoError(t, subCtx.Err(), "the stream must not start already cancelled")
+
+	d.sessionMu.Lock()
+	fails := d.heartbeatFails
+	d.sessionMu.Unlock()
+	assert.Zero(t, fails, "the new session starts with a clean failure count")
+}
+
+// TestRunHeartbeat_DropsSessionAfterConsecutiveFailures — gRPC keepalive covers
+// a transport nobody answers, but a hub that answers PINGs while its RPCs go
+// nowhere looks healthy to it. The heartbeat is the only call on a fixed
+// cadence, so it has to be the one that gives up on the session. (#72)
+func TestRunHeartbeat_DropsSessionAfterConsecutiveFailures(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sessionCtx := d.newSessionCtx(ctx)
+
+	var calls atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		calls.Add(1)
+		return errors.New("hub is not answering")
+	}
+
+	go d.runHeartbeat(ctx)
+
+	select {
+	case <-sessionCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session was never dropped despite continuous heartbeat failures")
+	}
+
+	assert.GreaterOrEqual(t, calls.Load(), int32(maxHeartbeatFailures),
+		"the session must survive fewer failures than the threshold")
+	assert.NoError(t, ctx.Err(), "dropping a session must not cancel the daemon")
+}
+
+// TestRunHeartbeat_SuccessResetsFailureCount — a hub that drops the occasional
+// beat is not a dead session; only an unbroken run of failures is.
+func TestRunHeartbeat_SuccessResetsFailureCount(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sessionCtx := d.newSessionCtx(ctx)
+
+	var calls atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		// Fail twice, succeed, repeat — never maxHeartbeatFailures in a row.
+		if calls.Add(1)%3 == 0 {
+			return nil
+		}
+		return errors.New("transient")
+	}
+
+	go d.runHeartbeat(ctx)
+
+	select {
+	case <-sessionCtx.Done():
+		t.Fatal("an interrupted run of failures must not end the session")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	assert.Greater(t, calls.Load(), int32(maxHeartbeatFailures),
+		"the test must have run long enough to trip a counter that never resets")
+}
+
+// TestNewSessionCtx_CancelsPreviousAndClearsFailures — the supervisor starts a
+// new session on every reconnect; the old context must not be left dangling,
+// and the failures that ended the old session must not immediately end the new
+// one.
+func TestNewSessionCtx_CancelsPreviousAndClearsFailures(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := d.newSessionCtx(ctx)
+	d.sessionMu.Lock()
+	d.heartbeatFails = maxHeartbeatFailures - 1
+	d.sessionMu.Unlock()
+
+	second := d.newSessionCtx(ctx)
+
+	assert.Error(t, first.Err(), "the previous session context must be cancelled")
+	assert.NoError(t, second.Err(), "the new session context must be live")
+	d.sessionMu.Lock()
+	fails := d.heartbeatFails
+	d.sessionMu.Unlock()
+	assert.Zero(t, fails, "a new session starts with a clean failure count")
+
+	// Ending a session is safe to repeat, including when none is live.
+	failHeartbeatUntilSessionDrops(d)
+	assert.Error(t, second.Err(), "the current session must be cancelled")
+	failHeartbeatUntilSessionDrops(d)
+}
+
 func TestHeartbeatIntervalFromEnv(t *testing.T) {
 	const def = 10 * time.Second
 

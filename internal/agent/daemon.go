@@ -73,6 +73,18 @@ type Daemon struct {
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
 
+	// sessionCancel ends the current hub session's event stream and
+	// heartbeatFails counts the consecutive heartbeat failures that decide to
+	// call it. Both live under sessionMu, and deliberately so: counting and
+	// cancelling have to be one atomic step, or a failure evaluated against a
+	// session that has already died would cancel the healthy session that
+	// replaced it in between. sessionOnce installs the cancel and clears the
+	// count under the same lock, so a new session is never dropped by the
+	// failures that ended the last one. (#72)
+	sessionMu      sync.Mutex
+	sessionCancel  context.CancelFunc
+	heartbeatFails int
+
 	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
 	// it on the first successful Register and runServices asks again as a
 	// safety net, but exactly one goroutine may exist for the daemon's
@@ -533,8 +545,16 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	cfg := d.config
 	d.mu.RUnlock()
 
+	// Bound the registration. It is the other call on the critical path that a
+	// dead-but-unclosed connection can swallow whole: without a deadline a
+	// reconnect attempt blocks here forever and the supervisor's backoff never
+	// gets to run, so the daemon looks like it is retrying when it is not.
+	// Twenty seconds is far beyond what a few SQLite queries need and still
+	// inside the hub's own liveness timeout. (#72)
+	regCtx, cancelReg := context.WithTimeout(ctx, registerTimeout)
 	shares := configSharesToProto(cfg.Shares)
-	regResp, err := d.registerFn(ctx, shares, d.sshPort)
+	regResp, err := d.registerFn(regCtx, shares, d.sshPort)
+	cancelReg()
 	if err != nil {
 		return nil, fmt.Errorf("register with hub: %w", err)
 	}
@@ -563,12 +583,99 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 
 	d.processInitialDevices(regResp.DevicesOnline)
 
-	stream, err := d.subscribeFn(ctx)
+	// The event stream runs on a context of its own so the daemon can end this
+	// session deliberately — see noteHeartbeatFailure. Cancelling it makes Recv
+	// fail, which is the one signal supervise already acts on.
+	//
+	// It is created HERE, and not earlier, on purpose. The first session has no
+	// supervisor behind it: a cancellation during the blocking work above would
+	// make this Subscribe fail with context.Canceled, and Run would return —
+	// exiting the process instead of retrying. Heartbeat failures before this
+	// point find no session to end, which noteHeartbeatFailure logs. (#72)
+	sessionCtx := d.newSessionCtx(ctx)
+
+	stream, err := d.subscribeFn(sessionCtx)
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
 
 	return stream, nil
+}
+
+// registerTimeout bounds the Register RPC of a session setup. See sessionOnce.
+const registerTimeout = 20 * time.Second
+
+// maxHeartbeatFailures is how many consecutive heartbeat failures end the hub
+// session. Three of them span the hub's own 30s liveness timeout
+// (hub.DefaultHeartbeatTimeout at the default 10s cadence): by then the hub has
+// stopped counting this device as online anyway, so there is nothing left to
+// preserve and everything to gain from a fresh session. (#72)
+const maxHeartbeatFailures = 3
+
+// newSessionCtx derives a cancellable context for the session about to start,
+// cancels the previous one, and clears the heartbeat failure count so a fresh
+// session never inherits the failures that ended the last.
+func (d *Daemon) newSessionCtx(parent context.Context) context.Context {
+	sessionCtx, cancel := context.WithCancel(parent)
+
+	d.sessionMu.Lock()
+	prev := d.sessionCancel
+	d.sessionCancel = cancel
+	d.heartbeatFails = 0
+	d.sessionMu.Unlock()
+
+	if prev != nil {
+		prev()
+	}
+
+	return sessionCtx
+}
+
+// noteHeartbeatFailure records one failed heartbeat and ends the session once
+// maxHeartbeatFailures of them have happened in a row. It is the
+// application-level counterpart to gRPC keepalive: keepalive notices a
+// transport nobody answers, while a hub that answers at the transport level and
+// not at the application one is invisible to it — the pings are served by the
+// HTTP/2 layer either way, so only a real RPC can tell. Ending the session
+// makes the supervisor re-register, which recovers a stale session; a hub whose
+// transport is healthy while its RPCs go nowhere keeps failing, visibly, in
+// that retry loop rather than silently.
+//
+// Counting and cancelling happen in one critical section on purpose. Split
+// apart, a goroutine that decided to drop the session could be overtaken by the
+// supervisor establishing a new one and cancel that instead — a healthy session
+// killed by the failures of a dead one. Because sessionOnce clears the count
+// under the same lock, the worst outcome now is cancelling an already-dead
+// session, which is a no-op. (#72)
+func (d *Daemon) noteHeartbeatFailure() {
+	d.sessionMu.Lock()
+	d.heartbeatFails++
+	if d.heartbeatFails < maxHeartbeatFailures {
+		d.sessionMu.Unlock()
+		return
+	}
+	d.heartbeatFails = 0
+	cancel := d.sessionCancel
+	d.sessionCancel = nil
+	d.sessionMu.Unlock()
+
+	if cancel == nil {
+		// No session to end: the failures happened between sessions, and the
+		// supervisor is already trying to establish one.
+		d.logger.Debug("heartbeats failing with no live hub session; the supervisor is reconnecting")
+		return
+	}
+	d.logger.Warn("ending hub session; the supervisor will establish a new one",
+		"reason", fmt.Sprintf("%d consecutive heartbeat failures", maxHeartbeatFailures))
+	cancel()
+}
+
+// clearHeartbeatFailures forgets the running failure count after a heartbeat
+// the hub answered.
+func (d *Daemon) clearHeartbeatFailures() {
+	d.sessionMu.Lock()
+	d.heartbeatFails = 0
+	d.sessionMu.Unlock()
 }
 
 // readStream consumes events from the hub subscription until Recv returns an
