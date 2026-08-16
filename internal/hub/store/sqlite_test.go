@@ -53,6 +53,7 @@ func TestGetDevice_NotFound(t *testing.T) {
 
 	_, err := s.GetDevice(ctx, "nonexistent")
 	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound, "a missing device must be distinguishable from a real query failure")
 }
 
 func TestCreateDevice_DuplicateNickname(t *testing.T) {
@@ -92,6 +93,7 @@ func TestGetDeviceByNickname_NotFound(t *testing.T) {
 
 	_, err := s.GetDeviceByNickname(ctx, "nobody")
 	assert.Error(t, err, "expected error for nonexistent nickname")
+	assert.ErrorIs(t, err, ErrNotFound, "a missing nickname must be distinguishable from a real query failure")
 }
 
 func TestListOnlineDevices(t *testing.T) {
@@ -163,6 +165,35 @@ func TestUpdateHeartbeat(t *testing.T) {
 	require.NoError(t, err, "GetDevice")
 	assert.False(t, got.LastHeartbeat.Before(before) || got.LastHeartbeat.After(after),
 		"LastHeartbeat %v not in expected range [%v, %v]", got.LastHeartbeat, before, after)
+}
+
+// TestUpdateHeartbeat_UnknownDevice pins the #69 fix: an UPDATE that matches no
+// row is not an SQL error, so without the RowsAffected check the hub would
+// answer Heartbeat with Success=true for a device it had already pruned — and
+// the agent would keep believing it was registered.
+func TestUpdateHeartbeat_UnknownDevice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	err := s.UpdateHeartbeat(ctx, "never-existed")
+	require.Error(t, err, "heartbeat for an unknown device must fail")
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestUpdateHeartbeat_AfterDelete covers the actual issue #69 sequence: the
+// device existed, was pruned, and its old identity keeps heartbeating.
+func TestUpdateHeartbeat_AfterDelete(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateHeartbeat(ctx, "dev-1"), "heartbeat while the device exists")
+
+	require.NoError(t, s.DeleteDevice(ctx, "dev-1"), "DeleteDevice")
+
+	err := s.UpdateHeartbeat(ctx, "dev-1")
+	require.Error(t, err, "heartbeat after prune must fail")
+	assert.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestGetStaleDevices(t *testing.T) {

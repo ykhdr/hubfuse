@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -135,7 +136,7 @@ func (s *sqliteStore) GetDevice(ctx context.Context, deviceID string) (*Device, 
 	row := s.db.QueryRowContext(ctx, q, deviceID)
 	d, err := scanDevice(row)
 	if err != nil {
-		return nil, fmt.Errorf("get device %q: %w", deviceID, err)
+		return nil, fmt.Errorf("get device %q: %w", deviceID, notFoundOrErr(err))
 	}
 	return d, nil
 }
@@ -148,7 +149,7 @@ func (s *sqliteStore) GetDeviceByNickname(ctx context.Context, nickname string) 
 	row := s.db.QueryRowContext(ctx, q, nickname)
 	d, err := scanDevice(row)
 	if err != nil {
-		return nil, fmt.Errorf("get device by nickname %q: %w", nickname, err)
+		return nil, fmt.Errorf("get device by nickname %q: %w", nickname, notFoundOrErr(err))
 	}
 	return d, nil
 }
@@ -200,11 +201,23 @@ func (s *sqliteStore) UpdateDeviceNickname(ctx context.Context, deviceID string,
 }
 
 // UpdateHeartbeat records the current UTC time as the last_heartbeat for a device.
+// A device row that no longer exists (pruned, or removed by `hubfuse leave`)
+// yields ErrNotFound rather than a silent success: an UPDATE that matches no row
+// is not an error for SQLite, so without the RowsAffected check a pruned device's
+// heartbeat would be reported as accepted and the agent would keep believing the
+// hub knows it. (#69)
 func (s *sqliteStore) UpdateHeartbeat(ctx context.Context, deviceID string) error {
 	const q = `UPDATE devices SET last_heartbeat = ? WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, time.Now().UTC(), deviceID)
+	res, err := s.db.ExecContext(ctx, q, time.Now().UTC(), deviceID)
 	if err != nil {
 		return fmt.Errorf("update heartbeat for device %q: %w", deviceID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update heartbeat for device %q: rows affected: %w", deviceID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("update heartbeat for device %q: %w", deviceID, ErrNotFound)
 	}
 	return nil
 }
@@ -617,6 +630,17 @@ func scanDevice(row rowScanner) (*Device, error) {
 	}
 	d.LastHeartbeat = t
 	return &d, nil
+}
+
+// notFoundOrErr maps the driver's "no such row" signal to the package's own
+// ErrNotFound sentinel and passes every other error through untouched. Callers
+// wrap the result with their own context, so errors.Is(err, ErrNotFound) works
+// across the wrapping while the SQL detail stays inside this package. (#69)
+func notFoundOrErr(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
 }
 
 // scanDevices iterates over rows and scans each into a Device.

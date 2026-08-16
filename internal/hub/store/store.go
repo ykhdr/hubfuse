@@ -2,8 +2,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotFound is returned (wrapped) by operations that address a row which does
+// not exist. It is the store layer's own sentinel deliberately: this package is
+// the data layer and must not depend on the protocol-level errors in
+// internal/common. Callers that need a gRPC status translate it — see
+// Registry.deviceErr. (#69)
+var ErrNotFound = errors.New("not found")
 
 // Store defines the data access operations for the hub database.
 type Store interface {
@@ -14,11 +22,12 @@ type Store interface {
 	CreateDevice(ctx context.Context, d *Device) error
 
 	// GetDevice retrieves a device by its device_id. Returns nil and an error
-	// if no matching device exists.
+	// wrapping ErrNotFound if no matching device exists.
 	GetDevice(ctx context.Context, deviceID string) (*Device, error)
 
 	// GetDeviceByNickname retrieves a device by its human-readable nickname.
-	// Returns nil and an error if no matching device exists.
+	// Returns nil and an error wrapping ErrNotFound if no matching device
+	// exists.
 	GetDeviceByNickname(ctx context.Context, nickname string) (*Device, error)
 
 	// ListOnlineDevices returns all devices whose status is "online".
@@ -33,7 +42,9 @@ type Store interface {
 	// UpdateDeviceNickname changes the nickname of a device.
 	UpdateDeviceNickname(ctx context.Context, deviceID string, nickname string) error
 
-	// UpdateHeartbeat records the current time as the last_heartbeat for a device.
+	// UpdateHeartbeat records the current time as the last_heartbeat for a
+	// device. Returns an error wrapping ErrNotFound when no such device row
+	// exists, so a heartbeat from a pruned identity cannot pass as accepted.
 	UpdateHeartbeat(ctx context.Context, deviceID string) error
 
 	// GetStaleDevices returns devices whose status is "online" and whose
