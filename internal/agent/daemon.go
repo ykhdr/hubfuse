@@ -562,13 +562,6 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
-	// The session exists from here on: the event stream will run on this
-	// context, and cancelling it is how the daemon ends a session it has
-	// decided is dead (dropSession). It is created BEFORE the heartbeat starts
-	// and before the mount reconciliation below, so a session that goes bad
-	// during either can still be ended rather than silently discarded. (#72)
-	sessionCtx := d.newSessionCtx(ctx)
-
 	// Liveness first, before anything that can block. processInitialDevices
 	// below mounts synchronously, and a single unreachable mount burns the full
 	// mount-verify window under the mounter lock — long enough for the hub to
@@ -589,6 +582,17 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	})
 
 	d.processInitialDevices(regResp.DevicesOnline)
+
+	// The event stream runs on a context of its own so the daemon can end this
+	// session deliberately — see noteHeartbeatFailure. Cancelling it makes Recv
+	// fail, which is the one signal supervise already acts on.
+	//
+	// It is created HERE, and not earlier, on purpose. The first session has no
+	// supervisor behind it: a cancellation during the blocking work above would
+	// make this Subscribe fail with context.Canceled, and Run would return —
+	// exiting the process instead of retrying. Heartbeat failures before this
+	// point find no session to end, which noteHeartbeatFailure logs. (#72)
+	sessionCtx := d.newSessionCtx(ctx)
 
 	stream, err := d.subscribeFn(sessionCtx)
 	if err != nil {
@@ -628,7 +632,14 @@ func (d *Daemon) newSessionCtx(parent context.Context) context.Context {
 }
 
 // noteHeartbeatFailure records one failed heartbeat and ends the session once
-// maxHeartbeatFailures of them have happened in a row.
+// maxHeartbeatFailures of them have happened in a row. It is the
+// application-level counterpart to gRPC keepalive: keepalive notices a
+// transport nobody answers, while a hub that answers at the transport level and
+// not at the application one is invisible to it — the pings are served by the
+// HTTP/2 layer either way, so only a real RPC can tell. Ending the session
+// makes the supervisor re-register, which recovers a stale session; a hub whose
+// transport is healthy while its RPCs go nowhere keeps failing, visibly, in
+// that retry loop rather than silently.
 //
 // Counting and cancelling happen in one critical section on purpose. Split
 // apart, a goroutine that decided to drop the session could be overtaken by the
@@ -665,25 +676,6 @@ func (d *Daemon) clearHeartbeatFailures() {
 	d.sessionMu.Lock()
 	d.heartbeatFails = 0
 	d.sessionMu.Unlock()
-}
-
-// dropSession ends the current hub session so the supervisor establishes a new
-// one. It is the application-level counterpart to gRPC keepalive: keepalive
-// notices a transport nobody is answering, while this notices a hub that
-// answers at the transport level and not at the application one — the pings are
-// served by the HTTP/2 layer either way, so only a real RPC can tell the
-// difference. Safe to call when no session is live. (#72)
-func (d *Daemon) dropSession(reason string) {
-	d.sessionMu.Lock()
-	cancel := d.sessionCancel
-	d.sessionCancel = nil
-	d.sessionMu.Unlock()
-
-	if cancel == nil {
-		return
-	}
-	d.logger.Warn("ending hub session; the supervisor will establish a new one", "reason", reason)
-	cancel()
 }
 
 // readStream consumes events from the hub subscription until Recv returns an
