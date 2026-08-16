@@ -18,6 +18,7 @@ var (
 	ErrNotAuthenticated     = status.Error(codes.Unauthenticated, "client certificate required")
 	ErrPairingAlreadyExists = status.Error(codes.AlreadyExists, "devices already paired")
 	ErrInvalidJoinToken     = status.Error(codes.PermissionDenied, "invalid join token")
+	ErrHubShuttingDown      = status.Error(codes.Unavailable, "hub is shutting down")
 	ErrJoinTokenExpired     = status.Error(codes.DeadlineExceeded, "join token expired")
 
 	// ErrJoinTokenMissingFingerprint is returned when a join token lacks the

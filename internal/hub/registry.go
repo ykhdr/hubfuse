@@ -99,6 +99,15 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
+	// A hub on its way out must not accept new online rows: the shutdown sweep
+	// has already run by the time an in-flight Register reaches this point, so
+	// the row would survive into the next hub start and be served to peers as
+	// an endpoint nobody is listening on. The agent retries with backoff and
+	// registers against the hub that comes back. (#69)
+	if r.draining.Load() {
+		return nil, common.ErrHubShuttingDown
+	}
+
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {
 		// A device whose row is gone (pruned, or removed by `leave`) must be
@@ -114,18 +123,19 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 
 	// Every write below is translated the same way as the read above: a prune
 	// can land between them, and the agent must get the actionable
-	// "device unknown, re-join" answer no matter which statement noticed.
+	// "device unknown, re-join" answer no matter which statement noticed — and
+	// whatever shape that statement's failure took (see writeErr).
 	storeShares := sharesFromProto(deviceID, shares)
 	if err := r.store.SetShares(ctx, deviceID, storeShares); err != nil {
-		return nil, deviceErr(err)
+		return nil, r.writeErr(ctx, deviceID, err)
 	}
 
 	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
-		return nil, deviceErr(err)
+		return nil, r.writeErr(ctx, deviceID, err)
 	}
 
 	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
-		return nil, deviceErr(err)
+		return nil, r.writeErr(ctx, deviceID, err)
 	}
 
 	current := &store.Device{
@@ -234,25 +244,12 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 		return err
 	}
 
-	recovered, err := r.recoverIfConnected(ctx, deviceID, ip)
-	if err != nil {
-		return err
-	}
-	if !recovered {
-		return nil
-	}
-
 	announcedIP := device.LastIP
 	if ip != "" {
 		announcedIP = ip
 	}
 
-	r.logger.Info("device recovered via heartbeat",
-		slog.String("device_id", deviceID),
-		slog.String("nickname", device.Nickname),
-		slog.String("ip", announcedIP))
-
-	r.Broadcast(&pb.Event{
+	recovered, err := r.recoverAndAnnounce(ctx, deviceID, ip, &pb.Event{
 		Payload: &pb.Event_DeviceOnline{
 			DeviceOnline: &pb.DeviceOnlineEvent{
 				DeviceId: device.DeviceID,
@@ -262,7 +259,20 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 				Shares:   sharesToProto(shares),
 			},
 		},
-	}, deviceID)
+	})
+	if err != nil {
+		return err
+	}
+	if !recovered {
+		return nil
+	}
+
+	// Logged outside the critical section: file I/O must not sit inside a lock
+	// that gates the event fanout.
+	r.logger.Info("device recovered via heartbeat",
+		slog.String("device_id", deviceID),
+		slog.String("nickname", device.Nickname),
+		slog.String("ip", announcedIP))
 
 	return nil
 }
@@ -279,7 +289,8 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 // outright. (#69)
 //
 // Callers must not act on this answer across a database round-trip: use
-// recoverIfConnected, which re-evaluates it atomically with the write.
+// recoverAndAnnounce, which re-evaluates it atomically with the write and the
+// announcement.
 func (r *Registry) canRecover(deviceID string) bool {
 	if r.draining.Load() {
 		return false
@@ -290,23 +301,25 @@ func (r *Registry) canRecover(deviceID string) bool {
 	return subscribed
 }
 
-// recoverIfConnected performs the promotion under the subscriber lock, with the
-// guard re-evaluated inside it, and reports whether the row changed.
+// recoverAndAnnounce evaluates the recovery guard, promotes the device, and
+// publishes event — all inside ONE critical section — and reports whether the
+// row changed.
 //
-// Checking canRecover and then writing a couple of round-trips later would be a
-// check-then-act: a Deregister completing in between (removeSubscriber, then
-// its own offline write) would be followed by our promotion, announcing a
-// daemon that has exited; a Drain in between would leave an online row behind
-// after the shutdown sweep had already passed the device by — a phantom that
-// survives into the next hub start rather than self-healing.
+// All three steps belong together. Checking canRecover and writing a couple of
+// round-trips later is a check-then-act: a Deregister completing in between
+// (removeSubscriber, then its own offline write) is followed by our promotion,
+// and a Drain in between leaves an online row behind after the shutdown sweep
+// has already passed the device by — a phantom that survives into the next hub
+// start rather than self-healing. Publishing outside the section is the same
+// mistake one level up: the row would end up correct while peers were left with
+// DeviceOffline followed by DeviceOnline, i.e. their last word on a departed
+// daemon is that it is up, and they would mount a dead endpoint.
 //
-// Holding the read lock across the write closes both: removeSubscriber (used by
-// Deregister and Leave) and Drain both take the WRITE lock, so they either
-// complete before the guard is read — and lose, leaving nothing to announce —
-// or wait for the promotion to finish and overwrite it immediately afterwards
-// (Deregister with its own offline write, Drain with the shutdown sweep that
-// runs after it returns). The lock is held only across one indexed UPDATE.
-func (r *Registry) recoverIfConnected(ctx context.Context, deviceID, ip string) (bool, error) {
+// removeSubscriber (used by Deregister and Leave) and Drain both take the WRITE
+// lock, so they either complete first — and this guard then refuses, leaving
+// nothing to announce — or wait, and their own DeviceOffline is published after
+// our DeviceOnline, which is the order peers must see. (#69)
+func (r *Registry) recoverAndAnnounce(ctx context.Context, deviceID, ip string, event *pb.Event) (bool, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -317,7 +330,13 @@ func (r *Registry) recoverIfConnected(ctx context.Context, deviceID, ip string) 
 		return false, nil
 	}
 
-	return r.store.MarkOnlineIfOffline(ctx, deviceID, ip)
+	recovered, err := r.store.MarkOnlineIfOffline(ctx, deviceID, ip)
+	if err != nil || !recovered {
+		return false, err
+	}
+
+	r.broadcastLocked(event, deviceID)
+	return true, nil
 }
 
 // Drain stops heartbeat-driven recovery for the rest of this hub's life. Hub
@@ -334,6 +353,22 @@ func (r *Registry) Drain() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.draining.Store(true)
+}
+
+// writeErr classifies a failed device-addressed write. A device pruned between
+// two statements of the same RPC does not always surface as ErrNotFound: with
+// foreign keys enabled, inserting shares for a deleted device fails as a
+// constraint violation instead. So when a write fails for any reason, ask
+// whether the row is still there before deciding what the caller is told —
+// one extra query, on an error path only. (#69)
+func (r *Registry) writeErr(ctx context.Context, deviceID string, err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return common.ErrDeviceNotFound
+	}
+	if _, getErr := r.store.GetDevice(ctx, deviceID); errors.Is(getErr, store.ErrNotFound) {
+		return common.ErrDeviceNotFound
+	}
+	return err
 }
 
 // deviceErr translates the store's own not-found sentinel into the
@@ -475,6 +510,14 @@ func (r *Registry) Broadcast(event *pb.Event, excludeDevice string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	r.broadcastLocked(event, excludeDevice)
+}
+
+// broadcastLocked is Broadcast's body for callers that already hold r.mu (read
+// or write). It exists so a caller can publish an event in the same critical
+// section that decided to publish it — see recoverAndAnnounce. Never call it
+// without the lock: the sends below race Subscribe's channel replacement.
+func (r *Registry) broadcastLocked(event *pb.Event, excludeDevice string) {
 	for deviceID, ch := range r.subscribers {
 		if deviceID == excludeDevice {
 			continue

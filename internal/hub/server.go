@@ -61,7 +61,7 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 		s.logger.Warn("register rejected",
 			slog.String("device_id", deviceID),
 			slog.Any("error", err))
-		return &pb.RegisterResponse{Success: false, Error: registerRejection(err)}, nil
+		return &pb.RegisterResponse{Success: false, Error: rejectionMessage(err)}, nil
 	}
 
 	ids := make([]string, 0, len(online))
@@ -91,16 +91,17 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 	}, nil
 }
 
-// registerRejection renders the reason a registration was refused, in terms the
-// operator can act on. The device-unknown case is the one that matters: the
-// device's row is gone (pruned after the retention window, or removed by
-// `hubfuse leave`), and nothing short of a fresh join will fix it — the agent
-// surfaces this text verbatim in its startup error. (#69)
+// rejectionMessage renders the reason an RPC was refused, in terms the operator
+// can act on. The device-unknown case is the one that matters: the device's row
+// is gone (pruned after the retention window, or removed by `hubfuse leave`),
+// and nothing short of a fresh join will fix it — the agent surfaces this text
+// verbatim in its startup error. Everything else keeps the underlying message.
+// (#69)
 //
 // The wording deliberately avoids the substring "device not found":
 // cmd/internal/clierrors collapses any message containing it into a bare
 // "device not found", which would swallow the instruction.
-func registerRejection(err error) string {
+func rejectionMessage(err error) string {
 	if errors.Is(err, common.ErrDeviceNotFound) {
 		return "this device is not registered on the hub — it was pruned or removed; " +
 			"re-join with 'hubfuse join <hub-address> --token <token>'"
@@ -116,7 +117,7 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	}
 
 	if err := s.registry.Rename(ctx, deviceID, req.NewNickname); err != nil {
-		return &pb.RenameResponse{Success: false, Error: err.Error()}, nil
+		return &pb.RenameResponse{Success: false, Error: rejectionMessage(err)}, nil
 	}
 
 	return &pb.RenameResponse{Success: true}, nil

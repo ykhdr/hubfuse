@@ -2,8 +2,10 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -401,6 +403,111 @@ func TestRegister_UnknownDevice(t *testing.T) {
 	_, err := r.Register(context.Background(), "never-joined", "10.0.0.1", 2222, nil, common.ProtocolVersion)
 	require.Error(t, err, "registration of an unknown device must fail")
 	assert.ErrorIs(t, err, common.ErrDeviceNotFound)
+}
+
+// TestHeartbeat_RecoveryAnnouncementIsNotOverridden — the row ending up
+// correct is not enough: peers act on the LAST event they saw. If a Deregister
+// could complete between the promotion and its announcement, peers would be
+// left with DeviceOffline followed by DeviceOnline for a daemon that has
+// exited, and would mount a dead endpoint. The recovery therefore publishes
+// inside the same critical section that decided to publish.
+func TestHeartbeat_RecoveryAnnouncementIsNotOverridden(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+
+	_, selfUnsub := r.Subscribe("dev-1")
+	defer selfUnsub()
+	watchCh, watchUnsub := r.Subscribe("dev-2")
+	defer watchUnsub()
+
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	demoted, err := r.MarkOffline(ctx, d1, time.Now().Add(time.Minute))
+	require.NoError(t, err, "MarkOffline")
+	require.True(t, demoted)
+	require.NotNil(t, (<-watchCh).GetDeviceOffline(), "demotion event")
+
+	// Heartbeat and Deregister race. Whatever the interleaving, the peer's last
+	// word about dev-1 must be "offline", matching the persisted row.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = r.Heartbeat(ctx, "dev-1", "10.0.0.1")
+	}()
+	go func() {
+		defer wg.Done()
+		_ = r.Deregister(ctx, "dev-1")
+	}()
+	wg.Wait()
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	require.Equal(t, store.StatusOffline, d.Status, "a deregistered device must end up offline")
+
+	last := ""
+	for {
+		select {
+		case event := <-watchCh:
+			switch {
+			case event.GetDeviceOnline() != nil:
+				last = "online"
+			case event.GetDeviceOffline() != nil:
+				last = "offline"
+			}
+			continue
+		case <-time.After(300 * time.Millisecond):
+		}
+		break
+	}
+	if last != "" {
+		assert.Equal(t, "offline", last,
+			"the peer's last event must agree with the persisted state, or it mounts a dead endpoint")
+	}
+}
+
+// TestRegister_RefusedWhileDraining — the shutdown sweep has already run by the
+// time an in-flight Register lands, so accepting it would leave an online row
+// for the next hub start to serve to peers.
+func TestRegister_RefusedWhileDraining(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	r.Drain()
+
+	_, err := r.Register(ctx, "dev-1", "10.0.0.1", 2222, nil, common.ProtocolVersion)
+	require.Error(t, err, "a draining hub must refuse registrations")
+	assert.ErrorIs(t, err, common.ErrHubShuttingDown)
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.NotEqual(t, store.StatusOnline, d.Status, "no online row may be written while draining")
+}
+
+// TestWriteErr_TranslatesAnyFailureForAVanishedDevice — a prune between two
+// statements of the same RPC does not always surface as ErrNotFound: with
+// foreign keys on, writing shares for a deleted device fails as a constraint
+// violation. The caller must still be told to re-join.
+func TestWriteErr_TranslatesAnyFailureForAVanishedDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+
+	// While the device exists, an unrelated failure stays itself.
+	other := errors.New("disk on fire")
+	assert.Equal(t, other, r.writeErr(ctx, "dev-1", other))
+
+	require.NoError(t, r.store.DeleteDevice(ctx, "dev-1"), "DeleteDevice")
+
+	assert.ErrorIs(t, r.writeErr(ctx, "dev-1", other), common.ErrDeviceNotFound,
+		"any write failure against a vanished device must become the actionable NotFound")
+	assert.ErrorIs(t, r.writeErr(ctx, "dev-1", store.ErrNotFound), common.ErrDeviceNotFound)
 }
 
 // TestRename_UnknownDevice — the rename path must speak the same language as

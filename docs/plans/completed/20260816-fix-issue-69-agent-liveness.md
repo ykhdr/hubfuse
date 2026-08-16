@@ -298,6 +298,22 @@
       уносит с собой штатное завершение
 - [x] формулировка про «ноль» в `resolveHeartbeatTimeout` (замечание Copilot)
 
+### Task 10: правки по итогам верификации блокировок (➕)
+
+- [x] анонс `DeviceOnline` перенесён внутрь критической секции (`recoverAndAnnounce` +
+      `broadcastLocked`): строка в БД оказывалась верной, но пир видел `Offline`, затем
+      `Online` для уже ушедшего демона — то есть монтировал мёртвый эндпоинт
+- [x] `Register` отказывает при `draining` (иначе регистрация, пришедшая после sweep'а
+      `Hub.Stop`, оставляет онлайн-строку до следующего старта хаба)
+- [x] `writeErr` — любая ошибка записи по исчезнувшему устройству транслируется в
+      `ErrDeviceNotFound` (замечание Copilot: при включённых FK `SetShares` падает
+      constraint-ошибкой, а не `ErrNotFound`)
+- [x] `Rename` использует общий `rejectionMessage`, как и `Register`
+- [x] `deregisterTimeout` 3s — 5s+5s съедали весь 10s дедлайн daemonize без запаса
+- [x] **блокер:** `go test ./internal/agent/... -race` падал из-за самого теста —
+      heartbeat-горутина писала в тот же `bytes.Buffer`, который читал тест; добавлен
+      `syncBuffer`, а heartbeat в тесте получил транспорт-заглушку
+
 ### Task 7: документация ✅
 
 - [x] `CLAUDE.md`: обновить описания `internal/agent/daemon.go` (порядок liveness),

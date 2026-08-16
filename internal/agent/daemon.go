@@ -992,9 +992,11 @@ func (d *Daemon) clearReconcileErr(key mountKey) {
 	delete(d.reconcileFails, key)
 }
 
-// deregisterTimeout bounds the shutdown Deregister RPC. It matches the unmount
-// budget below: both run inside the daemonize 10s SIGKILL deadline. (#69)
-const deregisterTimeout = 5 * time.Second
+// deregisterTimeout bounds the shutdown Deregister RPC. It is deliberately
+// smaller than the 5s unmount budget: both run inside daemonize's 10s SIGKILL
+// deadline, and the SSH server stop, watcher stop and client close still have
+// to fit after them. (#69)
+const deregisterTimeout = 3 * time.Second
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
 // server, stops the config watcher, and closes the hub client.

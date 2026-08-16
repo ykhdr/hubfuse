@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -1575,11 +1576,20 @@ func TestRunHeartbeat_BoundsEveryCall(t *testing.T) {
 func TestReconnectSession_LogsHubRefusalLoudly(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 
-	var buf bytes.Buffer
-	d.logger = captureLogger(&buf) // WARN and above
+	// A synchronised sink: sessionOnce starts the heartbeat goroutine, which
+	// logs through the same logger, so a plain bytes.Buffer would be written
+	// and read concurrently (a real -race failure).
+	buf := &syncBuffer{}
+	d.logger = captureLogger(buf) // WARN and above
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Give the heartbeat loop a transport so it does not log its own ERROR
+	// ("no heartbeat transport configured") into the buffer this test asserts
+	// on — the assertion must be satisfied by the refusal alone.
+	d.heartbeatInterval = time.Hour
+	d.heartbeatFn = func(context.Context) error { return nil }
 
 	var calls atomic.Int32
 	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
@@ -1665,10 +1675,30 @@ agent {
 
 // ─── preflightMountBinary ──────────────────────────────────────────────────────
 
-// captureLogger returns a logger that writes warnings (and above) into buf so a
-// test can assert on the emitted message.
-func captureLogger(buf *bytes.Buffer) *slog.Logger {
-	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+// captureLogger returns a logger that writes warnings (and above) into w so a
+// test can assert on the emitted message. Tests whose daemon starts background
+// goroutines must pass a syncBuffer, not a bare bytes.Buffer.
+func captureLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger written from several
+// goroutines while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestPreflightMountBinary_MissingBinaryWarnsButDoesNotAbort(t *testing.T) {
