@@ -992,6 +992,10 @@ func (d *Daemon) clearReconcileErr(key mountKey) {
 	delete(d.reconcileFails, key)
 }
 
+// deregisterTimeout bounds the shutdown Deregister RPC. It matches the unmount
+// budget below: both run inside the daemonize 10s SIGKILL deadline. (#69)
+const deregisterTimeout = 5 * time.Second
+
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
 // server, stops the config watcher, and closes the hub client.
 // UnmountAllForce runs under a 5s timeout so a wedged mount cannot prevent
@@ -1006,13 +1010,19 @@ func (d *Daemon) Shutdown() error {
 	}
 
 	if d.hubClient != nil {
+		// Bound the call like every other shutdown step: a Deregister on a
+		// half-open connection would otherwise hang past the daemonize SIGKILL
+		// deadline and take the clean shutdown with it. (#50 bounded, #69)
+		dctx, dcancel := context.WithTimeout(context.Background(), deregisterTimeout)
 		// A hub that REFUSES the deregistration (Success=false) has nothing left
 		// to deregister — the classic case is an identity the hub already pruned,
 		// which is exactly the #69 scenario. Nothing the daemon can do about it at
 		// exit time, and turning a clean shutdown into a failure would make
 		// `hubfuse stop` exit non-zero for a healthy stop. Transport errors still
 		// aggregate: those say the hub never heard us. (#69)
-		if err := d.hubClient.Deregister(context.Background()); err != nil {
+		err := d.hubClient.Deregister(dctx)
+		dcancel()
+		if err != nil {
 			if errors.Is(err, ErrHubRejected) {
 				d.logger.Warn("hub refused deregistration; shutting down anyway", "error", err)
 			} else {

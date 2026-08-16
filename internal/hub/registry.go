@@ -171,7 +171,9 @@ func (r *Registry) Rename(ctx context.Context, deviceID, newNickname string) err
 		return common.ErrNicknameTaken
 	}
 
-	return r.store.UpdateDeviceNickname(ctx, deviceID, newNickname)
+	// Translated like every other device-addressed write: a pruned row must
+	// reach the CLI as "device not found", not as a raw store string. (#69)
+	return deviceErr(r.store.UpdateDeviceNickname(ctx, deviceID, newNickname))
 }
 
 // Heartbeat records liveness for a device and, when the hub had already given
@@ -212,7 +214,8 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 	}
 	if !r.canRecover(deviceID) {
 		// Offline for a reason other than "the hub gave up on a live device".
-		// See canRecover.
+		// This is only the cheap early exit — recoverIfConnected re-checks the
+		// same guard atomically with the write. See canRecover.
 		return nil
 	}
 	if device.SSHPort == 0 {
@@ -231,7 +234,7 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 		return err
 	}
 
-	recovered, err := r.store.MarkOnlineIfOffline(ctx, deviceID, ip)
+	recovered, err := r.recoverIfConnected(ctx, deviceID, ip)
 	if err != nil {
 		return err
 	}
@@ -274,6 +277,9 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 // open (the device is still connected, just late), while Deregister and Leave
 // close it before touching the status, and a draining hub refuses recovery
 // outright. (#69)
+//
+// Callers must not act on this answer across a database round-trip: use
+// recoverIfConnected, which re-evaluates it atomically with the write.
 func (r *Registry) canRecover(deviceID string) bool {
 	if r.draining.Load() {
 		return false
@@ -284,12 +290,49 @@ func (r *Registry) canRecover(deviceID string) bool {
 	return subscribed
 }
 
+// recoverIfConnected performs the promotion under the subscriber lock, with the
+// guard re-evaluated inside it, and reports whether the row changed.
+//
+// Checking canRecover and then writing a couple of round-trips later would be a
+// check-then-act: a Deregister completing in between (removeSubscriber, then
+// its own offline write) would be followed by our promotion, announcing a
+// daemon that has exited; a Drain in between would leave an online row behind
+// after the shutdown sweep had already passed the device by — a phantom that
+// survives into the next hub start rather than self-healing.
+//
+// Holding the read lock across the write closes both: removeSubscriber (used by
+// Deregister and Leave) and Drain both take the WRITE lock, so they either
+// complete before the guard is read — and lose, leaving nothing to announce —
+// or wait for the promotion to finish and overwrite it immediately afterwards
+// (Deregister with its own offline write, Drain with the shutdown sweep that
+// runs after it returns). The lock is held only across one indexed UPDATE.
+func (r *Registry) recoverIfConnected(ctx context.Context, deviceID, ip string) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.draining.Load() {
+		return false, nil
+	}
+	if _, subscribed := r.subscribers[deviceID]; !subscribed {
+		return false, nil
+	}
+
+	return r.store.MarkOnlineIfOffline(ctx, deviceID, ip)
+}
+
 // Drain stops heartbeat-driven recovery for the rest of this hub's life. Hub
 // shutdown marks every online device offline and then waits for in-flight RPCs
 // to finish; without this, a heartbeat processed inside that window would flip
 // a device back to online and leave a phantom-online row behind for the next
-// hub start to serve to its peers. (#69)
+// hub start to serve to its peers.
+//
+// The flag is set under the WRITE lock so it cannot land inside
+// recoverIfConnected's guarded window: either it wins and every later heartbeat
+// is refused, or it waits for the in-flight promotion and the shutdown sweep
+// that follows demotes that device along with the rest. (#69)
 func (r *Registry) Drain() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.draining.Store(true)
 }
 
@@ -325,8 +368,11 @@ func (r *Registry) UpdateShares(ctx context.Context, deviceID string, shares []*
 	return nil
 }
 
-// Deregister marks a device as offline, broadcasts a DeviceOffline event, and
-// removes the device's event subscription.
+// Deregister removes the device's event subscription, marks it offline, and
+// broadcasts a DeviceOffline event — in that order. Closing the subscription
+// first is load-bearing, not cosmetic: it is what stops a heartbeat still in
+// flight from recovering a device that deliberately went away (see
+// recoverIfConnected). (#69)
 func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {

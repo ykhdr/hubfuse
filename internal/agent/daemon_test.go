@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -1532,6 +1533,71 @@ func TestSessionOnce_RejectedRegisterStartsNothing(t *testing.T) {
 
 	assert.Zero(t, readyCalls, "no PID file may be written for a registration the hub refused")
 	assert.Zero(t, beats.Load(), "no heartbeat loop may start for a registration the hub refused")
+}
+
+// TestRunHeartbeat_BoundsEveryCall — a heartbeat RPC on a half-open connection
+// can hang forever, and the loop drops ticks while it is blocked. Without a
+// per-call deadline the daemon would stop beating entirely and be demoted,
+// producing exactly the outcome this loop exists to prevent.
+func TestRunHeartbeat_BoundsEveryCall(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	deadlines := make(chan time.Duration, 4)
+	d.heartbeatInterval = 10 * time.Millisecond
+	d.heartbeatFn = func(callCtx context.Context) error {
+		deadline, ok := callCtx.Deadline()
+		require.True(t, ok, "every heartbeat call must carry its own deadline")
+		select {
+		case deadlines <- time.Until(deadline):
+		default:
+		}
+		return nil
+	}
+
+	go d.runHeartbeat(ctx)
+
+	select {
+	case budget := <-deadlines:
+		assert.Positive(t, budget, "the deadline must still be ahead of the call")
+		assert.LessOrEqual(t, budget, minHeartbeatRPCTimeout,
+			"a sub-second cadence must be floored at minHeartbeatRPCTimeout, not scaled beyond it")
+	case <-time.After(2 * time.Second):
+		t.Fatal("no heartbeat observed")
+	}
+}
+
+// TestReconnectSession_LogsHubRefusalLoudly — a hub that ANSWERS and says no
+// (pruned device) usually needs operator action, and its instruction must not
+// be buried in the same warn line as "the hub is unreachable, retrying".
+func TestReconnectSession_LogsHubRefusalLoudly(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var buf bytes.Buffer
+	d.logger = captureLogger(&buf) // WARN and above
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		if calls.Add(1) == 1 {
+			return nil, fmt.Errorf("%w: registration refused: this device is not registered on the hub", ErrHubRejected)
+		}
+		return &pb.RegisterResponse{}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	stream := d.reconnectSession(ctx)
+	require.NotNil(t, stream, "the retry must eventually succeed")
+
+	logged := buf.String()
+	assert.Contains(t, logged, "level=ERROR", "a refusal must be reported at Error, not buried at Warn")
+	assert.Contains(t, logged, "not registered on the hub", "the hub's own instruction must reach the log")
 }
 
 func TestHeartbeatIntervalFromEnv(t *testing.T) {

@@ -43,9 +43,9 @@ func resolveDeviceRetention(flagValue string, flagChanged bool, configPath strin
 // resolveDeviceRetention: an explicitly set flag wins, otherwise config.kdl,
 // otherwise the flag default.
 //
-// Zero means "use the hub default" (hub.DefaultHeartbeatTimeout); negative is
-// rejected outright, since a non-positive timeout would demote every device on
-// the first sweep. (#69)
+// Zero is accepted and means "use the hub default" (hub.DefaultHeartbeatTimeout
+// — NewHeartbeatMonitor substitutes it). A negative value is rejected outright:
+// it has no such meaning and would demote every device on the first sweep. (#69)
 func resolveHeartbeatTimeout(flagValue string, flagChanged bool, configPath string) (time.Duration, error) {
 	flagDuration, err := time.ParseDuration(flagValue)
 	if err != nil {

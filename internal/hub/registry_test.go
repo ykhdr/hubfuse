@@ -403,6 +403,17 @@ func TestRegister_UnknownDevice(t *testing.T) {
 	assert.ErrorIs(t, err, common.ErrDeviceNotFound)
 }
 
+// TestRename_UnknownDevice — the rename path must speak the same language as
+// Register and Heartbeat: a device whose row was pruned gets a NotFound the CLI
+// can render, not a raw store string. (#69)
+func TestRename_UnknownDevice(t *testing.T) {
+	r := newTestRegistry(t)
+
+	err := r.Rename(context.Background(), "never-joined", "ghost")
+	require.Error(t, err, "renaming an unknown device must fail")
+	assert.ErrorIs(t, err, common.ErrDeviceNotFound)
+}
+
 // TestMarkOffline_FreshHeartbeatKeepsDeviceOnline pins the registry half of the
 // sweep race: the monitor selected this device as stale, it heartbeated before
 // the demotion was written, and peers must NOT be told it went offline.
