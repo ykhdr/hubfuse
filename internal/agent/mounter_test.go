@@ -1912,93 +1912,93 @@ func TestGuardTarget_StubNoOp(t *testing.T) {
 // without detection. (MAJOR-1 from issue #67 review)
 func TestClassifyMountHealth(t *testing.T) {
 	tests := []struct {
-		name   string
-		isMnt  bool
-		err    error
-		want   mountHealth
+		name  string
+		isMnt bool
+		err   error
+		want  mountHealth
 	}{
 		// Healthy: positive evidence the mount is alive.
 		{
-			name:   "healthy: isMnt=true, no error",
-			isMnt:  true,
-			err:    nil,
-			want:   mountHealthHealthy,
+			name:  "healthy: isMnt=true, no error",
+			isMnt: true,
+			err:   nil,
+			want:  mountHealthHealthy,
 		},
 		// Dead: positive evidence the mount is gone.
 		{
-			name:   "dead: isMnt=false, no error",
-			isMnt:  false,
-			err:    nil,
-			want:   mountHealthDead,
+			name:  "dead: isMnt=false, no error",
+			isMnt: false,
+			err:   nil,
+			want:  mountHealthDead,
 		},
 		{
-			name:   "dead: ENOTCONN (dead FUSE transport)",
-			isMnt:  false,
-			err:    syscall.ENOTCONN,
-			want:   mountHealthDead,
+			name:  "dead: ENOTCONN (dead FUSE transport)",
+			isMnt: false,
+			err:   syscall.ENOTCONN,
+			want:  mountHealthDead,
 		},
 		{
-			name:   "dead: fs.ErrNotExist (wrapped ENOENT)",
-			isMnt:  false,
-			err:    fs.ErrNotExist,
-			want:   mountHealthDead,
+			name:  "dead: fs.ErrNotExist (wrapped ENOENT)",
+			isMnt: false,
+			err:   fs.ErrNotExist,
+			want:  mountHealthDead,
 		},
 		{
-			name:   "dead: os.ErrNotExist (os.IsNotExist path)",
-			isMnt:  false,
-			err:    os.ErrNotExist,
-			want:   mountHealthDead,
+			name:  "dead: os.ErrNotExist (os.IsNotExist path)",
+			isMnt: false,
+			err:   os.ErrNotExist,
+			want:  mountHealthDead,
 		},
 		{
-			name:   "dead: syscall.ENOENT (raw syscall error, os.IsNotExist true)",
-			isMnt:  false,
-			err:    syscall.ENOENT,
-			want:   mountHealthDead,
+			name:  "dead: syscall.ENOENT (raw syscall error, os.IsNotExist true)",
+			isMnt: false,
+			err:   syscall.ENOENT,
+			want:  mountHealthDead,
 		},
 		// Unknown: ambiguous — NEVER teardown.
 		{
-			name:   "unknown: EACCES (permission denied, not a dead-mount signal)",
-			isMnt:  false,
-			err:    syscall.EACCES,
-			want:   mountHealthUnknown,
+			name:  "unknown: EACCES (permission denied, not a dead-mount signal)",
+			isMnt: false,
+			err:   syscall.EACCES,
+			want:  mountHealthUnknown,
 		},
 		{
-			name:   "unknown: EINTR (interrupted syscall, not a dead-mount signal)",
-			isMnt:  false,
-			err:    syscall.EINTR,
-			want:   mountHealthUnknown,
+			name:  "unknown: EINTR (interrupted syscall, not a dead-mount signal)",
+			isMnt: false,
+			err:   syscall.EINTR,
+			want:  mountHealthUnknown,
 		},
 		{
-			name:   "unknown: arbitrary error",
-			isMnt:  false,
-			err:    errors.New("arbitrary fuse error"),
-			want:   mountHealthUnknown,
+			name:  "unknown: arbitrary error",
+			isMnt: false,
+			err:   errors.New("arbitrary fuse error"),
+			want:  mountHealthUnknown,
 		},
 		{
-			name:   "unknown: context deadline exceeded",
-			isMnt:  false,
-			err:    context.DeadlineExceeded,
-			want:   mountHealthUnknown,
+			name:  "unknown: context deadline exceeded",
+			isMnt: false,
+			err:   context.DeadlineExceeded,
+			want:  mountHealthUnknown,
 		},
 		{
-			name:   "unknown: context cancelled",
-			isMnt:  false,
-			err:    context.Canceled,
-			want:   mountHealthUnknown,
+			name:  "unknown: context cancelled",
+			isMnt: false,
+			err:   context.Canceled,
+			want:  mountHealthUnknown,
 		},
 		// Edge: healthy takes priority over isMnt=false when err is nil.
 		{
-			name:   "healthy: isMnt=true trumps any non-error state",
-			isMnt:  true,
-			err:    nil,
-			want:   mountHealthHealthy,
+			name:  "healthy: isMnt=true trumps any non-error state",
+			isMnt: true,
+			err:   nil,
+			want:  mountHealthHealthy,
 		},
 		// Edge: error path takes priority over isMnt.
 		{
-			name:   "dead: error takes priority even when isMnt=true (shouldn't happen but contract is clear)",
-			isMnt:  true,
-			err:    syscall.ENOTCONN,
-			want:   mountHealthDead,
+			name:  "dead: error takes priority even when isMnt=true (shouldn't happen but contract is clear)",
+			isMnt: true,
+			err:   syscall.ENOTCONN,
+			want:  mountHealthDead,
 		},
 	}
 	for _, tt := range tests {
@@ -2181,6 +2181,60 @@ func TestProbeGenerationLocked_JoinerHonoursOwnContext(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("probe owner did not finish after release")
 	}
+}
+
+// TestProbeGenerationLocked_WedgedProbeSpawnsOneGoroutine verifies the bound on
+// the one leak this design cannot eliminate. A stat against a wedged-but-alive
+// FUSE mount never returns, and Go cannot cancel a goroutine blocked in a
+// syscall — it pins an OS thread. Since the monitor drives a probe for every
+// desired mount every tick, re-spawning per tick would leak ~240 pinned threads
+// an hour and eventually abort the process on the runtime thread limit.
+//
+// The entry therefore stays registered until the syscall actually returns, so
+// every later tick JOINS it. This test simulates repeated monitor ticks against
+// a permanently wedged mount and asserts exactly one probe was ever started.
+// (#67)
+func TestProbeGenerationLocked_WedgedProbeSpawnsOneGoroutine(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// A probe that never returns — the wedged-but-alive FUSE case.
+	wedged := make(chan struct{})
+	t.Cleanup(func() { close(wedged) }) // release the goroutine when the test ends
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		checkCalls.Add(1)
+		<-wedged
+		return true, nil
+	})
+
+	// Simulate monitor ticks. Each caller uses a short ctx so it gives up
+	// quickly; the probe stays outstanding across all of them.
+	const ticks = 5
+	for i := 0; i < ticks; i++ {
+		tickCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		err := m.Mount(tickCtx, mc, "device-a", "10.0.0.1", 2222)
+		cancel()
+		require.NoError(t, err, "tick %d: an unresolved probe is unknown, which Mount treats as a no-op", i)
+	}
+
+	assert.Equal(t, int32(1), checkCalls.Load(),
+		"a wedged probe must be started once and joined thereafter, not re-spawned per tick")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "unknown health must never tear a mount down")
+	require.Len(t, m.ActiveMounts(), 1, "the mount must be retained across every tick")
 }
 
 // ─── Test 3: probeGenerationLocked stale-generation safety ────────────────────

@@ -1936,6 +1936,35 @@ func TestReconcileMounts_SkipsUnexportedShare(t *testing.T) {
 	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an unexported share")
 }
 
+// TestReconcileErrLogGate verifies the log-once-per-transition gate. The
+// monitor retries a desired mount every tick forever, and some failures are
+// stable and only the user can clear them (the #49 local-files guard), so an
+// unchanged error must not be logged at Error on every tick. A changed error,
+// or one that recurs after a success, must log again. (#67)
+func TestReconcileErrLogGate(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+	other := mountKey{Device: "laptop", Share: "photos"}
+
+	assert.True(t, d.firstReconcileErr(key, "boom"), "first failure must log")
+	assert.False(t, d.firstReconcileErr(key, "boom"), "an unchanged repeat must not log")
+	assert.False(t, d.firstReconcileErr(key, "boom"), "still must not log on later ticks")
+
+	assert.True(t, d.firstReconcileErr(key, "different"), "a changed error must log")
+	assert.False(t, d.firstReconcileErr(key, "different"), "…then dedupe on the new message")
+
+	// Failures are tracked per mount, not globally.
+	assert.True(t, d.firstReconcileErr(other, "boom"), "a different mount must log independently")
+
+	// A success clears the memory, so a later relapse is reported again.
+	d.clearReconcileErr(key)
+	assert.True(t, d.firstReconcileErr(key, "different"), "a relapse after success must log")
+
+	// clearReconcileErr on an unknown key (and on a nil map) must not panic.
+	fresh, _ := buildTestDaemon(t)
+	assert.NotPanics(t, func() { fresh.clearReconcileErr(key) }, "clearing a nil map must be safe")
+}
+
 // TestReconcileMounts_CancellationStopsSweep verifies that a cancelled context
 // stops the reconcileMounts sweep before processing all mounts.
 func TestReconcileMounts_CancellationStopsSweep(t *testing.T) {

@@ -98,6 +98,14 @@ type Daemon struct {
 	// never run the monitor unless they set it explicitly. (#67)
 	mountMonitorInterval time.Duration
 
+	// reconcileLastErr remembers the last reconcile failure per mount so that
+	// a stably-failing mount logs once per transition rather than once per
+	// monitor tick (see firstReconcileErr). Lazily built, guarded by
+	// reconcileMu — buildTestDaemon constructs Daemon as a literal, so this
+	// must tolerate a nil map. (#67)
+	reconcileMu      sync.Mutex
+	reconcileLastErr map[mountKey]string
+
 	// registerFn and subscribeFn are injectable seams over the concrete
 	// HubClient (client.go has no interface, so it cannot be stubbed without a
 	// live gRPC connection). NewDaemon wires them to delegate to
@@ -680,8 +688,7 @@ func mountMonitorIntervalFromEnv(raw string, def time.Duration, logger *slog.Log
 }
 
 // runMountMonitor periodically reconciles the desired mount state against
-// actual mounts. It replaces the previous detect-then-act healDeadMounts
-// with a unified desired-state loop: on each tick, snapshot config and
+// actual mounts: on each tick, snapshot config and
 // online devices, build the desired set, and call Mounter.Mount for every
 // desired entry. Mount's generation-safe Ensure semantics probe live mounts
 // (a no-op), tear down and remount confirmed-dead ones, and establish
@@ -717,8 +724,8 @@ func (d *Daemon) runMountMonitor(ctx context.Context) {
 //     probe the existing entry (a no-op if healthy/unknown), tear down and
 //     remount if confirmed-dead, or establish a new mount.
 //
-// Unlike healDeadMounts, reconcileMounts does NOT detect-then-act from a
-// stale snapshot: it goes directly to the desired set and delegates every
+// reconcileMounts deliberately does NOT detect-then-act from a stale
+// snapshot: it goes directly to the desired set and delegates every
 // mount decision to Mount's generation-bound single-flight probe. A mount
 // that was removed from config or whose peer went offline is NOT touched
 // here — event paths (DeviceOffline, onConfigChange) own that cleanup.
@@ -763,25 +770,55 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 			continue
 		}
 
-		if err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort); err != nil {
+		key := mountKey{Device: mc.Device, Share: mc.Share}
+		err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort)
+		if err == nil {
+			d.clearReconcileErr(key)
+			continue
+		}
+		// Log once per transition, not once per tick. Some failures are
+		// stable and only the user can clear them — the #49 guard on a target
+		// holding local files is the classic one — and this loop retries every
+		// mountMonitorInterval forever. Repeating the same error every 15s
+		// would bury the log for a condition that has not changed.
+		if d.firstReconcileErr(key, err.Error()) {
 			d.logger.Error("mount reconcile: mount failed",
 				"device", mc.Device,
 				"share", mc.Share,
 				"error", err,
 			)
+			continue
 		}
+		d.logger.Debug("mount reconcile: mount still failing with the same error",
+			"device", mc.Device,
+			"share", mc.Share,
+			"error", err,
+		)
 	}
 }
 
-// mountConfigFor returns the configured mount entry matching (device, share),
-// if any. cfg must be a snapshotted config pointer (immutable once taken).
-func mountConfigFor(cfg *agentconfig.Config, device, share string) (agentconfig.MountConfig, bool) {
-	for _, mc := range cfg.Mounts {
-		if mc.Device == device && mc.Share == share {
-			return mc, true
-		}
+// firstReconcileErr reports whether msg differs from the last reconcile error
+// recorded for key, recording it either way. It is the log-once-per-transition
+// gate for reconcileMounts: a repeated identical failure returns false.
+func (d *Daemon) firstReconcileErr(key mountKey, msg string) bool {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	if d.reconcileLastErr == nil {
+		d.reconcileLastErr = make(map[mountKey]string)
 	}
-	return agentconfig.MountConfig{}, false
+	if prev, ok := d.reconcileLastErr[key]; ok && prev == msg {
+		return false
+	}
+	d.reconcileLastErr[key] = msg
+	return true
+}
+
+// clearReconcileErr forgets any recorded failure for key, so that a mount
+// which recovers and later breaks again logs the new failure at Error.
+func (d *Daemon) clearReconcileErr(key mountKey) {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	delete(d.reconcileLastErr, key)
 }
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
@@ -834,20 +871,20 @@ func (d *Daemon) Shutdown() error {
 //     whose endpoint changed has each of its shares re-pointed at the new
 //     IP/port by Mount's remount branch. (#61)
 //   - Devices ABSENT from the snapshot are pruned from onlineDevices: a peer
-	//     that went offline while our event stream was dead never delivered its
-	//     DeviceOffline, and an add/update-only reconciliation would leave the
-	//     stale entry lying forever — misleading every consumer of the map
-	//     (reconcileMounts would keep re-mounting a gone peer's mounts at its
-	//     dead endpoint instead of leaving them for the offline event path).
-	//     (#67)
-	//
-	// Nothing is unmounted in this path, deliberately. A missing snapshot entry
-	// proves only that the HUB lost the peer — not that the SSH data path did — so
-	// tearing down a possibly-live mount here would be exactly the
-	// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
-	// prune feeds the conservative division of labour: once the entry is gone, the
-	// mount monitor's next sweep sees the peer as offline and skips its mounts
-	// (reconcileMounts); a mount that is still alive is left untouched. (#67)
+//     that went offline while our event stream was dead never delivered its
+//     DeviceOffline, and an add/update-only reconciliation would leave the
+//     stale entry lying forever — misleading every consumer of the map
+//     (reconcileMounts would keep re-mounting a gone peer's mounts at its
+//     dead endpoint instead of leaving them for the offline event path).
+//     (#67)
+//
+// Nothing is unmounted in this path, deliberately. A missing snapshot entry
+// proves only that the HUB lost the peer — not that the SSH data path did — so
+// tearing down a possibly-live mount here would be exactly the
+// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
+// prune feeds the conservative division of labour: once the entry is gone, the
+// mount monitor's next sweep sees the peer as offline and skips its mounts
+// (reconcileMounts); a mount that is still alive is left untouched. (#67)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
 	present := make(map[string]struct{}, len(devices))
 	for _, dev := range devices {

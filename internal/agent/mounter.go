@@ -245,6 +245,7 @@ func classifyMountHealth(isMnt bool, err error) mountHealth {
 	}
 	return mountHealthDead
 }
+
 // guardMode is the restricted mode applied to an unmounted mount target:
 // r-x for owner, nothing for group/other. The cleared write bit blocks entry
 // creation/deletion (so stray local writes fail with EACCES); the set execute
@@ -263,9 +264,13 @@ const guardMode os.FileMode = 0o500
 // forever. The close/receive pair also establishes the happens-before edge
 // that makes the health read race-free.
 type probeEntry struct {
-	mount  *Mount        // the generation this probe is bound to
-	done   chan struct{} // closed exactly once, after health is written
-	health mountHealth   // written before close(done); immutable afterwards
+	mount *Mount        // the generation this probe is bound to
+	done  chan struct{} // closed exactly once, after health is written
+	// deadline is shared by every caller of this probe, so joining a probe
+	// that already overran its budget costs nothing instead of adding another
+	// mountProbeTimeout to the caller's sweep. Immutable after construction.
+	deadline time.Time
+	health   mountHealth // written before close(done); immutable afterwards
 }
 
 // mountableMode is applied to the mount point immediately before invoking the
@@ -653,25 +658,27 @@ const unmountOpTimeout = 5 * time.Second
 // (#67 dead-mount healing)
 const mountProbeTimeout = 3 * time.Second
 
-// probeHealth runs checkMountpoint(path) and classifies the result. It is a
-// pure function (no side effects on Mounter state) so it can be called from
-// the single-flight goroutine without holding any lock.
-func (m *Mounter) probeHealth(ctx context.Context, path string) mountHealth {
-	done := make(chan struct{})
-	var isMnt bool
-	var err error
-	go func() {
-		isMnt, err = m.checkMountpoint(path)
-		close(done)
-	}()
-	select {
-	case <-ctx.Done():
-		// Timeout or cancellation — we could not confirm anything.
-		m.logger.Warn("mountpoint health probe did not complete within deadline; treating as unknown", "path", path)
-		return mountHealthUnknown
-	case <-done:
-		return classifyMountHealth(isMnt, err)
+// runProbe is the single goroutine backing one probeEntry. It performs the
+// (potentially blocking) checkMountpoint syscall, publishes the classified
+// result, and de-registers the entry.
+//
+// It deliberately outlives the caller that spawned it. A stat against a
+// wedged-but-alive FUSE mount never returns, and Go cannot cancel a goroutine
+// blocked in a syscall — such a goroutine pins an OS thread. Leaving the entry
+// registered until the syscall actually returns is what makes that leak
+// BOUNDED: while this probe is outstanding, every later caller joins the entry
+// instead of spawning another goroutine, so a permanently wedged mount costs
+// exactly one pinned thread rather than one per monitor tick. (#67)
+func (m *Mounter) runProbe(key mountKey, entry *probeEntry) {
+	isMnt, err := m.checkMountpoint(entry.mount.LocalPath)
+	entry.health = classifyMountHealth(isMnt, err)
+	close(entry.done)
+
+	m.probeMu.Lock()
+	if m.probes[key] == entry {
+		delete(m.probes, key)
 	}
+	m.probeMu.Unlock()
 }
 
 // probeGenerationLocked performs a generation-bound single-flight health probe
@@ -683,79 +690,82 @@ func (m *Mounter) probeHealth(ctx context.Context, path string) mountHealth {
 // Returns the probe health, or mountHealthUnknown if the generation changed
 // (the mount was replaced/removed while the probe was in flight).
 func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *Mount) mountHealth {
-	// Register or join the single-flight probe under probeMu.
+	// Register or join the single-flight probe under probeMu. The probe
+	// goroutine is spawned at most once per entry: while one is outstanding
+	// (including one wedged forever in stat) every later caller joins it, so
+	// the monitor's 15s cadence cannot accumulate blocked goroutines.
 	m.probeMu.Lock()
-	existing, hasExisting := m.probes[key]
-	if hasExisting && existing.mount == mnt {
-		// Same generation — join the existing probe. Release m.mu while
-		// waiting so the running probe can complete (it needs m.mu to
-		// write the result and clean up its entry).
-		probe := existing
-		m.probeMu.Unlock()
-		m.mu.Unlock()
-		// Wait for the owner's broadcast, but never outlive our own ctx:
-		// a caller with a short deadline must not be pinned to the owner's
-		// (up to mountProbeTimeout) probe. Both paths re-acquire m.mu
-		// because the caller holds it across this call.
-		select {
-		case <-ctx.Done():
-			m.mu.Lock()
-			return mountHealthUnknown
-		case <-probe.done:
+	entry, joined := m.probes[key]
+	if !joined || entry.mount != mnt {
+		entry = &probeEntry{
+			mount:    mnt,
+			done:     make(chan struct{}),
+			deadline: time.Now().Add(mountProbeTimeout),
 		}
-		health := probe.health // safe: written before close(done)
-		m.mu.Lock()
-		// Re-check generation: the mount may have been replaced while
-		// we were waiting.
-		if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
-			return mountHealthUnknown
-		}
-		return health
+		m.probes[key] = entry
+		joined = false
+		go m.runProbe(key, entry)
 	}
-	// Start a new probe for this key+generation.
-	entry := &probeEntry{
-		mount: mnt,
-		done:  make(chan struct{}),
-	}
-	m.probes[key] = entry
 	m.probeMu.Unlock()
 
-	// Release m.mu while the probe runs.
+	// Release m.mu while waiting: a hanging FUSE stat must not block other
+	// mounter operations. Every exit below re-acquires it, because the caller
+	// holds m.mu across this call.
 	m.mu.Unlock()
-
-	// Run the probe. Use the caller's ctx so the probe respects the
-	// caller's deadline/cancellation, capped at mountProbeTimeout. If the
-	// OWNER's ctx dies early, joiners observe the resulting unknown — which
-	// is conservative (unknown never tears a mount down) and bounds every
-	// joiner's wait by mountProbeTimeout even when the joiner passed a ctx
-	// without a deadline.
-	pctx, pcancel := context.WithTimeout(ctx, mountProbeTimeout)
-	defer pcancel()
-	health := m.probeHealth(pctx, mnt.LocalPath)
-
-	// Publish the result to every joiner: write before close, never send.
-	entry.health = health
-	close(entry.done)
-
-	// Re-acquire m.mu to re-check generation.
+	health := m.awaitProbe(ctx, entry, joined)
 	m.mu.Lock()
 
-	// Clean up the probe entry under probeMu.
-	m.probeMu.Lock()
-	if m.probes[key] == entry {
-		delete(m.probes, key)
-	}
-	m.probeMu.Unlock()
-
-	// Check if the generation is still valid.
+	// Re-check generation: the mount may have been replaced or removed while
+	// we were waiting, which makes the result stale.
 	if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
-		// Mount was replaced or removed while probe was in flight.
-		// The result is stale — return unknown so the caller retries.
 		m.logger.Debug("stale health probe result discarded; mount generation changed",
 			"device", key.Device, "share", key.Share)
 		return mountHealthUnknown
 	}
 	return health
+}
+
+// awaitProbe waits for entry's result, bounded by both the probe's own
+// deadline and the caller's ctx, and returns mountHealthUnknown if neither
+// produced an answer in time. It must be called WITHOUT m.mu held.
+//
+// The bound is the entry's shared deadline rather than a per-caller timeout:
+// a caller joining a probe that has already blown its budget gets unknown
+// immediately instead of adding another mountProbeTimeout to the sweep.
+func (m *Mounter) awaitProbe(ctx context.Context, entry *probeEntry, joined bool) mountHealth {
+	// Already past the shared deadline — an outstanding wedged probe. Report
+	// it at Debug: the caller that first observed the timeout logged the Warn,
+	// and this repeats on every monitor tick until the syscall returns.
+	wait := time.Until(entry.deadline)
+	if wait <= 0 {
+		select {
+		case <-entry.done:
+			return entry.health
+		default:
+			m.logger.Debug("joined a health probe that is still outstanding past its deadline; treating as unknown",
+				"path", entry.mount.LocalPath)
+			return mountHealthUnknown
+		}
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-entry.done:
+		return entry.health // safe: written before close(done)
+	case <-timer.C:
+		if !joined {
+			// First observation of this probe overrunning its budget.
+			m.logger.Warn("mountpoint health probe did not complete within deadline; treating as unknown",
+				"path", entry.mount.LocalPath)
+		}
+		return mountHealthUnknown
+	case <-ctx.Done():
+		// The caller gave up before the probe did. The probe stays registered
+		// and its result serves whoever asks next.
+		return mountHealthUnknown
+	}
 }
 
 // reapMountCmd reaps a finished mount's backend process. sshfs daemonizes — it

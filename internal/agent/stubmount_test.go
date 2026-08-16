@@ -308,4 +308,3 @@ func TestNewMounter_NoStubEnvKeepsRealHarness(t *testing.T) {
 	m := NewMounter(filepath.Join(dir, "key"), dir, filepath.Join(dir, "known_hosts"), "", discardLogger())
 	assert.False(t, m.stub, "empty HUBFUSE_STUB_MOUNT_DIR must not enable stub mode")
 }
-
