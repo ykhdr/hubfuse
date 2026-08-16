@@ -186,7 +186,7 @@ func TestHeartbeat_UpdatesTimestamp(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice", "")
 
 	before := time.Now()
-	err := r.Heartbeat(ctx, "dev-1")
+	err := r.Heartbeat(ctx, "dev-1", "10.0.0.1")
 	require.NoError(t, err, "Heartbeat")
 	after := time.Now()
 
@@ -194,6 +194,175 @@ func TestHeartbeat_UpdatesTimestamp(t *testing.T) {
 	require.NoError(t, err, "GetDevice")
 	assert.False(t, d.LastHeartbeat.Before(before) || d.LastHeartbeat.After(after),
 		"LastHeartbeat %v not in expected range [%v, %v]", d.LastHeartbeat, before, after)
+}
+
+// TestHeartbeat_OnlineDeviceBroadcastsNothing — the ordinary case must stay
+// silent: a heartbeat from a device the hub already considers online is a
+// timestamp update and nothing else.
+func TestHeartbeat_OnlineDeviceBroadcastsNothing(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+
+	ch, unsub := r.Subscribe("dev-2")
+	defer unsub()
+
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
+
+	select {
+	case event := <-ch:
+		t.Fatalf("an online device's heartbeat must not broadcast anything, got %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHeartbeat_RecoversOfflineDevice is the core of issue #69: the hub demoted
+// a device that was in fact alive (its heartbeats were merely late), every peer
+// unmounted its shares, and nothing but a full session re-establishment could
+// undo that. A heartbeat is proof of life, so it must restore the device and
+// tell the peers.
+func TestHeartbeat_RecoversOfflineDevice(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+	require.NoError(t, r.UpdateShares(ctx, "dev-1", []*pb.Share{{Alias: "docs", Permissions: "ro"}}), "UpdateShares")
+
+	// The monitor gave up on dev-1 while the device kept running.
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	demoted, err := r.MarkOffline(ctx, d1, time.Now().Add(time.Minute))
+	require.NoError(t, err, "MarkOffline")
+	require.True(t, demoted, "MarkOffline should demote a device past the threshold")
+
+	ch, unsub := r.Subscribe("dev-2")
+	defer unsub()
+	selfCh, selfUnsub := r.Subscribe("dev-1")
+	defer selfUnsub()
+
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.7"), "Heartbeat")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOnline, d.Status, "a heartbeat must bring an offline device back")
+	assert.Equal(t, "10.0.0.7", d.LastIP, "the caller's current address must be recorded")
+
+	select {
+	case event := <-ch:
+		online := event.GetDeviceOnline()
+		require.NotNil(t, online, "expected DeviceOnline, got %T", event.GetPayload())
+		assert.Equal(t, "dev-1", online.DeviceId)
+		assert.Equal(t, "alice", online.Nickname)
+		assert.Equal(t, "10.0.0.7", online.Ip, "peers must be told the address the device is reachable at now")
+		assert.Equal(t, int32(2222), online.SshPort, "the stored SSH port must be re-announced")
+		require.Len(t, online.Shares, 1, "the device's shares must be re-announced so peers can remount")
+		assert.Equal(t, "docs", online.Shares[0].Alias)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the recovery DeviceOnline event")
+	}
+
+	select {
+	case event := <-selfCh:
+		t.Fatalf("the recovered device must not receive its own DeviceOnline, got %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// A second heartbeat changes nothing — the device is online already.
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.7"), "second Heartbeat")
+	select {
+	case event := <-ch:
+		t.Fatalf("recovery must be announced once, got a second %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHeartbeat_OfflineDeviceWithoutSSHPortIsNotRecovered — a device that never
+// completed a Register has no endpoint the hub could announce; recovering it
+// would broadcast a mount target of port 0.
+func TestHeartbeat_OfflineDeviceWithoutSSHPortIsNotRecovered(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	require.NoError(t, r.store.UpdateDeviceStatus(ctx, "dev-1", store.StatusOffline, "10.0.0.1", 0), "UpdateDeviceStatus")
+
+	ch, unsub := r.Subscribe("dev-2")
+	defer unsub()
+
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status, "a device with no known SSH port must stay offline")
+
+	select {
+	case event := <-ch:
+		t.Fatalf("nothing should be broadcast for a device with no endpoint, got %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestHeartbeat_UnknownDevice — the pruned identity from issue #69. The hub must
+// say so instead of silently accepting the beat.
+func TestHeartbeat_UnknownDevice(t *testing.T) {
+	r := newTestRegistry(t)
+
+	err := r.Heartbeat(context.Background(), "never-joined", "10.0.0.1")
+	require.Error(t, err, "heartbeat from an unknown device must fail")
+	assert.ErrorIs(t, err, common.ErrDeviceNotFound)
+}
+
+// TestRegister_UnknownDevice — the same for registration, which is what a
+// restarted pruned daemon hits first.
+func TestRegister_UnknownDevice(t *testing.T) {
+	r := newTestRegistry(t)
+
+	_, err := r.Register(context.Background(), "never-joined", "10.0.0.1", 2222, nil, common.ProtocolVersion)
+	require.Error(t, err, "registration of an unknown device must fail")
+	assert.ErrorIs(t, err, common.ErrDeviceNotFound)
+}
+
+// TestMarkOffline_FreshHeartbeatKeepsDeviceOnline pins the registry half of the
+// sweep race: the monitor selected this device as stale, it heartbeated before
+// the demotion was written, and peers must NOT be told it went offline.
+func TestMarkOffline_FreshHeartbeatKeepsDeviceOnline(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+	joinDevice(t, r, "dev-2", "bob", "")
+	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
+
+	d1, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+
+	// The sweep computed its threshold, then the device heartbeated.
+	threshold := time.Now().Add(-time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
+
+	ch, unsub := r.Subscribe("dev-2")
+	defer unsub()
+
+	demoted, err := r.MarkOffline(ctx, d1, threshold)
+	require.NoError(t, err, "MarkOffline")
+	assert.False(t, demoted, "a device that heartbeated during the sweep must stay online")
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOnline, d.Status)
+
+	select {
+	case event := <-ch:
+		t.Fatalf("no DeviceOffline may be broadcast for a device that stayed online, got %T", event.GetPayload())
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 // --- Subscribe + Broadcast ---
@@ -416,8 +585,9 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 
 	d1, err := r.store.GetDevice(ctx, "dev-1")
 	require.NoError(t, err, "GetDevice before MarkOffline")
-	err = r.MarkOffline(ctx, d1)
+	demoted, err := r.MarkOffline(ctx, d1, time.Now().Add(time.Minute))
 	require.NoError(t, err, "MarkOffline")
+	require.True(t, demoted, "an online device past the threshold must be demoted")
 
 	d, err := r.store.GetDevice(ctx, "dev-1")
 	require.NoError(t, err, "GetDevice")

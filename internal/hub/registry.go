@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -95,7 +96,10 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {
-		return nil, err
+		// A device whose row is gone (pruned, or removed by `leave`) must be
+		// told so explicitly — the agent turns this into a re-join prompt
+		// instead of logging "registered with hub" and carrying on. (#69)
+		return nil, deviceErr(err)
 	}
 
 	online, err := r.store.ListOnlineDevices(ctx)
@@ -162,9 +166,100 @@ func (r *Registry) Rename(ctx context.Context, deviceID, newNickname string) err
 	return r.store.UpdateDeviceNickname(ctx, deviceID, newNickname)
 }
 
-// Heartbeat updates the heartbeat timestamp for a device.
-func (r *Registry) Heartbeat(ctx context.Context, deviceID string) error {
-	return r.store.UpdateHeartbeat(ctx, deviceID)
+// Heartbeat records liveness for a device and, when the hub had already given
+// up on it, brings it back online.
+//
+// A heartbeat used to only move last_heartbeat. That left a device the monitor
+// had demoted stuck offline until its whole session was re-established: the
+// agent process was alive, connected, and pinging, while every peer had
+// unmounted its shares and had no event that would ever bring them back. So a
+// heartbeat from a device the hub believes is offline is treated as what it
+// demonstrably is — proof the device is up — and the transition is broadcast.
+//
+// ip is the caller's apparent address (best effort; may be empty). It refreshes
+// last_ip so a device that recovered at a new address is announced at that
+// address; the stored SSH port and share list are reused, since a heartbeat
+// carries neither and only Register can change them.
+//
+// The promotion is conditional (MarkOnlineIfOffline): a Register racing this
+// heartbeat wins the row and owns the DeviceOnline broadcast, so peers never
+// see two announcements or an announcement built from data the Register was
+// about to replace. (#69)
+func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
+	// Write liveness FIRST: the monitor's demotion is conditional on
+	// last_heartbeat still being stale, so recording the beat before the
+	// promotion is what makes a concurrent stale-sweep back off instead of
+	// demoting the device we are about to bring back.
+	if err := r.store.UpdateHeartbeat(ctx, deviceID); err != nil {
+		return deviceErr(err)
+	}
+
+	device, err := r.store.GetDevice(ctx, deviceID)
+	if err != nil {
+		return deviceErr(err)
+	}
+	if device.Status != store.StatusOffline {
+		// Ordinary case: nothing to announce.
+		return nil
+	}
+	if device.SSHPort == 0 {
+		// The device has an offline row but never completed a Register, so the
+		// hub has no endpoint to announce. Its own Register will announce it.
+		r.logger.Warn("heartbeat from an offline device with no known SSH port; leaving it offline",
+			slog.String("device_id", deviceID))
+		return nil
+	}
+
+	// Read the shares BEFORE the promotion so a failure here leaves the device
+	// offline and the next heartbeat retries the whole recovery, rather than
+	// promoting the device with nothing to announce.
+	shares, err := r.store.GetShares(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+
+	recovered, err := r.store.MarkOnlineIfOffline(ctx, deviceID, ip)
+	if err != nil {
+		return err
+	}
+	if !recovered {
+		return nil
+	}
+
+	announcedIP := device.LastIP
+	if ip != "" {
+		announcedIP = ip
+	}
+
+	r.logger.Info("device recovered via heartbeat",
+		slog.String("device_id", deviceID),
+		slog.String("nickname", device.Nickname),
+		slog.String("ip", announcedIP))
+
+	r.Broadcast(&pb.Event{
+		Payload: &pb.Event_DeviceOnline{
+			DeviceOnline: &pb.DeviceOnlineEvent{
+				DeviceId: device.DeviceID,
+				Nickname: device.Nickname,
+				Ip:       announcedIP,
+				SshPort:  int32(device.SSHPort),
+				Shares:   sharesToProto(shares),
+			},
+		},
+	}, deviceID)
+
+	return nil
+}
+
+// deviceErr translates the store's own not-found sentinel into the
+// protocol-level error the RPC layer speaks, and passes everything else
+// through. It exists so the data layer can keep its errors free of gRPC
+// status codes while callers still get a NotFound they can act on. (#69)
+func deviceErr(err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return common.ErrDeviceNotFound
+	}
+	return err
 }
 
 // UpdateShares replaces the shares for a device and broadcasts a SharesUpdated
@@ -353,12 +448,23 @@ func (r *Registry) ListDevicesWithShares(ctx context.Context) ([]*store.Device, 
 	return devices, shares, nil
 }
 
-// MarkOffline marks the given device offline and broadcasts DeviceOffline.
-// Used by the heartbeat monitor for stale devices. The caller passes the
-// *Device already in hand, avoiding a redundant store lookup.
-func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error {
-	if err := r.store.UpdateDeviceStatus(ctx, device.DeviceID, store.StatusOffline, device.LastIP, device.SSHPort); err != nil {
-		return err
+// MarkOffline demotes a stale device and broadcasts DeviceOffline, reporting
+// whether the demotion actually happened. Used by the heartbeat monitor. The
+// caller passes the *Device already in hand, avoiding a redundant store lookup.
+//
+// threshold is the staleness cut-off the caller selected the device with, and
+// it is re-applied at write time. The monitor selects the stale set and writes
+// each demotion afterwards; a heartbeat that arrives inside that window must
+// keep the device online, or peers receive a DeviceOffline (and unmount) for a
+// device that just proved it is alive — the #69 symptom. A device that is no
+// longer stale (or no longer online) yields false and no broadcast. (#69)
+func (r *Registry) MarkOffline(ctx context.Context, device *store.Device, threshold time.Time) (bool, error) {
+	demoted, err := r.store.MarkOfflineIfStale(ctx, device.DeviceID, threshold)
+	if err != nil {
+		return false, err
+	}
+	if !demoted {
+		return false, nil
 	}
 
 	event := &pb.Event{
@@ -371,7 +477,7 @@ func (r *Registry) MarkOffline(ctx context.Context, device *store.Device) error 
 	}
 	r.Broadcast(event, device.DeviceID)
 
-	return nil
+	return true, nil
 }
 
 // BroadcastDeviceRemoved sends a DeviceRemoved event to all subscribers except

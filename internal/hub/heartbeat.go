@@ -112,12 +112,22 @@ func (m *HeartbeatMonitor) checkStale(ctx context.Context) {
 	}
 
 	for _, d := range stale {
-		if err := m.registry.MarkOffline(ctx, d); err != nil {
+		// The same threshold is re-applied at write time. Between this sweep's
+		// SELECT and the UPDATE below, a device can heartbeat — and a device
+		// that just proved it is alive must not be demoted (its peers would
+		// unmount its shares on the resulting DeviceOffline). demoted=false is
+		// the normal outcome for that race, not an error. (#69)
+		demoted, err := m.registry.MarkOffline(ctx, d, threshold)
+		switch {
+		case err != nil:
 			m.logger.Error("heartbeat monitor: mark offline",
 				slog.String("device_id", d.DeviceID),
 				slog.Any("error", err))
-		} else {
+		case demoted:
 			m.logger.Info("heartbeat monitor: marked device offline",
+				slog.String("device_id", d.DeviceID))
+		default:
+			m.logger.Debug("heartbeat monitor: device heartbeated during the sweep; leaving it online",
 				slog.String("device_id", d.DeviceID))
 		}
 	}
