@@ -98,13 +98,13 @@ type Daemon struct {
 	// never run the monitor unless they set it explicitly. (#67)
 	mountMonitorInterval time.Duration
 
-	// reconcileLastErr remembers the last reconcile failure per mount so that
-	// a stably-failing mount logs once per transition rather than once per
-	// monitor tick (see firstReconcileErr). Lazily built, guarded by
-	// reconcileMu — buildTestDaemon constructs Daemon as a literal, so this
-	// must tolerate a nil map. (#67)
-	reconcileMu      sync.Mutex
-	reconcileLastErr map[mountKey]string
+	// reconcileFails tracks consecutive reconcile failures per mount, driving
+	// both the retry backoff and the log-once-per-transition gate (see
+	// noteReconcileFailure). Lazily built, guarded by reconcileMu —
+	// buildTestDaemon constructs Daemon as a literal, so this must tolerate a
+	// nil map. (#67)
+	reconcileMu    sync.Mutex
+	reconcileFails map[mountKey]*reconcileState
 
 	// registerFn and subscribeFn are injectable seams over the concrete
 	// HubClient (client.go has no interface, so it cannot be stubbed without a
@@ -731,46 +731,36 @@ func (d *Daemon) runMountMonitor(ctx context.Context) {
 // here — event paths (DeviceOffline, onConfigChange) own that cleanup.
 // (#67 desired-state reconciliation)
 func (d *Daemon) reconcileMounts(ctx context.Context) {
+	// Snapshot only the KEYS to visit. Everything a mount decision depends on
+	// — the config entry, the peer's endpoint, whether the mount is still
+	// wanted at all — is re-read immediately before each Mount call by
+	// currentDesiredMount. A single Mount can hold the mounter lock for the
+	// full mount-verify timeout, so config reloads and DeviceOffline events
+	// land mid-sweep routinely; acting on a sweep-start snapshot would
+	// re-create a mount that onConfigChange or handleDeviceOffline had just
+	// torn down, and nothing would ever clean that one up.
 	d.mu.RLock()
-	cfg := d.config
-	peers := make(map[string]*OnlineDevice, len(d.onlineDevices))
-	for _, dev := range d.onlineDevices {
-		cp := *dev
-		cp.Shares = append([]string(nil), dev.Shares...)
-		peers[dev.Nickname] = &cp
+	keys := make([]mountKey, 0, len(d.config.Mounts))
+	for _, mc := range d.config.Mounts {
+		keys = append(keys, mountKey{Device: mc.Device, Share: mc.Share})
 	}
 	d.mu.RUnlock()
 
-	for _, mc := range cfg.Mounts {
+	for _, key := range keys {
 		if ctx.Err() != nil {
 			return
 		}
 
-		peer, online := peers[mc.Device]
-		if !online {
-			// Peer offline — nothing to reconcile. The DeviceOffline event
-			// path owns teardown; if it was missed, a future DeviceOnline
-			// re-establishes the mount.
+		mc, peer, desired := d.currentDesiredMount(key)
+		if !desired {
 			continue
 		}
 
-		// Verify the peer still exports this share.
-		shareExported := false
-		for _, s := range peer.Shares {
-			if s == mc.Share {
-				shareExported = true
-				break
-			}
-		}
-		if !shareExported {
+		if !d.reconcileDue(key) {
+			// Backing off after repeated failures — see noteReconcileFailure.
 			continue
 		}
 
-		if !d.isPaired(peer.DeviceID) {
-			continue
-		}
-
-		key := mountKey{Device: mc.Device, Share: mc.Share}
 		err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort)
 		if err == nil {
 			d.clearReconcileErr(key)
@@ -781,7 +771,7 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 		// holding local files is the classic one — and this loop retries every
 		// mountMonitorInterval forever. Repeating the same error every 15s
 		// would bury the log for a condition that has not changed.
-		if d.firstReconcileErr(key, err.Error()) {
+		if d.noteReconcileFailure(key, err.Error()) {
 			d.logger.Error("mount reconcile: mount failed",
 				"device", mc.Device,
 				"share", mc.Share,
@@ -797,28 +787,130 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 	}
 }
 
-// firstReconcileErr reports whether msg differs from the last reconcile error
-// recorded for key, recording it either way. It is the log-once-per-transition
-// gate for reconcileMounts: a repeated identical failure returns false.
-func (d *Daemon) firstReconcileErr(key mountKey, msg string) bool {
-	d.reconcileMu.Lock()
-	defer d.reconcileMu.Unlock()
-	if d.reconcileLastErr == nil {
-		d.reconcileLastErr = make(map[mountKey]string)
+// currentDesiredMount re-reads the live config and online-device set and
+// reports whether key is still a mount we want right now, returning the
+// CURRENT config entry and a copy of the peer's current endpoint.
+//
+// It is deliberately called per iteration rather than once per sweep: a sweep
+// can span tens of seconds, and both the config (hot reload) and the online
+// set (DeviceOffline) change underneath it.
+func (d *Daemon) currentDesiredMount(key mountKey) (agentconfig.MountConfig, *OnlineDevice, bool) {
+	d.mu.RLock()
+	var (
+		mc      agentconfig.MountConfig
+		peer    *OnlineDevice
+		inCfg   bool
+		nothing agentconfig.MountConfig
+	)
+	for _, cand := range d.config.Mounts {
+		if cand.Device == key.Device && cand.Share == key.Share {
+			mc, inCfg = cand, true
+			break
+		}
 	}
-	if prev, ok := d.reconcileLastErr[key]; ok && prev == msg {
-		return false
+	if inCfg {
+		for _, dev := range d.onlineDevices {
+			if dev.Nickname == key.Device {
+				cp := *dev
+				cp.Shares = append([]string(nil), dev.Shares...)
+				peer = &cp
+				break
+			}
+		}
 	}
-	d.reconcileLastErr[key] = msg
-	return true
+	d.mu.RUnlock()
+
+	// Removed from config, or the peer is offline. Teardown belongs to the
+	// event paths (onConfigChange, DeviceOffline), never to this loop.
+	if !inCfg || peer == nil {
+		return nothing, nil, false
+	}
+
+	exported := false
+	for _, s := range peer.Shares {
+		if s == key.Share {
+			exported = true
+			break
+		}
+	}
+	if !exported {
+		return nothing, nil, false
+	}
+	if !d.isPaired(peer.DeviceID) {
+		return nothing, nil, false
+	}
+	return mc, peer, true
 }
 
-// clearReconcileErr forgets any recorded failure for key, so that a mount
-// which recovers and later breaks again logs the new failure at Error.
+// maxReconcileBackoff caps the retry delay for a mount that keeps failing.
+const maxReconcileBackoff = 10 * time.Minute
+
+// reconcileState tracks consecutive reconcile failures for one mount.
+type reconcileState struct {
+	lastErr  string    // last error message, for the log-once-per-transition gate
+	attempts int       // consecutive failures
+	nextTry  time.Time // earliest next attempt
+}
+
+// reconcileDue reports whether key may be attempted on this tick. A mount with
+// no failure history is always due.
+func (d *Daemon) reconcileDue(key mountKey) bool {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	st, ok := d.reconcileFails[key]
+	if !ok {
+		return true
+	}
+	return !time.Now().Before(st.nextTry)
+}
+
+// noteReconcileFailure records a failed attempt for key and schedules the next
+// one with exponential backoff, returning whether this failure should be logged
+// at Error (true for the first failure and for any changed message).
+//
+// The backoff matters beyond log volume: Mount holds the mounter lock for the
+// whole mount-verify window when a mount cannot be established, so retrying an
+// unreachable-but-online peer every tick would keep that lock busy nearly
+// continuously and queue up Unmount, DeviceOffline teardown and shutdown behind
+// it. (#67)
+func (d *Daemon) noteReconcileFailure(key mountKey, msg string) bool {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	if d.reconcileFails == nil {
+		d.reconcileFails = make(map[mountKey]*reconcileState)
+	}
+	st, ok := d.reconcileFails[key]
+	if !ok {
+		st = &reconcileState{}
+		d.reconcileFails[key] = st
+	}
+
+	base := d.mountMonitorInterval
+	if base <= 0 {
+		base = defaultMountMonitorInterval
+	}
+	shift := st.attempts // 0 on the first failure → one interval
+	if shift > 16 {
+		shift = 16 // guard the shift; the clamp below caps the value anyway
+	}
+	delay := base << shift
+	if delay <= 0 || delay > maxReconcileBackoff {
+		delay = maxReconcileBackoff
+	}
+
+	st.attempts++
+	st.nextTry = time.Now().Add(delay)
+	shouldLog := st.lastErr != msg
+	st.lastErr = msg
+	return shouldLog
+}
+
+// clearReconcileErr forgets any recorded failure for key, so a mount that
+// recovers is retried without backoff and a later relapse logs at Error again.
 func (d *Daemon) clearReconcileErr(key mountKey) {
 	d.reconcileMu.Lock()
 	defer d.reconcileMu.Unlock()
-	delete(d.reconcileLastErr, key)
+	delete(d.reconcileFails, key)
 }
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH

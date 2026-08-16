@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1946,23 +1947,118 @@ func TestReconcileErrLogGate(t *testing.T) {
 	key := mountKey{Device: "laptop", Share: "docs"}
 	other := mountKey{Device: "laptop", Share: "photos"}
 
-	assert.True(t, d.firstReconcileErr(key, "boom"), "first failure must log")
-	assert.False(t, d.firstReconcileErr(key, "boom"), "an unchanged repeat must not log")
-	assert.False(t, d.firstReconcileErr(key, "boom"), "still must not log on later ticks")
+	assert.True(t, d.noteReconcileFailure(key, "boom"), "first failure must log")
+	assert.False(t, d.noteReconcileFailure(key, "boom"), "an unchanged repeat must not log")
+	assert.False(t, d.noteReconcileFailure(key, "boom"), "still must not log on later ticks")
 
-	assert.True(t, d.firstReconcileErr(key, "different"), "a changed error must log")
-	assert.False(t, d.firstReconcileErr(key, "different"), "…then dedupe on the new message")
+	assert.True(t, d.noteReconcileFailure(key, "different"), "a changed error must log")
+	assert.False(t, d.noteReconcileFailure(key, "different"), "…then dedupe on the new message")
 
 	// Failures are tracked per mount, not globally.
-	assert.True(t, d.firstReconcileErr(other, "boom"), "a different mount must log independently")
+	assert.True(t, d.noteReconcileFailure(other, "boom"), "a different mount must log independently")
 
 	// A success clears the memory, so a later relapse is reported again.
 	d.clearReconcileErr(key)
-	assert.True(t, d.firstReconcileErr(key, "different"), "a relapse after success must log")
+	assert.True(t, d.noteReconcileFailure(key, "different"), "a relapse after success must log")
 
 	// clearReconcileErr on an unknown key (and on a nil map) must not panic.
 	fresh, _ := buildTestDaemon(t)
 	assert.NotPanics(t, func() { fresh.clearReconcileErr(key) }, "clearing a nil map must be safe")
+}
+
+// TestReconcileBackoff verifies the retry gate. Mount holds the mounter lock
+// for the whole verify window when it cannot establish a mount, so retrying an
+// unreachable-but-online peer every tick would keep that lock busy almost
+// continuously and starve Unmount/shutdown. Failures must therefore back off,
+// and a success must clear the penalty. (#67)
+func TestReconcileBackoff(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+
+	assert.True(t, d.reconcileDue(key), "a mount with no failure history is always due")
+
+	d.noteReconcileFailure(key, "boom")
+	assert.False(t, d.reconcileDue(key), "a just-failed mount must not be retried on the next tick")
+
+	// The delay grows with consecutive failures.
+	d.reconcileMu.Lock()
+	first := d.reconcileFails[key].nextTry
+	d.reconcileMu.Unlock()
+
+	d.noteReconcileFailure(key, "boom")
+	d.reconcileMu.Lock()
+	second := d.reconcileFails[key].nextTry
+	attempts := d.reconcileFails[key].attempts
+	d.reconcileMu.Unlock()
+
+	assert.True(t, second.After(first), "backoff must grow after a repeated failure")
+	assert.Equal(t, 2, attempts, "consecutive failures must be counted")
+
+	// Backoff is capped, not unbounded.
+	for i := 0; i < 40; i++ {
+		d.noteReconcileFailure(key, "boom")
+	}
+	d.reconcileMu.Lock()
+	capped := time.Until(d.reconcileFails[key].nextTry)
+	d.reconcileMu.Unlock()
+	assert.LessOrEqual(t, capped, maxReconcileBackoff, "backoff must be capped")
+	assert.Positive(t, capped, "a capped backoff must still be a positive delay")
+
+	// A success clears the penalty entirely.
+	d.clearReconcileErr(key)
+	assert.True(t, d.reconcileDue(key), "a recovered mount must be due immediately")
+}
+
+// TestReconcileMounts_RevalidatesBeforeEachMount verifies that the sweep does
+// not act on a sweep-start snapshot. A single Mount can hold the mounter lock
+// for the whole verify window, so a config reload lands mid-sweep routinely.
+// If reconcileMounts iterated a stale snapshot it would re-establish a mount
+// the user had just removed — and since the new config no longer lists it,
+// nothing would ever tear that mount down again. (#67)
+func TestReconcileMounts_RevalidatesBeforeEachMount(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	writePubKey(t, dir, "device-a")
+	writePubKey(t, dir, "device-b")
+
+	mc1 := agentconfig.MountConfig{Device: "alpha", Share: "docs", To: filepath.Join(dir, "mnt1")}
+	mc2 := agentconfig.MountConfig{Device: "beta", Share: "docs", To: filepath.Join(dir, "mnt2")}
+	d.config.Mounts = []agentconfig.MountConfig{mc1, mc2}
+
+	d.mu.Lock()
+	d.onlineDevices["device-a"] = &OnlineDevice{
+		DeviceID: "device-a", Nickname: "alpha", IP: "10.0.0.1", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.onlineDevices["device-b"] = &OnlineDevice{
+		DeviceID: "device-b", Nickname: "beta", IP: "10.0.0.2", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	var mu sync.Mutex
+	var targets []string
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		mu.Lock()
+		targets = append(targets, args[len(args)-1]) // the mount target is the last operand
+		mu.Unlock()
+
+		// Mid-sweep, the user drops the second mount from the config — exactly
+		// what onConfigChange does on hot reload.
+		d.mu.Lock()
+		newCfg := *d.config
+		newCfg.Mounts = []agentconfig.MountConfig{mc1}
+		d.config = &newCfg
+		d.mu.Unlock()
+
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, targets, 1, "only the still-configured mount may be established")
+	assert.Equal(t, mc1.To, targets[0], "the mount removed mid-sweep must not be resurrected")
+	assert.False(t, d.mounter.IsActive("beta", "docs"), "a de-configured mount must not be left active")
 }
 
 // TestReconcileMounts_CancellationStopsSweep verifies that a cancelled context

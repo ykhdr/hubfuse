@@ -263,6 +263,18 @@ const guardMode os.FileMode = 0o500
 // would be drained by whichever joiner received first, wedging the rest
 // forever. The close/receive pair also establishes the happens-before edge
 // that makes the health read race-free.
+// probeOutcome says what became of the probed activeMounts entry by the time
+// the probe finished. The caller needs the distinction: a replaced entry means
+// someone else already did the work, while a vanished one means nothing is
+// mounted and the caller must establish it. (#67)
+type probeOutcome int
+
+const (
+	probeEntryCurrent  probeOutcome = iota // same entry, same generation — health is meaningful
+	probeEntryReplaced                     // another *Mount took this key over
+	probeEntryVanished                     // the entry was removed entirely
+)
+
 type probeEntry struct {
 	mount *Mount        // the generation this probe is bound to
 	done  chan struct{} // closed exactly once, after health is written
@@ -390,30 +402,44 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	// then re-acquires m.mu and verifies the mount generation is unchanged
 	// before acting on the result. (#67)
 	if existing, exists := m.activeMounts[key]; exists {
+		// teardown says whether the stale entry below must be unmounted before
+		// the normal mount flow runs. It stays false when the entry turned out
+		// to be gone already — there is then nothing to tear down.
+		teardown := true
 		if existing.IP == deviceIP && existing.SSHPort == sshPort {
 			// Same endpoint — probe liveness using the generation-bound
 			// single-flight mechanism. probeGenerationLocked temporarily
 			// releases m.mu, runs the probe, re-acquires m.mu, and
-			// re-verifies generation identity. If the generation changed
-			// while the probe was in flight, it returns unknown.
-			health := m.probeGenerationLocked(ctx, key, existing)
-			if health == mountHealthHealthy || health == mountHealthUnknown {
+			// re-verifies generation identity.
+			health, outcome := m.probeGenerationLocked(ctx, key, existing)
+			switch {
+			case outcome == probeEntryReplaced:
+				// Another caller established this mount while we probed; it
+				// owns the entry now and re-mounting would fight it.
+				return nil
+			case outcome == probeEntryVanished:
+				// The entry was removed under us (concurrent Unmount /
+				// DeviceOffline / config change). Nothing to tear down —
+				// fall through and establish the mount.
+				teardown = false
+			case health == mountHealthHealthy || health == mountHealthUnknown:
 				// Alive (or not confirmed dead) — the live mount already
 				// points at the right place. Return BEFORE guardTarget so
 				// a live mount's masked mode is never clobbered.
 				return nil
+			default:
+				// Confirmed dead: the sshfs process behind this entry is gone
+				// and the path serves "Transport endpoint is not connected".
+				// Tear the zombie down and fall through to the normal mount
+				// flow to re-attach at the same endpoint. (#67)
+				m.logger.Info("re-mounting dead mount at same endpoint",
+					"device", mc.Device,
+					"share", mc.Share,
+					"ip", deviceIP,
+					"port", sshPort,
+					"local_path", existing.LocalPath,
+				)
 			}
-			// Confirmed dead: the sshfs process behind this entry is gone
-			// and the path serves "Transport endpoint is not connected".
-			// Tear the zombie down and fall through to the normal mount
-			// flow to re-attach at the same endpoint. (#67)
-			m.logger.Info("re-mounting dead mount at same endpoint",
-				"device", mc.Device,
-				"share", mc.Share,
-				"ip", deviceIP,
-				"port", sshPort,
-				"local_path", existing.LocalPath,
-			)
 		} else {
 			// Peer roamed (DHCP address change / SSH port change). Tear down
 			// the stale mount pointing at the now-dead old endpoint, then fall
@@ -433,14 +459,16 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		// escalate (the force ladder reaches umount -l). reguard=false: the
 		// normal flow below re-guards the target via guardTarget. Bound the
 		// unmount with unmountOpTimeout — this remount path has no caller deadline.
-		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
-		err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
-		cancel()
-		if err != nil {
-			// Could not tear down the stale mount — do NOT start a new one; the
-			// stale entry is retained (by unmountKey) for a later retry.
-			return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
-				mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
+		if teardown {
+			rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
+			err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
+			cancel()
+			if err != nil {
+				// Could not tear down the stale mount — do NOT start a new one; the
+				// stale entry is retained (by unmountKey) for a later retry.
+				return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
+					mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
+			}
 		}
 		// Stale entry removed; continue into the normal mount flow below.
 	}
@@ -687,9 +715,10 @@ func (m *Mounter) runProbe(key mountKey, entry *probeEntry) {
 // so a hanging FUSE stat does not block other mounter operations, then
 // re-acquires m.mu to verify generation identity before returning.
 //
-// Returns the probe health, or mountHealthUnknown if the generation changed
-// (the mount was replaced/removed while the probe was in flight).
-func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *Mount) mountHealth {
+// Returns the probe health together with what happened to the entry while the
+// probe was in flight (see probeOutcome). The health is only meaningful for
+// probeEntryCurrent.
+func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *Mount) (mountHealth, probeOutcome) {
 	// Register or join the single-flight probe under probeMu. The probe
 	// goroutine is spawned at most once per entry: while one is outstanding
 	// (including one wedged forever in stat) every later caller joins it, so
@@ -715,14 +744,23 @@ func (m *Mounter) probeGenerationLocked(ctx context.Context, key mountKey, mnt *
 	health := m.awaitProbe(ctx, entry, joined)
 	m.mu.Lock()
 
-	// Re-check generation: the mount may have been replaced or removed while
-	// we were waiting, which makes the result stale.
-	if cur, exists := m.activeMounts[key]; !exists || cur != mnt {
+	// Re-check generation. "Replaced" and "vanished" are NOT the same outcome:
+	// a replacement means another caller already established this mount, while
+	// a vanished entry means there is now no mount at all and the caller must
+	// fall through and create one — collapsing both into "unknown" made Mount
+	// report success having mounted nothing.
+	cur, exists := m.activeMounts[key]
+	switch {
+	case !exists:
+		m.logger.Debug("mount entry vanished while its health probe was in flight",
+			"device", key.Device, "share", key.Share)
+		return mountHealthUnknown, probeEntryVanished
+	case cur != mnt:
 		m.logger.Debug("stale health probe result discarded; mount generation changed",
 			"device", key.Device, "share", key.Share)
-		return mountHealthUnknown
+		return mountHealthUnknown, probeEntryReplaced
 	}
-	return health
+	return health, probeEntryCurrent
 }
 
 // awaitProbe waits for entry's result, bounded by both the probe's own
