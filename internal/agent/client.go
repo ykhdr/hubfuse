@@ -147,7 +147,10 @@ func (c *HubClient) Heartbeat(ctx context.Context) error {
 		return fmt.Errorf("Heartbeat RPC: %w", err)
 	}
 	if !resp.GetSuccess() {
-		return fmt.Errorf("%w: heartbeat refused — the hub does not recognise this device (re-join may be required)", ErrHubRejected)
+		// HeartbeatResponse carries no reason, and the hub refuses for more than
+		// one cause (unknown device, store failure), so name the likeliest one
+		// without asserting it. The hub logs which it was.
+		return fmt.Errorf("%w: heartbeat refused — the hub may no longer know this device (re-join may be required)", ErrHubRejected)
 	}
 	return nil
 }

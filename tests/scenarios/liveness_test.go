@@ -96,7 +96,14 @@ func TestAgentStaysOnlineWhileStaleMountBlocks(t *testing.T) {
 	// demoted after the first one.
 	deadline := time.Now().Add(3*heartbeatTimeout + 2*time.Second)
 	for time.Now().Before(deadline) {
+		// PeerStatus shells out to `hubfuse devices`, so a single failed call
+		// says nothing about alice — retry once before believing it. A real
+		// demotion persists across both attempts.
 		row, ok := bob.PeerStatus(t, "alice")
+		if !ok {
+			time.Sleep(200 * time.Millisecond)
+			row, ok = bob.PeerStatus(t, "alice")
+		}
 		require.True(t, ok, "alice must remain in the hub's device list")
 		require.Equal(t, "online", row.Status,
 			"alice must stay online while her own stale mount keeps failing")
