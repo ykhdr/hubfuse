@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Always commit and push after completing an action (feature, fix, refactor, etc.) without waiting for explicit request.
 
+**Plans move to `docs/plans/completed/` BEFORE the branch is merged, never after.** The move
+belongs in the feature branch itself, as part of the work it documents — so the plan lands in
+`completed/` in the same merge. Moving it afterwards costs an extra branch and PR for pure
+housekeeping, and until that lands the repo contradicts its own plan docs. This applies to
+every plan the branch completes, including any rework plan that superseded the original.
+
 ## Project
 
 HubFuse is a network file sharing system for local networks. Devices mount remote directories transparently via SSHFS, coordinated by a central gRPC hub server. Written in Go 1.25.

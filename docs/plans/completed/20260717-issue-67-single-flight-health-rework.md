@@ -1,5 +1,14 @@
 # Issue #67: single-flight mount health and periodic reconciliation
 
+> **Статус: выполнен.** Шаги 1–6 реализованы, PR #68 смержен (`4e691e2`), issue #67 закрыт.
+> Три прохода ревью дали 0 critical; найденные MEDIUM/LOW закрыты в ветке — в том числе
+> broadcast результата пробы через `close` вместо send, привязка залипшей горутины к
+> `probeEntry` (одна на маунт, а не одна на тик), перечитка желаемого состояния перед
+> каждым `Mount` и экспоненциальный backoff только на установку с нуля.
+>
+> Открытым остаётся только ручной прогон на живой паре машин (см. Risks ниже) — стенд со
+> стабом проверяет оркестрацию, но не поведение реального ядра и FUSE.
+
 ## Goal and acceptance criteria
 
 - A dead sshfs/FUSE mount at an unchanged IP/port is detected and remounted automatically.
