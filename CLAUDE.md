@@ -55,10 +55,10 @@ Device identity is extracted from the mTLS certificate CN field via a gRPC inter
 
 ### Agent internals (`internal/agent/`)
 
-- `daemon.go` — Orchestrator; supervises the hub session — on event-stream death it re-runs Register→Subscribe with backoff so roaming/IP changes recover without a daemon restart (issue #61)
+- `daemon.go` — Orchestrator; supervises the hub session — on event-stream death it re-runs Register→Subscribe with backoff so roaming/IP changes recover without a daemon restart (issue #61); a background mount-health monitor (`runMountMonitor`/`reconcileMounts`, 15s default, `HUBFUSE_MOUNT_MONITOR_INTERVAL` override) periodically reconciles desired mount state — it triggers Mount's generation-bound single-flight probe for each mount, which is a no-op for healthy/unknown mounts and tears down-and-remounts confirmed-dead ones (ENOTCONN or missing path, issue #67); the sweep re-reads config and online peers before *each* `Mount` (`currentDesiredMount`) so a mid-sweep config reload or `DeviceOffline` cannot be undone by a stale snapshot, and repeated *establish* failures back off exponentially per mount (10m cap) while probes of existing entries always run, so healing is never gated (issue #67); `processInitialDevices` prunes vanished peers from `onlineDevices` on re-register (issue #67)
 - `client.go` — gRPC client wrapper
 - `connector.go` — Hub connection with backoff retry
-- `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table); `Mount` remounts a peer when its IP/port changes and `buildMountArgs` adds sshfs `reconnect`/`ServerAlive*` keepalive opts so a same-IP TCP blip self-heals (issue #61)
+- `mounter.go` — SSHFS mount/unmount lifecycle; mount tool is selectable via the `mount-tool` config key (see the `mountBackends` table); `Mount` remounts a peer when its IP/port changes and `buildMountArgs` adds sshfs `reconnect`/`ServerAlive*` keepalive opts so a same-IP TCP blip self-heals (issue #61); `Mount`'s same-endpoint branch uses a generation-bound single-flight probe with tri-state health classification (healthy/dead/unknown) and tears down/remounts only confirmed-dead mounts (ENOTCONN zombie, issue #67); the daemon's desired-state reconciliation loop calls `Mount` for each desired entry, driving probes through the single-flight registry
 - `sshserver.go` — Embedded SSH server (default port 2222) for incoming SSHFS
 - `config/` — KDL format config parser (`config.go`), diff detection (`diff.go`), hot-reload via fsnotify (`watcher.go`)
 
@@ -73,4 +73,5 @@ TLS cert helpers, structured logging setup, protocol version constant, common er
 - **Data layer**: All hub persistence goes through the `store.Store` interface — add new queries there, implement in `sqlite.go`
 - **Events**: Registry fans out events to subscriber channels; agents process them in `events.go`
 - **Integration tests** (`tests/integration/`): Spin up an in-process hub with in-memory SQLite, create TLS certs programmatically, and test full gRPC flows
+- **Scenario tests** (`tests/scenarios/`): End-to-end hub + daemons using a stub sshfs (`tests/tools/stub-sshfs`, selected via `HUBFUSE_STUB_MOUNT_DIR`); the stub harness is faithful — a mount is alive iff its JSON marker exists and its PID is running (`internal/agent/stubmount.go`), so killing the stub simulates a dead sshfs (issue #67)
 - **Release versioning**: Lives in the `internal/version` package (the single source of truth for both binaries); GoReleaser injects version metadata via ldflags into that package's vars (`-X github.com/ykhdr/hubfuse/internal/version.{version,commit,date}`), NOT into `main.*` — wire any new version strings there

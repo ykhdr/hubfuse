@@ -84,6 +84,28 @@ type Daemon struct {
 	// retries. (#61)
 	minReconnectInterval time.Duration
 
+	// mountMonitorInterval is the cadence of the background mount-health monitor
+	// (runMountMonitor): every tick it runs reconcileMounts — desired-state
+	// reconciliation that probes mounts and heals confirmed-dead ones through
+	// Mount's generation-bound single-flight Ensure semantics. The monitor
+	// exists for the event-less windows the Subscribe stream cannot cover — an
+	// sshfs that dies while its peer stays registered at the same endpoint
+	// never produces a hub event at all. NewDaemon sets
+	// defaultMountMonitorInterval, overridable via the
+	// HUBFUSE_MOUNT_MONITOR_INTERVAL env var (a test handle for scenario
+	// tests, like HUBFUSE_STUB_MOUNT_DIR); <= 0 disables the monitor.
+	// buildTestDaemon bypasses NewDaemon and leaves this 0, so unit tests
+	// never run the monitor unless they set it explicitly. (#67)
+	mountMonitorInterval time.Duration
+
+	// reconcileFails tracks consecutive reconcile failures per mount, driving
+	// both the retry backoff and the log-once-per-transition gate (see
+	// noteReconcileFailure). Lazily built, guarded by reconcileMu —
+	// buildTestDaemon constructs Daemon as a literal, so this must tolerate a
+	// nil map. (#67)
+	reconcileMu    sync.Mutex
+	reconcileFails map[mountKey]*reconcileState
+
 	// registerFn and subscribeFn are injectable seams over the concrete
 	// HubClient (client.go has no interface, so it cannot be stubbed without a
 	// live gRPC connection). NewDaemon wires them to delegate to
@@ -185,6 +207,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		onReady:       opts.OnReady,
 
 		minReconnectInterval: backoffInitial,
+		mountMonitorInterval: mountMonitorIntervalFromEnv(
+			os.Getenv("HUBFUSE_MOUNT_MONITOR_INTERVAL"),
+			defaultMountMonitorInterval, logger),
 	}
 
 	// Wire the hub-session seams to the live client. The closures read d.hubClient
@@ -608,10 +633,11 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 	}
 }
 
-// runServices starts the heartbeat ticker and config watcher, then blocks
-// until ctx is cancelled before shutting down.
+// runServices starts the heartbeat ticker, the mount-health monitor (#67), and
+// the config watcher, then blocks until ctx is cancelled before shutting down.
 func (d *Daemon) runServices(ctx context.Context) error {
 	go d.runHeartbeat(ctx)
+	go d.runMountMonitor(ctx)
 
 	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
 	if err != nil {
@@ -629,6 +655,286 @@ func (d *Daemon) runServices(ctx context.Context) error {
 	d.logger.Info("daemon shutting down")
 
 	return d.Shutdown()
+}
+
+// defaultMountMonitorInterval is the default cadence of the mount-health
+// monitor. It sits between the hub's 10s heartbeat interval and its 30s
+// offline timeout: fast enough that a confirmed-dead mount is usually healed
+// within one heartbeat cycle, slow enough that liveness probes (a stat per
+// active mount per tick) stay negligible. (#67)
+const defaultMountMonitorInterval = 15 * time.Second
+
+// mountMonitorIntervalFromEnv resolves the mount-monitor interval from the raw
+// HUBFUSE_MOUNT_MONITOR_INTERVAL env value. An empty value keeps def; a value
+// time.ParseDuration accepts is used as-is — including zero or negative, which
+// disable the monitor (see runMountMonitor); a malformed value logs a WARN and
+// falls back to def so a typo can never silently disable dead-mount healing.
+// It is a pure helper so the parsing rules are unit-testable without driving
+// NewDaemon (which needs a full on-disk fixture). (#67)
+func mountMonitorIntervalFromEnv(raw string, def time.Duration, logger *slog.Logger) time.Duration {
+	if raw == "" {
+		return def
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil {
+		logger.Warn("invalid HUBFUSE_MOUNT_MONITOR_INTERVAL; using default",
+			"value", raw,
+			"default", def,
+			"error", err,
+		)
+		return def
+	}
+	return interval
+}
+
+// runMountMonitor periodically reconciles the desired mount state against
+// actual mounts: on each tick, snapshot config and
+// online devices, build the desired set, and call Mounter.Mount for every
+// desired entry. Mount's generation-safe Ensure semantics probe live mounts
+// (a no-op), tear down and remount confirmed-dead ones, and establish
+// missing ones. A slow sweep simply delays the next tick — no overlapping
+// sweeps. (#67 desired-state reconciliation)
+//
+// Returns immediately when mountMonitorInterval <= 0 (monitor disabled);
+// exits when ctx is cancelled.
+func (d *Daemon) runMountMonitor(ctx context.Context) {
+	if d.mountMonitorInterval <= 0 {
+		d.logger.Info("mount monitor disabled", "interval", d.mountMonitorInterval)
+		return
+	}
+
+	ticker := time.NewTicker(d.mountMonitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.reconcileMounts(ctx)
+		}
+	}
+}
+
+// reconcileMounts is the desired-state reconciliation loop. Each tick:
+//  1. Snapshots config and online devices under d.mu.
+//  2. Builds the desired mount set: configured mounts whose peer is online,
+//     paired, and exports the matching share.
+//  3. Calls Mounter.Mount for each desired mount — Mount's Ensure semantics
+//     probe the existing entry (a no-op if healthy/unknown), tear down and
+//     remount if confirmed-dead, or establish a new mount.
+//
+// reconcileMounts deliberately does NOT detect-then-act from a stale
+// snapshot: it goes directly to the desired set and delegates every
+// mount decision to Mount's generation-bound single-flight probe. A mount
+// that was removed from config or whose peer went offline is NOT touched
+// here — event paths (DeviceOffline, onConfigChange) own that cleanup.
+// (#67 desired-state reconciliation)
+func (d *Daemon) reconcileMounts(ctx context.Context) {
+	// Snapshot only the KEYS to visit. Everything a mount decision depends on
+	// — the config entry, the peer's endpoint, whether the mount is still
+	// wanted at all — is re-read immediately before each Mount call by
+	// currentDesiredMount. A single Mount can hold the mounter lock for the
+	// full mount-verify timeout, so config reloads and DeviceOffline events
+	// land mid-sweep routinely; acting on a sweep-start snapshot would
+	// re-create a mount that onConfigChange or handleDeviceOffline had just
+	// torn down, and nothing would ever clean that one up.
+	d.mu.RLock()
+	keys := make([]mountKey, 0, len(d.config.Mounts))
+	for _, mc := range d.config.Mounts {
+		keys = append(keys, mountKey{Device: mc.Device, Share: mc.Share})
+	}
+	d.mu.RUnlock()
+
+	for _, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+
+		mc, peer, desired := d.currentDesiredMount(key)
+		if !desired {
+			continue
+		}
+
+		// The backoff gates ESTABLISHING a mount from scratch — that is the
+		// path that burns the whole verify window under the mounter lock. It
+		// must never gate an existing entry: probing one is cheap (bounded,
+		// single-flight) and is exactly the dead-mount healing this issue is
+		// about. Otherwise a stale penalty from an earlier failed establish
+		// would suppress healing for minutes — and because a skipped key never
+		// calls Mount, it would never observe the success that clears it.
+		establishing := !d.mounter.IsActive(key.Device, key.Share)
+		if establishing && !d.reconcileDue(key) {
+			continue
+		}
+
+		err := d.mounter.Mount(ctx, mc, peer.DeviceID, peer.IP, peer.SSHPort)
+		if err == nil {
+			d.clearReconcileErr(key)
+			continue
+		}
+		// Log once per transition, not once per tick. Some failures are
+		// stable and only the user can clear them — the #49 guard on a target
+		// holding local files is the classic one — and this loop retries every
+		// mountMonitorInterval forever. Repeating the same error every 15s
+		// would bury the log for a condition that has not changed.
+		//
+		// Only an establish attempt feeds the backoff. A failure while the
+		// entry is still active is a probe or teardown failure (e.g. the force
+		// unmount ladder losing to a wedged mount); those retry every tick by
+		// design, and counting them would silently inflate the delay that
+		// applies later, once the entry does go away — stalling the re-mount
+		// for minutes in exactly the dead-mount scenario #67 is about.
+		if d.noteReconcileFailure(key, err.Error(), establishing) {
+			d.logger.Error("mount reconcile: mount failed",
+				"device", mc.Device,
+				"share", mc.Share,
+				"error", err,
+			)
+			continue
+		}
+		d.logger.Debug("mount reconcile: mount still failing with the same error",
+			"device", mc.Device,
+			"share", mc.Share,
+			"error", err,
+		)
+	}
+}
+
+// currentDesiredMount re-reads the live config and online-device set and
+// reports whether key is still a mount we want right now, returning the
+// CURRENT config entry and a copy of the peer's current endpoint.
+//
+// It is deliberately called per iteration rather than once per sweep: a sweep
+// can span tens of seconds, and both the config (hot reload) and the online
+// set (DeviceOffline) change underneath it.
+func (d *Daemon) currentDesiredMount(key mountKey) (agentconfig.MountConfig, *OnlineDevice, bool) {
+	d.mu.RLock()
+	var (
+		mc      agentconfig.MountConfig
+		peer    *OnlineDevice
+		inCfg   bool
+		nothing agentconfig.MountConfig
+	)
+	for _, cand := range d.config.Mounts {
+		if cand.Device == key.Device && cand.Share == key.Share {
+			mc, inCfg = cand, true
+			break
+		}
+	}
+	if inCfg {
+		for _, dev := range d.onlineDevices {
+			if dev.Nickname == key.Device {
+				cp := *dev
+				cp.Shares = append([]string(nil), dev.Shares...)
+				peer = &cp
+				break
+			}
+		}
+	}
+	d.mu.RUnlock()
+
+	// Removed from config, or the peer is offline. Teardown belongs to the
+	// event paths (onConfigChange, DeviceOffline), never to this loop.
+	if !inCfg || peer == nil {
+		return nothing, nil, false
+	}
+
+	exported := false
+	for _, s := range peer.Shares {
+		if s == key.Share {
+			exported = true
+			break
+		}
+	}
+	if !exported {
+		return nothing, nil, false
+	}
+	if !d.isPaired(peer.DeviceID) {
+		return nothing, nil, false
+	}
+	return mc, peer, true
+}
+
+// maxReconcileBackoff caps the retry delay for a mount that keeps failing.
+const maxReconcileBackoff = 10 * time.Minute
+
+// reconcileState tracks consecutive reconcile failures for one mount.
+type reconcileState struct {
+	lastErr  string    // last error message, for the log-once-per-transition gate
+	attempts int       // consecutive failures
+	nextTry  time.Time // earliest next attempt
+}
+
+// reconcileDue reports whether key may be attempted on this tick. A mount with
+// no failure history is always due.
+func (d *Daemon) reconcileDue(key mountKey) bool {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	st, ok := d.reconcileFails[key]
+	if !ok {
+		return true
+	}
+	return !time.Now().Before(st.nextTry)
+}
+
+// noteReconcileFailure records a failed attempt for key, returning whether this
+// failure should be logged at Error (true for the first failure and for any
+// changed message).
+//
+// establishing says whether the attempt was a mount-from-scratch; only those
+// extend the backoff. The backoff matters beyond log volume: Mount holds the
+// mounter lock for the whole mount-verify window when a mount cannot be
+// established, so retrying an unreachable-but-online peer every tick would keep
+// that lock busy nearly continuously and queue up Unmount, DeviceOffline
+// teardown and shutdown behind it. Failures against an entry that is still
+// active are probe/teardown failures, which are cheap and must keep retrying
+// every tick. (#67)
+func (d *Daemon) noteReconcileFailure(key mountKey, msg string, establishing bool) bool {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	if d.reconcileFails == nil {
+		d.reconcileFails = make(map[mountKey]*reconcileState)
+	}
+	st, ok := d.reconcileFails[key]
+	if !ok {
+		st = &reconcileState{}
+		d.reconcileFails[key] = st
+	}
+
+	if !establishing {
+		// Log gate only — no backoff accrual.
+		shouldLog := st.lastErr != msg
+		st.lastErr = msg
+		return shouldLog
+	}
+
+	base := d.mountMonitorInterval
+	if base <= 0 {
+		base = defaultMountMonitorInterval
+	}
+	shift := st.attempts // 0 on the first failure → one interval
+	if shift > 16 {
+		shift = 16 // guard the shift; the clamp below caps the value anyway
+	}
+	delay := base << shift
+	if delay <= 0 || delay > maxReconcileBackoff {
+		delay = maxReconcileBackoff
+	}
+
+	st.attempts++
+	st.nextTry = time.Now().Add(delay)
+	shouldLog := st.lastErr != msg
+	st.lastErr = msg
+	return shouldLog
+}
+
+// clearReconcileErr forgets any recorded failure for key, so a mount that
+// recovers is retried without backoff and a later relapse logs at Error again.
+func (d *Daemon) clearReconcileErr(key mountKey) {
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+	delete(d.reconcileFails, key)
 }
 
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
@@ -673,11 +979,53 @@ func (d *Daemon) Shutdown() error {
 }
 
 // processInitialDevices handles the list of online devices received on Register.
-// For each device that is paired, it auto-mounts every share configured for that
-// device. processInitialDevices runs again on every reconnect, so a roaming peer
-// whose endpoint changed has each of its shares re-pointed at the new IP/port by
-// Mount's remount branch. (#61)
+// The snapshot is AUTHORITATIVE for who is online right now, in both directions:
+//
+//   - Devices present in the snapshot are added/refreshed in onlineDevices, and
+//     each paired one has every configured share it exports (re)mounted.
+//     processInitialDevices runs again on every reconnect, so a roaming peer
+//     whose endpoint changed has each of its shares re-pointed at the new
+//     IP/port by Mount's remount branch. (#61)
+//   - Devices ABSENT from the snapshot are pruned from onlineDevices: a peer
+//     that went offline while our event stream was dead never delivered its
+//     DeviceOffline, and an add/update-only reconciliation would leave the
+//     stale entry lying forever — misleading every consumer of the map
+//     (reconcileMounts would keep re-mounting a gone peer's mounts at its
+//     dead endpoint instead of leaving them for the offline event path).
+//     (#67)
+//
+// Nothing is unmounted in this path, deliberately. A missing snapshot entry
+// proves only that the HUB lost the peer — not that the SSH data path did — so
+// tearing down a possibly-live mount here would be exactly the
+// touch-unconfirmed-mounts mistake the monitor is designed to avoid. Instead the
+// prune feeds the conservative division of labour: once the entry is gone, the
+// mount monitor's next sweep sees the peer as offline and skips its mounts
+// (reconcileMounts); a mount that is still alive is left untouched. (#67)
 func (d *Daemon) processInitialDevices(devices []*pb.DeviceInfo) {
+	present := make(map[string]struct{}, len(devices))
+	for _, dev := range devices {
+		present[dev.DeviceId] = struct{}{}
+	}
+
+	d.mu.Lock()
+	var pruned []*OnlineDevice
+	for id, info := range d.onlineDevices {
+		if _, ok := present[id]; !ok {
+			pruned = append(pruned, info)
+			delete(d.onlineDevices, id)
+		}
+	}
+	d.mu.Unlock()
+
+	// Log outside the lock — no daemon state is read here, and the entries were
+	// exclusively ours the moment they left the map.
+	for _, info := range pruned {
+		d.logger.Info("peer absent from register snapshot, dropping stale online entry",
+			"device_id", info.DeviceID,
+			"nickname", info.Nickname,
+		)
+	}
+
 	for _, dev := range devices {
 		info := protoToOnlineDevice(dev)
 

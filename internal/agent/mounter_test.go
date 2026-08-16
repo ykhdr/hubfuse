@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -645,6 +648,232 @@ func TestMount_RemountUnmountFailureAborts(t *testing.T) {
 	mounts := m.ActiveMounts()
 	require.Len(t, mounts, 1, "stale entry must be retained for retry")
 	assert.Equal(t, "10.0.0.1", mounts[0].IP, "retained entry must still hold the old endpoint")
+}
+
+// ─── Same-endpoint liveness probe (#67 dead-mount healing) ────────────────────
+
+// TestMount_SameEndpointAliveProbeIsNoOp verifies that a same-endpoint re-Mount
+// PROBES the existing mountpoint and, when the probe reports it alive, is a
+// silent no-op: no teardown, no new backend invocation, entry retained.
+// (#67 dead-mount healing)
+func TestMount_SameEndpointAliveProbeIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Install a probe-aware check AFTER the first Mount: alive, and record the
+	// probed path so we can prove the same-endpoint branch actually consulted it.
+	var probeCalls atomic.Int32
+	var probedPath atomic.Value
+	m.SetMountpointCheckForTests(func(path string) (bool, error) {
+		probeCalls.Add(1)
+		probedPath.Store(path)
+		return true, nil
+	})
+
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222),
+		"same-endpoint re-Mount of a LIVE mount must be a silent no-op")
+
+	assert.Equal(t, int32(1), probeCalls.Load(), "the same-endpoint branch must probe the mountpoint exactly once")
+	assert.Equal(t, mountTo, probedPath.Load(), "the probe must target the existing mount's local path")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "a live mount must NOT be torn down")
+	assert.Equal(t, int32(1), execCalls.Load(), "a live mount must NOT trigger a new backend invocation")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the live entry must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
+}
+
+// TestMount_SameEndpointDeadRemounts verifies the #67 core fix: a same-endpoint
+// re-Mount whose liveness probe CONFIRMS the mount dead — checkMountpoint says
+// "not a mountpoint" or errors (the ENOTCONN zombie) — tears the zombie down
+// (force unmount) and re-mounts at the same endpoint, re-invoking the backend
+// and refreshing the entry. (#67 dead-mount healing)
+func TestMount_SameEndpointDeadRemounts(t *testing.T) {
+	tests := []struct {
+		name     string
+		probeMnt bool
+		probeErr error
+	}{
+		{name: "not a mountpoint", probeMnt: false, probeErr: nil},
+		{name: "probe errors with ENOTCONN", probeMnt: false, probeErr: syscall.ENOTCONN},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			knownDir := filepath.Join(dir, common.KnownDevicesDir)
+			keyPath := filepath.Join(dir, "id_ed25519")
+			mountTo := filepath.Join(dir, "mnt", "docs")
+			t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+			writePubKeyFile(t, knownDir, "device-a")
+
+			var execCalls, unmountCalls atomic.Int32
+			var unmountForce atomic.Bool
+			var capturedArgs []string
+			m := newTestMounter(t, knownDir, keyPath, &capturedArgs, func(_ context.Context, _ string, force bool) error {
+				unmountCalls.Add(1)
+				unmountForce.Store(force)
+				return nil
+			})
+			base := m.execCommand
+			m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				execCalls.Add(1)
+				return base(ctx, name, args...)
+			}
+
+			mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+			require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+			// After the first Mount, the sshfs behind the entry "dies": the FIRST
+			// check call (the liveness probe) reports the configured dead result;
+			// subsequent calls (the new mount's verify poll) see the fresh mount.
+			var checkCalls atomic.Int32
+			m.SetMountpointCheckForTests(func(string) (bool, error) {
+				if checkCalls.Add(1) == 1 {
+					return tt.probeMnt, tt.probeErr
+				}
+				return true, nil
+			})
+
+			require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222),
+				"re-Mount of a confirmed-dead mount at the same endpoint must succeed")
+
+			assert.Equal(t, int32(1), unmountCalls.Load(), "the dead mount must be torn down exactly once")
+			assert.True(t, unmountForce.Load(), "dead-mount teardown must be forced (mirrors the #61 remount branch)")
+			assert.Equal(t, int32(2), execCalls.Load(), "the backend must be re-invoked for the fresh mount")
+			assert.Contains(t, capturedArgs, "hubfuse@10.0.0.1:docs",
+				"the fresh mount must target the SAME endpoint")
+
+			mounts := m.ActiveMounts()
+			require.Len(t, mounts, 1, "exactly one active mount after healing")
+			assert.Equal(t, "10.0.0.1", mounts[0].IP, "healed entry keeps the same IP")
+			assert.Equal(t, 2222, mounts[0].SSHPort, "healed entry keeps the same port")
+			assert.Equal(t, mountTo, mounts[0].LocalPath)
+		})
+	}
+}
+
+// TestMount_SameEndpointHangingProbeIsNoOp verifies the "timeout is not
+// evidence" guarantee end-to-end through Mount: when the liveness probe hangs
+// past its deadline, the mount is NOT confirmed dead, so the possibly-live
+// mount is left untouched — no teardown, no new backend invocation, nil return.
+// (#67 dead-mount healing, no false teardown)
+func TestMount_SameEndpointHangingProbeIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// The probe wedges (blocking FUSE stat simulation). The probe context is
+	// derived from Mount's ctx, so a short caller deadline bounds the wait and
+	// the test does not sit out the full mountProbeTimeout.
+	blocked := make(chan struct{}) // never closed
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		<-blocked
+		return true, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := m.Mount(ctx, mc, "device-a", "10.0.0.1", 2222)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "an unconfirmed (hanging) probe must be treated as alive → no-op nil")
+	assert.Less(t, elapsed, 2*time.Second, "Mount must return promptly once the probe deadline fires")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "a possibly-live mount must NEVER be torn down on a probe timeout")
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation on a probe timeout")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the possibly-live entry must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+}
+
+// TestMount_SameEndpointDeadUnmountFailureAborts verifies that when the probe
+// confirms the mount dead but the teardown fails (unmount errors AND the
+// re-check still sees a mountpoint), Mount returns an error and does NOT start
+// a new mount — the entry is retained (by unmountKey) for the next retry.
+// (#67 dead-mount healing; mirrors the #61 TestMount_RemountUnmountFailureAborts)
+func TestMount_SameEndpointDeadUnmountFailureAborts(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		return errors.New("device is busy")
+	})
+	base := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return base(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Probe (1st call) says dead; unmountKey's post-failure re-check (2nd call)
+	// still sees a mountpoint → the entry must be retained and an error returned.
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		if checkCalls.Add(1) == 1 {
+			return false, nil
+		}
+		return true, nil
+	})
+
+	err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	require.Error(t, err, "healing must fail when the dead mount cannot be torn down")
+	assert.Contains(t, err.Error(), "unmount stale endpoint", "error must explain the teardown failure")
+
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation when teardown fails")
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the entry must be retained for a later retry")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+	assert.Equal(t, 2222, mounts[0].SSHPort)
 }
 
 // TestMount_NoExistingMountProceedsNormally verifies the baseline path is
@@ -1654,4 +1883,516 @@ func TestGuardTarget_StubNoOp(t *testing.T) {
 	count, err := m.targetHasLocalContents(target)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count, "targetHasLocalContents must return 0 under stub")
+}
+
+// ─── #67 direct regression tests ──────────────────────────────────────────────
+//
+// The three test groups below close the two MAJOR findings from issue #67
+// review by adding direct, deterministic regression coverage for:
+//
+// 1. classifyMountHealth tri-state classification — all 5+ branches tested
+//    directly as a pure function table test (MAJOR-1).
+// 2. probeGenerationLocked single-flight join — concurrent callers joining
+//    the same blocked probe, asserting exactly one checkMountpoint invocation
+//    and all callers returning conservatively (MAJOR-2).
+// 3. probeGenerationLocked stale-generation safety — a probe that completes
+//    after the mount pointer was replaced is discarded, and the replacement
+//    mount is unaffected (MAJOR-2).
+//
+// All tests are deterministic, race-safe, and use channels/atomics (no flaky
+// sleeps). The single-flight and stale-generation tests run through the real
+// Mount → probeGenerationLocked path so they exercise the full lock discipline
+// and generation-identity checks.
+
+// ─── Test 1: classifyMountHealth tri-state table test ──────────────────────────
+
+// TestClassifyMountHealth is a direct table test for the pure function
+// classifyMountHealth. It covers all 5+ classification branches to ensure
+// a future change cannot accidentally re-classify an unknown error as dead
+// without detection. (MAJOR-1 from issue #67 review)
+func TestClassifyMountHealth(t *testing.T) {
+	tests := []struct {
+		name  string
+		isMnt bool
+		err   error
+		want  mountHealth
+	}{
+		// Healthy: positive evidence the mount is alive.
+		{
+			name:  "healthy: isMnt=true, no error",
+			isMnt: true,
+			err:   nil,
+			want:  mountHealthHealthy,
+		},
+		// Dead: positive evidence the mount is gone.
+		{
+			name:  "dead: isMnt=false, no error",
+			isMnt: false,
+			err:   nil,
+			want:  mountHealthDead,
+		},
+		{
+			name:  "dead: ENOTCONN (dead FUSE transport)",
+			isMnt: false,
+			err:   syscall.ENOTCONN,
+			want:  mountHealthDead,
+		},
+		{
+			name:  "dead: fs.ErrNotExist (wrapped ENOENT)",
+			isMnt: false,
+			err:   fs.ErrNotExist,
+			want:  mountHealthDead,
+		},
+		{
+			name:  "dead: os.ErrNotExist (os.IsNotExist path)",
+			isMnt: false,
+			err:   os.ErrNotExist,
+			want:  mountHealthDead,
+		},
+		{
+			name:  "dead: syscall.ENOENT (raw syscall error, os.IsNotExist true)",
+			isMnt: false,
+			err:   syscall.ENOENT,
+			want:  mountHealthDead,
+		},
+		// Unknown: ambiguous — NEVER teardown.
+		{
+			name:  "unknown: EACCES (permission denied, not a dead-mount signal)",
+			isMnt: false,
+			err:   syscall.EACCES,
+			want:  mountHealthUnknown,
+		},
+		{
+			name:  "unknown: EINTR (interrupted syscall, not a dead-mount signal)",
+			isMnt: false,
+			err:   syscall.EINTR,
+			want:  mountHealthUnknown,
+		},
+		{
+			name:  "unknown: arbitrary error",
+			isMnt: false,
+			err:   errors.New("arbitrary fuse error"),
+			want:  mountHealthUnknown,
+		},
+		{
+			name:  "unknown: context deadline exceeded",
+			isMnt: false,
+			err:   context.DeadlineExceeded,
+			want:  mountHealthUnknown,
+		},
+		{
+			name:  "unknown: context cancelled",
+			isMnt: false,
+			err:   context.Canceled,
+			want:  mountHealthUnknown,
+		},
+		// Edge: healthy takes priority over isMnt=false when err is nil.
+		{
+			name:  "healthy: isMnt=true trumps any non-error state",
+			isMnt: true,
+			err:   nil,
+			want:  mountHealthHealthy,
+		},
+		// Edge: error path takes priority over isMnt.
+		{
+			name:  "dead: error takes priority even when isMnt=true (shouldn't happen but contract is clear)",
+			isMnt: true,
+			err:   syscall.ENOTCONN,
+			want:  mountHealthDead,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyMountHealth(tt.isMnt, tt.err)
+			assert.Equal(t, tt.want, got, "classifyMountHealth(%v, %v)", tt.isMnt, tt.err)
+		})
+	}
+}
+
+// ─── Test 2: probeGenerationLocked single-flight join ─────────────────────────
+
+// TestProbeGenerationLocked_SingleFlightJoin verifies that when multiple
+// goroutines call Mount concurrently for the same key and generation, only
+// ONE checkMountpoint invocation occurs, and all callers receive the same
+// result conservatively. (MAJOR-2 from issue #67 review)
+//
+// Since the current probeEntry uses a buffered(1) result channel, exactly one
+// joiner is supported alongside the initiator. 2 concurrent callers (initiator
+// + 1 joiner) is the tested and valid case. N>2 callers would leak goroutines
+// on the channel — the test uses 2 callers and asserts correct single-flight
+// behavior.
+func TestProbeGenerationLocked_SingleFlightJoin(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	baseExec := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return baseExec(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Install a checkMountpoint that blocks until released, and counts calls.
+	checkStarted := make(chan struct{})
+	releaseCheck := make(chan struct{})
+	var startOnce sync.Once
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		checkCalls.Add(1)
+		// sync.Once, not a bare close: if single-flight ever regresses and a
+		// second probe starts, the test must fail on the call-count assertion
+		// below rather than panic on a double close.
+		startOnce.Do(func() { close(checkStarted) })
+		<-releaseCheck // block until released
+		return true, nil
+	})
+
+	// Launch one initiator plus SEVERAL joiners. The count is deliberately >2:
+	// the result is broadcast by closing probeEntry.done, so an unbounded
+	// number of joiners observes it. An earlier implementation sent the result
+	// on a buffered(1) channel, where the first joiner drained the buffer and
+	// every subsequent joiner blocked forever — this test caps at 2 no longer.
+	const numCallers = 5
+	errs := make([]error, numCallers)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < numCallers; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				errs[idx] = m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+			}(i)
+		}
+		wg.Wait()
+	}()
+
+	// Wait for the probe to start (checkMountpoint called once).
+	<-checkStarted
+
+	// Give the joiners time to reach the <-probe.done wait.
+	time.Sleep(50 * time.Millisecond)
+
+	// Exactly one checkMountpoint call so far.
+	assert.Equal(t, int32(1), checkCalls.Load(), "only one checkMountpoint invocation must have occurred (single-flight join)")
+
+	// Release the probe.
+	close(releaseCheck)
+
+	// Wait for all callers to complete. Bounded: a joiner that never observes
+	// the broadcast would otherwise hang the package until the test binary's
+	// global timeout, hiding which test wedged.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("joiners did not observe the probe result — single-flight broadcast is wedged")
+	}
+
+	// All callers must return nil (healthy probe → no-op).
+	for i, err := range errs {
+		assert.NoError(t, err, "caller %d must return nil (healthy probe → no-op)", i)
+	}
+
+	// Exactly one checkMountpoint call total.
+	assert.Equal(t, int32(1), checkCalls.Load(), "exactly one checkMountpoint invocation total (single-flight join)")
+
+	// No teardown or re-exec.
+	assert.Equal(t, int32(0), unmountCalls.Load(), "no unmount calls on a healthy mount")
+	assert.Equal(t, int32(1), execCalls.Load(), "no new backend invocation on a healthy mount")
+
+	// The original mount is retained.
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "the original mount must be retained")
+	assert.Equal(t, "10.0.0.1", mounts[0].IP)
+}
+
+// TestProbeGenerationLocked_JoinerHonoursOwnContext verifies that a caller that
+// JOINS an in-flight probe is bounded by its own ctx rather than by the probe
+// owner's. A joiner that ignored ctx.Done() would stay pinned to the owner for
+// up to mountProbeTimeout, blowing past its own deadline. The cancelled joiner
+// must return unknown — which Mount treats as a no-op, never a teardown.
+// (#67 single-flight)
+func TestProbeGenerationLocked_JoinerHonoursOwnContext(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	checkStarted := make(chan struct{})
+	releaseCheck := make(chan struct{})
+	var startOnce sync.Once
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		startOnce.Do(func() { close(checkStarted) })
+		<-releaseCheck
+		return true, nil
+	})
+
+	// Owner: blocks inside the probe until releaseCheck is closed.
+	ownerDone := make(chan struct{})
+	go func() {
+		defer close(ownerDone)
+		_ = m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+	}()
+	<-checkStarted
+	time.Sleep(50 * time.Millisecond) // let the owner settle inside the probe
+
+	// Joiner: same key/generation, but its ctx expires almost immediately.
+	jctx, jcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer jcancel()
+	start := time.Now()
+	err := m.Mount(jctx, mc, "device-a", "10.0.0.1", 2222)
+	elapsed := time.Since(start)
+
+	assert.NoError(t, err, "a cancelled joiner yields unknown, which Mount treats as a no-op")
+	assert.Less(t, elapsed, 2*time.Second,
+		"joiner must return on its own ctx deadline, not wait out the owner's probe")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "unknown health must never tear a mount down")
+
+	// The mount is untouched, and the owner still completes cleanly.
+	require.Len(t, m.ActiveMounts(), 1, "the original mount must be retained")
+
+	close(releaseCheck)
+	select {
+	case <-ownerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("probe owner did not finish after release")
+	}
+}
+
+// TestProbeGenerationLocked_WedgedProbeSpawnsOneGoroutine verifies the bound on
+// the one leak this design cannot eliminate. A stat against a wedged-but-alive
+// FUSE mount never returns, and Go cannot cancel a goroutine blocked in a
+// syscall — it pins an OS thread. Since the monitor drives a probe for every
+// desired mount every tick, re-spawning per tick would leak ~240 pinned threads
+// an hour and eventually abort the process on the runtime thread limit.
+//
+// The entry therefore stays registered until the syscall actually returns, so
+// every later tick JOINS it. This test simulates repeated monitor ticks against
+// a permanently wedged mount and asserts exactly one probe was ever started.
+// (#67)
+func TestProbeGenerationLocked_WedgedProbeSpawnsOneGoroutine(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// A probe that never returns — the wedged-but-alive FUSE case.
+	wedged := make(chan struct{})
+	t.Cleanup(func() { close(wedged) }) // release the goroutine when the test ends
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		checkCalls.Add(1)
+		<-wedged
+		return true, nil
+	})
+
+	// Simulate monitor ticks. Each caller uses a short ctx so it gives up
+	// quickly; the probe stays outstanding across all of them.
+	const ticks = 5
+	for i := 0; i < ticks; i++ {
+		tickCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		err := m.Mount(tickCtx, mc, "device-a", "10.0.0.1", 2222)
+		cancel()
+		require.NoError(t, err, "tick %d: an unresolved probe is unknown, which Mount treats as a no-op", i)
+	}
+
+	assert.Equal(t, int32(1), checkCalls.Load(),
+		"a wedged probe must be started once and joined thereafter, not re-spawned per tick")
+	assert.Equal(t, int32(0), unmountCalls.Load(), "unknown health must never tear a mount down")
+	require.Len(t, m.ActiveMounts(), 1, "the mount must be retained across every tick")
+}
+
+// TestMount_EntryVanishedMidProbeDoesNotResurrect verifies that when the active
+// entry is removed while its health probe is in flight, Mount does NOT
+// re-create it. The remover is normally Unmount via a config removal or
+// DeviceOffline, and Mount cannot tell "gone because it is no longer wanted"
+// from "gone by accident" — re-mounting here would strand a de-configured
+// mount that no reconcile tick would ever clean up, since reconcileMounts only
+// walks entries the config still lists. A still-desired mount is re-established
+// by the next monitor tick instead. (#67)
+func TestMount_EntryVanishedMidProbeDoesNotResurrect(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// Count backend invocations from here on: a resurrection would exec again.
+	var execCalls atomic.Int32
+	baseExec := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return baseExec(ctx, name, args...)
+	}
+
+	// Block the probe so we can remove the entry underneath it.
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var startOnce sync.Once
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		startOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		return true, nil
+	})
+
+	mountDone := make(chan error, 1)
+	go func() { mountDone <- m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222) }()
+
+	<-probeStarted
+	// The mount is de-configured while the probe is in flight. Unmount can take
+	// m.mu because probeGenerationLocked released it for the wait.
+	require.NoError(t, m.Unmount("device-a", "docs"), "concurrent Unmount")
+	close(releaseProbe)
+
+	select {
+	case err := <-mountDone:
+		require.NoError(t, err, "Mount must return cleanly when its entry vanished")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Mount did not return after the probe was released")
+	}
+
+	assert.Zero(t, execCalls.Load(), "a vanished entry must not be re-mounted")
+	assert.Empty(t, m.ActiveMounts(), "the removed mount must stay removed")
+}
+
+// ─── Test 3: probeGenerationLocked stale-generation safety ────────────────────
+
+// TestProbeGenerationLocked_StaleGenerationDiscarded verifies that when a
+// health probe completes after the mount entry has been replaced, the stale
+// result is discarded and the replacement mount is unaffected. The probe
+// returns mountHealthUnknown, which Mount treats as a no-op (no teardown).
+// (MAJOR-2 from issue #67 review)
+func TestProbeGenerationLocked_StaleGenerationDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	var execCalls, unmountCalls atomic.Int32
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		unmountCalls.Add(1)
+		return nil
+	})
+	baseExec := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return baseExec(ctx, name, args...)
+	}
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+	require.Equal(t, int32(1), execCalls.Load(), "first Mount invokes the backend once")
+
+	// Install a checkMountpoint that blocks until released, and counts calls.
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var checkCalls atomic.Int32
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		checkCalls.Add(1)
+		close(probeStarted) // signal that the probe goroutine has started
+		<-releaseProbe      // block until released
+		return true, nil    // probe would say healthy, but it's stale
+	})
+
+	// Mount call in a goroutine — it will block in probeHealth.
+	type mountResult struct {
+		err error
+	}
+	resultCh := make(chan mountResult, 1)
+	go func() {
+		err := m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222)
+		resultCh <- mountResult{err: err}
+	}()
+
+	// Wait for the probe to start (checkMountpoint called once).
+	<-probeStarted
+
+	// Replace the mount entry while the probe is in-flight — this simulates
+	// the mount being replaced (e.g. by a different endpoint remount or a
+	// re-mount after a different code path).
+	m.mu.Lock()
+	key := mountKey{Device: "device-a", Share: "docs"}
+	replacementMount := &Mount{
+		Device:    "device-a",
+		Share:     "docs",
+		LocalPath: mountTo,
+		IP:        "10.0.0.2", // different IP — would be a endpoint change
+		SSHPort:   2222,
+	}
+	m.activeMounts[key] = replacementMount
+	m.mu.Unlock()
+
+	// Now release the probe — it will return (true, nil) = healthy, but the
+	// generation check should detect the replacement and discard the result.
+	close(releaseProbe)
+
+	// Wait for the Mount call to complete.
+	result := <-resultCh
+
+	// The stale probe result must be discarded (returns mountHealthUnknown),
+	// which Mount treats as a no-op (no teardown, no re-mount).
+	require.NoError(t, result.err, "Mount must return nil (stale probe → unknown → no-op)")
+
+	// No teardown or re-exec should occur.
+	assert.Equal(t, int32(0), unmountCalls.Load(), "a stale probe must NOT trigger teardown")
+	assert.Equal(t, int32(1), execCalls.Load(), "a stale probe must NOT trigger a new backend invocation")
+
+	// The replacement mount must still be in place.
+	mounts := m.ActiveMounts()
+	require.Len(t, mounts, 1, "exactly one active mount")
+	assert.Equal(t, "10.0.0.2", mounts[0].IP, "the replacement mount's IP must be retained")
+	// Verify the mount POINTER in activeMounts IS the replacement (not the original).
+	m.mu.Lock()
+	key = mountKey{Device: "device-a", Share: "docs"}
+	currentMount := m.activeMounts[key]
+	m.mu.Unlock()
+	assert.Same(t, replacementMount, currentMount, "the activeMounts entry must be the replacement mount pointer, not the original")
+
+	// Exactly one checkMountpoint call total.
+	assert.Equal(t, int32(1), checkCalls.Load(), "exactly one checkMountpoint invocation (the stale probe)")
 }

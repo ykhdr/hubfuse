@@ -180,6 +180,17 @@ func optValue(opts []string, key string) string {
 	return ""
 }
 
+// sanitize converts the mount destination path into the marker filename stem.
+//
+// KEEP IN SYNC — this transformation exists in THREE packages that cannot
+// import each other (a main package, a test helper package, and the agent):
+//   - sanitize() here (marker writer)
+//   - sanitizeForMarker() in tests/scenarios/helpers/agent.go (test-side reader)
+//   - stubSanitizePath() in internal/agent/stubmount.go (agent-side liveness
+//     check + stub unmount, issue #67)
+//
+// Any drift makes the agent look for markers at the wrong path: every mount
+// verify-poll would time out and every liveness probe would read "dead".
 func sanitize(p string) string {
 	r := strings.NewReplacer("/", "_", `\`, "_", ":", "_", " ", "_")
 	return r.Replace(strings.TrimPrefix(p, "/"))

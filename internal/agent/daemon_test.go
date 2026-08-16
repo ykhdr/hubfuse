@@ -6,8 +6,11 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -980,6 +983,68 @@ func TestProcessInitialDevices_MountsOnlyExportedShares(t *testing.T) {
 		"a share absent from the snapshot must NOT be mounted")
 }
 
+// TestProcessInitialDevices_PrunesPeersAbsentFromSnapshot verifies the Register
+// snapshot is authoritative in BOTH directions (#67): a peer that went offline
+// while our event stream was dead (its DeviceOffline never reached us) must be
+// pruned from onlineDevices on re-registration, peers still present must be
+// refreshed in place — and, crucially, the vanished peer's mount must NOT be
+// touched in this path. The prune only reconciles the map; unmounting is owned
+// by the mount monitor, which acts solely on probe-confirmed-dead mounts.
+func TestProcessInitialDevices_PrunesPeersAbsentFromSnapshot(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	docsTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() {
+		_ = os.Chmod(docsTo, 0o755)
+	})
+
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: docsTo},
+	}
+	writePubKey(t, dir, "device-123")
+
+	// Any unmount in this path would violate the conservative contract — the
+	// snapshot proves the HUB lost the peer, not that the SSH data path died.
+	unmountCalls := 0
+	d.mounter.SetUnmountForTests(func(context.Context, string, bool) error {
+		unmountCalls++
+		return nil
+	})
+
+	laptop := &pb.DeviceInfo{
+		DeviceId: "device-123",
+		Nickname: "laptop",
+		Ip:       "10.0.0.5",
+		SshPort:  2222,
+		Shares:   []*pb.Share{{Alias: "docs"}},
+	}
+	tablet := func(ip string) *pb.DeviceInfo {
+		return &pb.DeviceInfo{DeviceId: "device-456", Nickname: "tablet", Ip: ip, SshPort: 2222}
+	}
+
+	// First session: both peers online, laptop's share auto-mounts.
+	d.processInitialDevices([]*pb.DeviceInfo{laptop, tablet("10.0.0.6")})
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "docs must mount from the first snapshot")
+
+	// Reconnect snapshot: laptop vanished while the stream was dead, tablet
+	// roamed to a new IP.
+	d.processInitialDevices([]*pb.DeviceInfo{tablet("10.0.0.66")})
+
+	d.mu.RLock()
+	_, laptopOnline := d.onlineDevices["device-123"]
+	tabletInfo, tabletOnline := d.onlineDevices["device-456"]
+	d.mu.RUnlock()
+
+	assert.False(t, laptopOnline,
+		"a peer absent from the re-register snapshot must be pruned from onlineDevices")
+	require.True(t, tabletOnline, "a peer present in the snapshot must stay in onlineDevices")
+	assert.Equal(t, "10.0.0.66", tabletInfo.IP, "a surviving peer's entry must be refreshed in place")
+
+	assert.True(t, d.mounter.IsActive("laptop", "docs"),
+		"the vanished peer's mount must survive the prune — only the monitor may remove it, and only when confirmed dead")
+	assert.Zero(t, unmountCalls, "processInitialDevices must never unmount anything")
+}
+
 // ─── supervisor: session reconnect (#61) ──────────────────────────────────────
 
 // fakeSubscribeStream is a minimal pb.HubFuse_SubscribeClient for unit tests.
@@ -1667,4 +1732,594 @@ func TestGuardTarget_GuardConfiguredTargets(t *testing.T) {
 	info2, err := os.Stat(mountTo2)
 	require.NoError(t, err)
 	assert.Equal(t, guardMode, info2.Mode().Perm(), "second target must be restricted to guardMode (#49 test 10)")
+}
+
+// ─── Mount monitor: reconcileMounts / runMountMonitor (#67) ─────────────────
+
+// TestReconcileMounts_HealsDeadMount verifies that reconcileMounts heals a
+// dead mount at the same endpoint: Mount's generation-bound single-flight
+// probe detects the dead mount, tears it down, and re-mounts. The mount is
+// still configured, the peer is online, paired, and exporting the share.
+func TestReconcileMounts_HealsDeadMount(t *testing.T) {
+	tests := []struct {
+		name   string
+		peerIP string
+	}{
+		{name: "same endpoint (dead branch)", peerIP: "10.0.0.5"},
+		{name: "roamed endpoint (remount branch)", peerIP: "10.0.0.99"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, dir := buildTestDaemon(t)
+
+			mountTo := filepath.Join(dir, "mnt", "docs")
+			t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+			mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
+			d.config.Mounts = []agentconfig.MountConfig{mc}
+			writePubKey(t, dir, "device-123")
+
+			// Pre-mount at the original endpoint.
+			require.NoError(t, d.mounter.Mount(context.Background(), mc, "device-123", "10.0.0.5", 2222), "pre-mount")
+
+			// Capture every mount exec from here on.
+			var mountCalls [][]string
+			d.mounter.SetExecCommandForTests(func(_ context.Context, name string, args ...string) *exec.Cmd {
+				mountCalls = append(mountCalls, append([]string{name}, args...))
+				return exec.Command("true")
+			})
+
+			// The sshfs behind the mount dies: probes report "gone" until
+			// the zombie is torn down, then fresh mounts verify normally.
+			var deadNow atomic.Bool
+			deadNow.Store(true)
+			var unmountCalls int
+			d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
+				return !deadNow.Load(), nil
+			})
+			d.mounter.SetUnmountForTests(func(_ context.Context, _ string, force bool) error {
+				unmountCalls++
+				assert.True(t, force, "zombie teardown must be forced")
+				deadNow.Store(false)
+				return nil
+			})
+
+			// Hub state: the peer is online, exporting the share, paired.
+			d.mu.Lock()
+			d.onlineDevices["device-123"] = &OnlineDevice{
+				DeviceID: "device-123",
+				Nickname: "laptop",
+				IP:       tt.peerIP,
+				SSHPort:  2222,
+				Shares:   []string{"docs"},
+			}
+			d.mu.Unlock()
+
+			d.reconcileMounts(context.Background())
+
+			require.GreaterOrEqual(t, unmountCalls, 1, "the zombie must be torn down")
+			require.True(t, d.mounter.IsActive("laptop", "docs"), "the dead mount must be remounted")
+
+			mounts := d.mounter.ActiveMounts()
+			require.Len(t, mounts, 1, "exactly one entry after healing")
+			assert.Equal(t, tt.peerIP, mounts[0].IP, "entry must carry the peer's current IP")
+			assert.Equal(t, 2222, mounts[0].SSHPort, "entry must carry the peer's current SSH port")
+
+			require.GreaterOrEqual(t, len(mountCalls), 1, "at least one mount exec")
+			joined := strings.Join(mountCalls[0], " ")
+			assert.Contains(t, joined, "hubfuse@"+tt.peerIP+":docs",
+				"the new exec must target the peer's CURRENT endpoint")
+		})
+	}
+}
+
+// TestReconcileMounts_RetriesMissingEntry verifies that a missing entry (e.g.
+// a failed previous remount tore down the old entry but the fresh mount failed)
+// is retried on the next reconcileMounts tick.
+func TestReconcileMounts_RetriesMissingEntry(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "device-123")
+
+	// Peer is online, paired, exporting the share — but no mount exists yet.
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123",
+		Nickname: "laptop",
+		IP:       "10.0.0.5",
+		SSHPort:  2222,
+		Shares:   []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	// reconcileMounts should establish the missing mount.
+	d.reconcileMounts(context.Background())
+
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "reconcileMounts must establish a missing mount")
+	mounts := d.mounter.ActiveMounts()
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "10.0.0.5", mounts[0].IP)
+}
+
+// TestReconcileMounts_SkipsOfflinePeer verifies that reconcileMounts skips
+// mounts whose peer is offline (not in onlineDevices).
+func TestReconcileMounts_SkipsOfflinePeer(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "ghost", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "ghost-id")
+
+	// Peer is NOT in onlineDevices.
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an offline peer")
+	assert.False(t, d.mounter.IsActive("ghost", "docs"), "no mount should exist for an offline peer")
+}
+
+// TestReconcileMounts_SkipsUnpairedDevice verifies that reconcileMounts skips
+// mounts whose peer is online but not paired.
+func TestReconcileMounts_SkipsUnpairedDevice(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "stranger", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	// Do NOT write a pairing key for this device.
+
+	d.mu.Lock()
+	d.onlineDevices["stranger-id"] = &OnlineDevice{
+		DeviceID: "stranger-id",
+		Nickname: "stranger",
+		IP:       "10.0.0.1",
+		SSHPort:  2222,
+		Shares:   []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an unpaired peer")
+}
+
+// TestReconcileMounts_SkipsUnexportedShare verifies that reconcileMounts skips
+// a mount whose share the peer no longer exports.
+func TestReconcileMounts_SkipsUnexportedShare(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "peer", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "peer-id")
+
+	d.mu.Lock()
+	d.onlineDevices["peer-id"] = &OnlineDevice{
+		DeviceID: "peer-id",
+		Nickname: "peer",
+		IP:       "10.0.0.1",
+		SSHPort:  2222,
+		Shares:   []string{"other"}, // does NOT export "docs"
+	}
+	d.mu.Unlock()
+
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted for an unexported share")
+}
+
+// TestReconcileErrLogGate verifies the log-once-per-transition gate. The
+// monitor retries a desired mount every tick forever, and some failures are
+// stable and only the user can clear them (the #49 local-files guard), so an
+// unchanged error must not be logged at Error on every tick. A changed error,
+// or one that recurs after a success, must log again. (#67)
+func TestReconcileErrLogGate(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+	other := mountKey{Device: "laptop", Share: "photos"}
+
+	assert.True(t, d.noteReconcileFailure(key, "boom", true), "first failure must log")
+	assert.False(t, d.noteReconcileFailure(key, "boom", true), "an unchanged repeat must not log")
+	assert.False(t, d.noteReconcileFailure(key, "boom", true), "still must not log on later ticks")
+
+	assert.True(t, d.noteReconcileFailure(key, "different", true), "a changed error must log")
+	assert.False(t, d.noteReconcileFailure(key, "different", true), "…then dedupe on the new message")
+
+	// Failures are tracked per mount, not globally.
+	assert.True(t, d.noteReconcileFailure(other, "boom", true), "a different mount must log independently")
+
+	// A success clears the memory, so a later relapse is reported again.
+	d.clearReconcileErr(key)
+	assert.True(t, d.noteReconcileFailure(key, "different", true), "a relapse after success must log")
+
+	// clearReconcileErr on an unknown key (and on a nil map) must not panic.
+	fresh, _ := buildTestDaemon(t)
+	assert.NotPanics(t, func() { fresh.clearReconcileErr(key) }, "clearing a nil map must be safe")
+}
+
+// TestReconcileBackoff verifies the retry gate. Mount holds the mounter lock
+// for the whole verify window when it cannot establish a mount, so retrying an
+// unreachable-but-online peer every tick would keep that lock busy almost
+// continuously and starve Unmount/shutdown. Failures must therefore back off,
+// and a success must clear the penalty. (#67)
+func TestReconcileBackoff(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+
+	assert.True(t, d.reconcileDue(key), "a mount with no failure history is always due")
+
+	d.noteReconcileFailure(key, "boom", true)
+	assert.False(t, d.reconcileDue(key), "a just-failed mount must not be retried on the next tick")
+
+	// The delay grows with consecutive failures.
+	d.reconcileMu.Lock()
+	first := d.reconcileFails[key].nextTry
+	d.reconcileMu.Unlock()
+
+	d.noteReconcileFailure(key, "boom", true)
+	d.reconcileMu.Lock()
+	second := d.reconcileFails[key].nextTry
+	attempts := d.reconcileFails[key].attempts
+	d.reconcileMu.Unlock()
+
+	assert.True(t, second.After(first), "backoff must grow after a repeated failure")
+	assert.Equal(t, 2, attempts, "consecutive failures must be counted")
+
+	// Backoff is capped, not unbounded.
+	for i := 0; i < 40; i++ {
+		d.noteReconcileFailure(key, "boom", true)
+	}
+	d.reconcileMu.Lock()
+	capped := time.Until(d.reconcileFails[key].nextTry)
+	d.reconcileMu.Unlock()
+	assert.LessOrEqual(t, capped, maxReconcileBackoff, "backoff must be capped")
+	assert.Positive(t, capped, "a capped backoff must still be a positive delay")
+
+	// A success clears the penalty entirely.
+	d.clearReconcileErr(key)
+	assert.True(t, d.reconcileDue(key), "a recovered mount must be due immediately")
+}
+
+// TestReconcileBackoff_OnlyEstablishAttemptsAccrue verifies that failures
+// against a still-active entry — probe or teardown failures, e.g. the force
+// unmount ladder losing to a wedged mount — do not extend the backoff. They
+// retry every tick by design, and counting them would inflate the delay that
+// applies later, once the entry does go away, stalling the re-mount for
+// minutes in exactly the dead-mount scenario #67 exists for. (#67)
+func TestReconcileBackoff_OnlyEstablishAttemptsAccrue(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+
+	// Many failures while the entry is still active must not accrue backoff.
+	for i := 0; i < 8; i++ {
+		d.noteReconcileFailure(key, "unmount ladder failed", false)
+	}
+	assert.True(t, d.reconcileDue(key), "non-establish failures must not schedule a backoff")
+
+	d.reconcileMu.Lock()
+	attempts := d.reconcileFails[key].attempts
+	d.reconcileMu.Unlock()
+	assert.Zero(t, attempts, "non-establish failures must not count toward the backoff exponent")
+
+	// The log gate still works for them.
+	assert.False(t, d.noteReconcileFailure(key, "unmount ladder failed", false), "unchanged message must not re-log")
+	assert.True(t, d.noteReconcileFailure(key, "something else", false), "a changed message must log")
+
+	// The first real establish failure starts from one interval, not from the
+	// inflated count those eight failures would otherwise have produced.
+	d.noteReconcileFailure(key, "establish failed", true)
+	d.reconcileMu.Lock()
+	delay := time.Until(d.reconcileFails[key].nextTry)
+	d.reconcileMu.Unlock()
+	assert.LessOrEqual(t, delay, defaultMountMonitorInterval, "the first establish failure must back off by one interval")
+}
+
+// TestReconcileMounts_BackoffDoesNotBlockHealing verifies that the retry
+// backoff gates only establishing a mount from scratch, never probing one that
+// already exists. A stale penalty left by earlier failed establishes must not
+// suppress dead-mount healing — that is the whole point of #67 — and since a
+// skipped key never calls Mount, it would never observe the success that
+// clears the penalty either. (#67)
+func TestReconcileMounts_BackoffDoesNotBlockHealing(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "device-123")
+
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123", Nickname: "laptop", IP: "10.0.0.5", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	// Establish the mount, then saddle the key with a long backoff penalty as
+	// an earlier run of failed establishes would have.
+	d.reconcileMounts(context.Background())
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "setup: the mount must exist")
+
+	d.noteReconcileFailure(mountKey{Device: "laptop", Share: "docs"}, "earlier failure", true)
+	require.False(t, d.reconcileDue(mountKey{Device: "laptop", Share: "docs"}), "setup: the key must be backing off")
+
+	// The mount now dies. The next sweep must still probe and heal it.
+	var probes atomic.Int32
+	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
+		probes.Add(1)
+		return false, nil // confirmed dead
+	})
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Positive(t, probes.Load(), "an existing mount must be probed despite the backoff")
+	assert.Positive(t, execCalls.Load(), "a confirmed-dead mount must be re-mounted despite the backoff")
+}
+
+// TestReconcileMounts_RevalidatesBeforeEachMount verifies that the sweep does
+// not act on a sweep-start snapshot. A single Mount can hold the mounter lock
+// for the whole verify window, so a config reload lands mid-sweep routinely.
+// If reconcileMounts iterated a stale snapshot it would re-establish a mount
+// the user had just removed — and since the new config no longer lists it,
+// nothing would ever tear that mount down again. (#67)
+func TestReconcileMounts_RevalidatesBeforeEachMount(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	writePubKey(t, dir, "device-a")
+	writePubKey(t, dir, "device-b")
+
+	mc1 := agentconfig.MountConfig{Device: "alpha", Share: "docs", To: filepath.Join(dir, "mnt1")}
+	mc2 := agentconfig.MountConfig{Device: "beta", Share: "docs", To: filepath.Join(dir, "mnt2")}
+	d.config.Mounts = []agentconfig.MountConfig{mc1, mc2}
+
+	d.mu.Lock()
+	d.onlineDevices["device-a"] = &OnlineDevice{
+		DeviceID: "device-a", Nickname: "alpha", IP: "10.0.0.1", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.onlineDevices["device-b"] = &OnlineDevice{
+		DeviceID: "device-b", Nickname: "beta", IP: "10.0.0.2", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	var mu sync.Mutex
+	var targets []string
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		mu.Lock()
+		targets = append(targets, args[len(args)-1]) // the mount target is the last operand
+		mu.Unlock()
+
+		// Mid-sweep, the user drops the second mount from the config — exactly
+		// what onConfigChange does on hot reload.
+		d.mu.Lock()
+		newCfg := *d.config
+		newCfg.Mounts = []agentconfig.MountConfig{mc1}
+		d.config = &newCfg
+		d.mu.Unlock()
+
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, targets, 1, "only the still-configured mount may be established")
+	assert.Equal(t, mc1.To, targets[0], "the mount removed mid-sweep must not be resurrected")
+	assert.False(t, d.mounter.IsActive("beta", "docs"), "a de-configured mount must not be left active")
+}
+
+// TestReconcileMounts_CancellationStopsSweep verifies that a cancelled context
+// stops the reconcileMounts sweep before processing all mounts.
+func TestReconcileMounts_CancellationStopsSweep(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	// Configure two mounts: the first will probe, the second must not be reached.
+	writePubKey(t, dir, "device-a")
+	writePubKey(t, dir, "device-b")
+
+	mc1 := agentconfig.MountConfig{Device: "alpha", Share: "docs", To: filepath.Join(dir, "mnt1")}
+	mc2 := agentconfig.MountConfig{Device: "beta", Share: "docs", To: filepath.Join(dir, "mnt2")}
+	d.config.Mounts = []agentconfig.MountConfig{mc1, mc2}
+
+	d.mu.Lock()
+	d.onlineDevices["device-a"] = &OnlineDevice{
+		DeviceID: "device-a", Nickname: "alpha", IP: "10.0.0.1", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.onlineDevices["device-b"] = &OnlineDevice{
+		DeviceID: "device-b", Nickname: "beta", IP: "10.0.0.2", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	d.reconcileMounts(ctx)
+
+	// With a cancelled context, no mounts should be processed.
+	assert.Zero(t, execCalls.Load(), "no mount must be attempted with a cancelled context")
+}
+
+// TestRunMountMonitor_TicksAndStopsOnCancel verifies the monitor loop fires
+// reconcileMounts on every tick (observable as liveness probes through
+// Mount's generation-bound single-flight probe of the one active mount) and
+// exits promptly when ctx is cancelled. (#67)
+func TestRunMountMonitor_TicksAndStopsOnCancel(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	writePubKey(t, dir, "device-123")
+
+	// Register the mount in both the config (so reconcileMounts finds it) and
+	// the mounter (so the tick's Mount call triggers a generation-bound probe).
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "laptop", Share: "docs", To: mountTo},
+	}
+
+	// Pre-mount so there is an active entry for the probe.
+	writePubKey(t, dir, "device-123")
+	require.NoError(t, d.mounter.Mount(context.Background(), d.config.Mounts[0], "device-123", "10.0.0.5", 2222), "pre-mount")
+
+	// Seed onlineDevices so reconcileMounts sees the peer.
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123", Nickname: "laptop",
+		IP: "10.0.0.5", SSHPort: 2222,
+		Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	// Count liveness probes: each tick's reconcileMounts → Mount → probeGenerationLocked
+	// probes the single active mount exactly once per tick via checkMountpoint.
+	var probes atomic.Int32
+	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
+		probes.Add(1)
+		return true, nil
+	})
+
+	d.mountMonitorInterval = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		d.runMountMonitor(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool { return probes.Load() >= 2 },
+		2*time.Second, 5*time.Millisecond,
+		"the monitor must probe active mounts on successive ticks")
+
+	cancel()
+	select {
+	case <-done:
+		// exited promptly — good.
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMountMonitor did not stop after ctx cancel")
+	}
+}
+
+// TestRunMountMonitor_DisabledIntervalReturnsImmediately verifies the <= 0
+// guard: with the interval left at 0 (buildTestDaemon bypasses NewDaemon) the
+// monitor must return without ever ticking, even though ctx is never
+// cancelled. (#67)
+func TestRunMountMonitor_DisabledIntervalReturnsImmediately(t *testing.T) {
+	d, _ := buildTestDaemon(t) // mountMonitorInterval == 0
+
+	done := make(chan struct{})
+	go func() {
+		d.runMountMonitor(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// returned without a ticker — disabled as designed.
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMountMonitor must return immediately when the interval is <= 0")
+	}
+}
+
+// TestMountMonitorIntervalFromEnv unit-tests the env parsing rules in
+// isolation (the NewDaemon path needs a full on-disk fixture): empty keeps the
+// default, a valid duration overrides (including zero/negative, which disable
+// the monitor), and garbage falls back to the default with a WARN. (#67)
+func TestMountMonitorIntervalFromEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		want     time.Duration
+		wantWarn bool
+	}{
+		{name: "unset keeps default", raw: "", want: defaultMountMonitorInterval},
+		{name: "valid duration overrides", raw: "1s", want: time.Second},
+		{name: "zero disables", raw: "0", want: 0},
+		{name: "negative disables", raw: "-5s", want: -5 * time.Second},
+		{name: "garbage falls back with warn", raw: "soon", want: defaultMountMonitorInterval, wantWarn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			got := mountMonitorIntervalFromEnv(tt.raw, defaultMountMonitorInterval, captureLogger(&buf))
+			assert.Equal(t, tt.want, got, "resolved interval")
+			if tt.wantWarn {
+				assert.Contains(t, buf.String(), "HUBFUSE_MOUNT_MONITOR_INTERVAL", "the WARN must name the env var")
+				assert.Contains(t, buf.String(), "level=WARN", "malformed value must warn, not abort")
+			} else {
+				assert.Empty(t, buf.String(), "no warning for a valid value")
+			}
+		})
+	}
+}
+
+// TestNewDaemon_MountMonitorIntervalDefaultAndEnvOverride verifies the wiring
+// in NewDaemon: the default interval lands on the daemon, and the
+// HUBFUSE_MOUNT_MONITOR_INTERVAL env var overrides it. (#67)
+func TestNewDaemon_MountMonitorIntervalDefaultAndEnvOverride(t *testing.T) {
+	cfgContent := `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    ssh-port 2222
+}
+`
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("HUBFUSE_MOUNT_MONITOR_INTERVAL", "") // isolate from the outer env
+		daemon, err := NewDaemon(writeDaemonFixture(t, cfgContent), discardLogger(), DaemonOptions{})
+		require.NoError(t, err, "NewDaemon")
+		assert.Equal(t, defaultMountMonitorInterval, daemon.mountMonitorInterval,
+			"NewDaemon must default the monitor interval")
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv("HUBFUSE_MOUNT_MONITOR_INTERVAL", "42s")
+		daemon, err := NewDaemon(writeDaemonFixture(t, cfgContent), discardLogger(), DaemonOptions{})
+		require.NoError(t, err, "NewDaemon")
+		assert.Equal(t, 42*time.Second, daemon.mountMonitorInterval,
+			"the env override must reach the daemon")
+	})
 }
