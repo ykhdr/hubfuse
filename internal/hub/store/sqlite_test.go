@@ -305,6 +305,26 @@ func TestMarkOnlineIfOffline_UnknownDevice(t *testing.T) {
 	assert.False(t, changed)
 }
 
+// TestUpdateDevice_NoOpWriteStillCountsAsAffected pins the property the
+// ErrNotFound-on-zero-rows checks rest on: SQLite's changes() counts the rows an
+// UPDATE MATCHED, not the ones whose values differed (that is MySQL's default
+// behaviour). Were it otherwise, re-registering an unchanged device — the
+// supervisor does exactly that on every reconnect — would report ErrNotFound for
+// a device that is plainly there. A driver or engine swap that changes this
+// must fail here rather than in production.
+func TestUpdateDevice_NoOpWriteStillCountsAsAffected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222), "first status write")
+
+	assert.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222),
+		"re-registering with identical values must not look like a missing device")
+	assert.NoError(t, s.UpdateDeviceNickname(ctx, "dev-1", "alice"),
+		"renaming to the current nickname must not look like a missing device")
+}
+
 // TestUpdateDeviceStatus_UnknownDevice / TestUpdateDeviceNickname_UnknownDevice
 // close the same silent-success hole as UpdateHeartbeat.
 func TestUpdateDeviceStatus_UnknownDevice(t *testing.T) {
