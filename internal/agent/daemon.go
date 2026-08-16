@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -72,6 +73,19 @@ type Daemon struct {
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
 
+	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
+	// it on the first successful Register and runServices asks again as a
+	// safety net, but exactly one goroutine may exist for the daemon's
+	// lifetime. See startHeartbeat. (#69)
+	heartbeatOnce sync.Once
+
+	// heartbeatInterval is the cadence of the heartbeat loop. NewDaemon sets
+	// defaultHeartbeatInterval, overridable via HUBFUSE_HEARTBEAT_INTERVAL (a
+	// test handle for scenario tests that shorten the hub's liveness timeout).
+	// Unlike the mount monitor's interval, a non-positive value never disables
+	// the loop — runHeartbeat falls back to the default. (#69)
+	heartbeatInterval time.Duration
+
 	// minReconnectInterval is the floor on how frequently the supervisor starts a
 	// new hub session. It serves two roles, both keyed off the same minimum so a
 	// flapping hub is never hammered: (1) supervise waits out this interval when a
@@ -113,6 +127,12 @@ type Daemon struct {
 	// fakes to drive sessionOnce / reconnectSession / supervise without a live hub.
 	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
 	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
+
+	// heartbeatFn is the same kind of seam over HubClient.Heartbeat, so a unit
+	// test can observe that liveness starts before the initial mount
+	// reconciliation without a live hub. A nil value means "no transport" and
+	// runHeartbeat declines to start (test fixtures that never register). (#69)
+	heartbeatFn func(ctx context.Context) error
 
 	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
 	// config-watcher's share-publish path (onConfigChange) is testable without a
@@ -210,6 +230,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		mountMonitorInterval: mountMonitorIntervalFromEnv(
 			os.Getenv("HUBFUSE_MOUNT_MONITOR_INTERVAL"),
 			defaultMountMonitorInterval, logger),
+		heartbeatInterval: heartbeatIntervalFromEnv(
+			os.Getenv("HUBFUSE_HEARTBEAT_INTERVAL"),
+			defaultHeartbeatInterval, logger),
 	}
 
 	// Wire the hub-session seams to the live client. The closures read d.hubClient
@@ -224,6 +247,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	}
 	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
 		return d.hubClient.UpdateShares(ctx, shares)
+	}
+	d.heartbeatFn = func(ctx context.Context) error {
+		return d.hubClient.Heartbeat(ctx)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
@@ -516,9 +542,19 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
+	// Liveness first, before anything that can block. processInitialDevices
+	// below mounts synchronously, and a single unreachable mount burns the full
+	// mount-verify window under the mounter lock — long enough for the hub to
+	// declare this device offline and for its peers to unmount the shares it is
+	// serving. The heartbeat loop is independent of all of that and must not
+	// queue behind it. (#69)
+	d.startHeartbeat(ctx)
+
 	// onReady is optional (nil in tests and when the cmd layer wants no PID
 	// hook), so guard the nil case inside the Once — a bare Do(d.onReady) would
-	// panic on a nil func.
+	// panic on a nil func. Note this runs only after a Register the hub
+	// ACCEPTED: a refused registration returns above, so no PID file is written
+	// for a daemon the hub does not know. (#69)
 	d.readyOnce.Do(func() {
 		if d.onReady != nil {
 			d.onReady()
@@ -577,10 +613,25 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 			return stream
 		}
 
-		d.logger.Warn("hub session reconnect failed, retrying",
-			"error", err,
-			"backoff", delay,
-		)
+		// Separate "the hub is unreachable" from "the hub answered and said no".
+		// The latter is usually not something retrying can fix — a pruned or
+		// removed device needs `hubfuse join`, and the hub's own message says
+		// so — and burying that instruction in a warn loop that repeats every
+		// few minutes forever is how the failure stayed invisible in the first
+		// place. Retrying continues either way: some refusals (a hub-side store
+		// error) really are transient, and the daemon cannot tell which from a
+		// human-readable reason. (#69)
+		if errors.Is(err, ErrHubRejected) {
+			d.logger.Error("hub refused this device's session; retrying, but this likely needs operator action",
+				"error", err,
+				"backoff", delay,
+			)
+		} else {
+			d.logger.Warn("hub session reconnect failed, retrying",
+				"error", err,
+				"backoff", delay,
+			)
+		}
 
 		select {
 		case <-ctx.Done():
@@ -633,10 +684,14 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 	}
 }
 
-// runServices starts the heartbeat ticker, the mount-health monitor (#67), and
-// the config watcher, then blocks until ctx is cancelled before shutting down.
+// runServices starts the mount-health monitor (#67) and the config watcher,
+// then blocks until ctx is cancelled before shutting down. The heartbeat loop
+// is normally already running — sessionOnce starts it as soon as the hub
+// accepts the registration, well before this point (#69) — and startHeartbeat
+// is idempotent, so asking again here costs nothing and keeps this the single
+// place that guarantees every background service is up.
 func (d *Daemon) runServices(ctx context.Context) error {
-	go d.runHeartbeat(ctx)
+	d.startHeartbeat(ctx)
 	go d.runMountMonitor(ctx)
 
 	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
@@ -937,6 +992,12 @@ func (d *Daemon) clearReconcileErr(key mountKey) {
 	delete(d.reconcileFails, key)
 }
 
+// deregisterTimeout bounds the shutdown Deregister RPC. It is deliberately
+// smaller than the 5s unmount budget: both run inside daemonize's 10s SIGKILL
+// deadline, and the SSH server stop, watcher stop and client close still have
+// to fit after them. (#69)
+const deregisterTimeout = 3 * time.Second
+
 // Shutdown unmounts all shares, deregisters from the hub, stops the SSH
 // server, stops the config watcher, and closes the hub client.
 // UnmountAllForce runs under a 5s timeout so a wedged mount cannot prevent
@@ -951,8 +1012,24 @@ func (d *Daemon) Shutdown() error {
 	}
 
 	if d.hubClient != nil {
-		if err := d.hubClient.Deregister(context.Background()); err != nil {
-			errs = append(errs, fmt.Sprintf("deregister: %v", err))
+		// Bound the call like every other shutdown step: a Deregister on a
+		// half-open connection would otherwise hang past the daemonize SIGKILL
+		// deadline and take the clean shutdown with it. (#50 bounded, #69)
+		dctx, dcancel := context.WithTimeout(context.Background(), deregisterTimeout)
+		// A hub that REFUSES the deregistration (Success=false) has nothing left
+		// to deregister — the classic case is an identity the hub already pruned,
+		// which is exactly the #69 scenario. Nothing the daemon can do about it at
+		// exit time, and turning a clean shutdown into a failure would make
+		// `hubfuse stop` exit non-zero for a healthy stop. Transport errors still
+		// aggregate: those say the hub never heard us. (#69)
+		err := d.hubClient.Deregister(dctx)
+		dcancel()
+		if err != nil {
+			if errors.Is(err, ErrHubRejected) {
+				d.logger.Warn("hub refused deregistration; shutting down anyway", "error", err)
+			} else {
+				errs = append(errs, fmt.Sprintf("deregister: %v", err))
+			}
 		}
 	}
 

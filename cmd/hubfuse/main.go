@@ -709,12 +709,10 @@ func renameCmd() *cobra.Command {
 			defer hubClient.Close()
 
 			ctx := &clierrors.Context{Nickname: newNickname, HubAddr: hubAddr}
-			resp, err := hubClient.Rename(context.Background(), newNickname)
-			if err != nil {
+			// HubClient.Rename reports an application-level refusal (nickname
+			// taken) as an error too, so one branch covers both. (#69)
+			if _, err := hubClient.Rename(context.Background(), newNickname); err != nil {
 				return clierrors.Wrap(fmt.Errorf("rename: %w", err), ctx)
-			}
-			if !resp.Success {
-				return clierrors.Wrap(errors.New(resp.Error), ctx)
 			}
 
 			// Update local identity.

@@ -31,6 +31,14 @@ type Config struct {
 	DeviceRetention time.Duration // how long to keep offline devices before pruning (0 = never prune)
 	JoinTokenTTL    time.Duration // how long issued join tokens remain valid (0 = use default 10m)
 
+	// HeartbeatTimeout is how long a device may go without a heartbeat before
+	// the monitor demotes it to offline (0 = use DefaultHeartbeatTimeout). The
+	// stale-check cadence is derived from it (timeout/3), so lowering it makes
+	// the hub notice a dead device sooner at the cost of more frequent sweeps.
+	// Scenario tests shorten it so liveness behaviour is observable in seconds;
+	// operators on slow links can raise it. (#69)
+	HeartbeatTimeout time.Duration
+
 	// OnReady, if non-nil, is invoked exactly once from Start right
 	// after net.Listen returns — the TCP listener is bound and the
 	// kernel is already queueing SYNs, and grpcServer.Serve runs
@@ -82,7 +90,7 @@ func NewHub(config Config) (*Hub, error) {
 	}
 
 	registry := NewRegistry(s, caCert, caKey, logger, config.JoinTokenTTL)
-	heartbeat := NewHeartbeatMonitor(registry, s, 0, config.DeviceRetention, logger)
+	heartbeat := NewHeartbeatMonitor(registry, s, config.HeartbeatTimeout, config.DeviceRetention, logger)
 
 	return &Hub{
 		config:    config,
@@ -148,6 +156,13 @@ func (h *Hub) Start(ctx context.Context) error {
 // devices, stops the gRPC server, and closes the store.
 func (h *Hub) Stop() error {
 	ctx := context.Background()
+
+	// Refuse heartbeat-driven recovery from here on. The sweep below marks every
+	// online device offline while the gRPC server is still answering, so without
+	// this a heartbeat processed inside that window would flip a device back to
+	// online and leave a phantom-online row for the next hub start to serve to
+	// its peers. (#69)
+	h.registry.Drain()
 
 	online, err := h.store.ListOnlineDevices(ctx)
 	if err != nil {

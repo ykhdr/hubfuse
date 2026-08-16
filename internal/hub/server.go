@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -57,7 +58,10 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 
 	online, err := s.registry.Register(ctx, deviceID, ip, int(req.SshPort), req.Shares, int(req.ProtocolVersion))
 	if err != nil {
-		return &pb.RegisterResponse{Success: false, Error: err.Error()}, nil
+		s.logger.Warn("register rejected",
+			slog.String("device_id", deviceID),
+			slog.Any("error", err))
+		return &pb.RegisterResponse{Success: false, Error: rejectionMessage(err)}, nil
 	}
 
 	ids := make([]string, 0, len(online))
@@ -87,6 +91,24 @@ func (s *Server) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Reg
 	}, nil
 }
 
+// rejectionMessage renders the reason an RPC was refused, in terms the operator
+// can act on. The device-unknown case is the one that matters: the device's row
+// is gone (pruned after the retention window, or removed by `hubfuse leave`),
+// and nothing short of a fresh join will fix it — the agent surfaces this text
+// verbatim in its startup error. Everything else keeps the underlying message.
+// (#69)
+//
+// The wording deliberately avoids the substring "device not found":
+// cmd/internal/clierrors collapses any message containing it into a bare
+// "device not found", which would swallow the instruction.
+func rejectionMessage(err error) string {
+	if errors.Is(err, common.ErrDeviceNotFound) {
+		return "this device is not registered on the hub — it was pruned or removed; " +
+			"re-join with 'hubfuse join <hub-address> --token <token>'"
+	}
+	return err.Error()
+}
+
 // Rename changes a device's nickname.
 func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameResponse, error) {
 	deviceID, err := common.ExtractDeviceID(ctx)
@@ -95,20 +117,28 @@ func (s *Server) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.RenameR
 	}
 
 	if err := s.registry.Rename(ctx, deviceID, req.NewNickname); err != nil {
-		return &pb.RenameResponse{Success: false, Error: err.Error()}, nil
+		return &pb.RenameResponse{Success: false, Error: rejectionMessage(err)}, nil
 	}
 
 	return &pb.RenameResponse{Success: true}, nil
 }
 
-// Heartbeat records that a device is still alive.
+// Heartbeat records that a device is still alive. The caller's apparent address
+// is passed along so a device the hub had given up on is announced at the
+// address it is actually reachable at when the heartbeat revives it. (#69)
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	deviceID, err := common.ExtractDeviceID(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.registry.Heartbeat(ctx, deviceID); err != nil {
+	if err := s.registry.Heartbeat(ctx, deviceID, peerIP(ctx)); err != nil {
+		// HeartbeatResponse carries no error string, so log the reason here —
+		// otherwise a hub-side failure (unknown device, store error) would be
+		// invisible on both sides.
+		s.logger.Warn("heartbeat rejected",
+			slog.String("device_id", deviceID),
+			slog.Any("error", err))
 		return &pb.HeartbeatResponse{Success: false}, nil
 	}
 

@@ -14,8 +14,9 @@ import (
 
 // HubConfigFile represents options parsed from config.kdl in the hub data dir.
 type HubConfigFile struct {
-	DeviceRetention *time.Duration
-	JoinTokenTTL    *time.Duration
+	DeviceRetention  *time.Duration
+	JoinTokenTTL     *time.Duration
+	HeartbeatTimeout *time.Duration
 }
 
 // LoadHubConfigFile parses an optional KDL config file. Missing files return
@@ -48,6 +49,16 @@ func LoadHubConfigFile(path string) (HubConfigFile, error) {
 				return cfg, fmt.Errorf("parse device-retention: %w", err)
 			}
 			cfg.DeviceRetention = &dur
+		case "heartbeat-timeout":
+			value := firstArgString(node)
+			if value == "" {
+				return cfg, fmt.Errorf("heartbeat-timeout requires a duration argument")
+			}
+			dur, err := time.ParseDuration(value)
+			if err != nil {
+				return cfg, fmt.Errorf("parse heartbeat-timeout: %w", err)
+			}
+			cfg.HeartbeatTimeout = &dur
 		case "join-token-ttl":
 			value := firstArgString(node)
 			if value == "" {

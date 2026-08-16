@@ -49,7 +49,7 @@ func TestHeartbeatMonitor_DoesNotMarkFreshDeviceOffline(t *testing.T) {
 	registerDevice(t, r, "dev-fresh", "10.0.0.1", 22)
 
 	// Update heartbeat to now so the device is fresh.
-	err := r.Heartbeat(bg, "dev-fresh")
+	err := r.Heartbeat(bg, "dev-fresh", "10.0.0.1")
 	require.NoError(t, err, "Heartbeat")
 
 	timeout := 10 * time.Second // long timeout — device won't go stale
@@ -136,7 +136,7 @@ func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
 	}
 
 	// Make dev-recent fresh so it should not be pruned.
-	if err := r.Heartbeat(ctx, "dev-recent"); err != nil {
+	if err := r.Heartbeat(ctx, "dev-recent", ""); err != nil {
 		t.Fatalf("Heartbeat dev-recent: %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
 			case <-stopHeartbeats:
 				return
 			case <-ticker.C:
-				_ = r.Heartbeat(ctx, "dev-recent")
+				_ = r.Heartbeat(ctx, "dev-recent", "")
 			}
 		}
 	}()

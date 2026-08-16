@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -135,7 +136,7 @@ func (s *sqliteStore) GetDevice(ctx context.Context, deviceID string) (*Device, 
 	row := s.db.QueryRowContext(ctx, q, deviceID)
 	d, err := scanDevice(row)
 	if err != nil {
-		return nil, fmt.Errorf("get device %q: %w", deviceID, err)
+		return nil, fmt.Errorf("get device %q: %w", deviceID, notFoundOrErr(err))
 	}
 	return d, nil
 }
@@ -148,7 +149,7 @@ func (s *sqliteStore) GetDeviceByNickname(ctx context.Context, nickname string) 
 	row := s.db.QueryRowContext(ctx, q, nickname)
 	d, err := scanDevice(row)
 	if err != nil {
-		return nil, fmt.Errorf("get device by nickname %q: %w", nickname, err)
+		return nil, fmt.Errorf("get device by nickname %q: %w", nickname, notFoundOrErr(err))
 	}
 	return d, nil
 }
@@ -180,33 +181,106 @@ func (s *sqliteStore) ListAllDevices(ctx context.Context) ([]*Device, error) {
 }
 
 // UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
+// A device row that no longer exists yields ErrNotFound. (#69)
 func (s *sqliteStore) UpdateDeviceStatus(ctx context.Context, deviceID string, status DeviceStatus, ip string, sshPort int) error {
 	const q = `UPDATE devices SET status = ?, last_ip = ?, ssh_port = ? WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, string(status), ip, sshPort, deviceID)
+	res, err := s.db.ExecContext(ctx, q, string(status), ip, sshPort, deviceID)
 	if err != nil {
 		return fmt.Errorf("update device status %q: %w", deviceID, err)
 	}
-	return nil
+	return requireAffected(res, fmt.Sprintf("update device status %q", deviceID))
 }
 
 // UpdateDeviceNickname changes the nickname of a device.
+// A device row that no longer exists yields ErrNotFound. (#69)
 func (s *sqliteStore) UpdateDeviceNickname(ctx context.Context, deviceID string, nickname string) error {
 	const q = `UPDATE devices SET nickname = ? WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, nickname, deviceID)
+	res, err := s.db.ExecContext(ctx, q, nickname, deviceID)
 	if err != nil {
 		return fmt.Errorf("update device nickname %q: %w", deviceID, err)
+	}
+	return requireAffected(res, fmt.Sprintf("update device nickname %q", deviceID))
+}
+
+// MarkOfflineIfStale demotes a device to offline in ONE statement that also
+// carries the staleness condition, and reports whether the row actually
+// changed.
+//
+// The heartbeat monitor reads the stale set and writes the demotion later
+// (GetStaleDevices → MarkOffline). A heartbeat that lands inside that window
+// would otherwise be overwritten by the pending demotion, and the peers would
+// receive a DeviceOffline for a device that is demonstrably alive — the exact
+// symptom issue #69 describes (the share unmounts ~30s after it appeared).
+// Folding "still online AND still stale" into the WHERE clause makes the
+// heartbeat win the race, and the changed flag tells the caller whether a
+// DeviceOffline broadcast is warranted at all. (#69)
+func (s *sqliteStore) MarkOfflineIfStale(ctx context.Context, deviceID string, threshold time.Time) (bool, error) {
+	const q = `
+		UPDATE devices SET status = ?
+		WHERE device_id = ? AND status = ? AND last_heartbeat < ?`
+	res, err := s.db.ExecContext(ctx, q, string(StatusOffline), deviceID, string(StatusOnline), threshold.UTC())
+	if err != nil {
+		return false, fmt.Errorf("mark device %q offline: %w", deviceID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark device %q offline: rows affected: %w", deviceID, err)
+	}
+	return affected > 0, nil
+}
+
+// MarkOnlineIfOffline promotes an offline device back to online and reports
+// whether the row actually changed. A non-empty ip replaces last_ip; an empty
+// one leaves the stored address alone.
+//
+// The condition is what keeps the promotion honest. Only a device the hub
+// currently believes is offline can be recovered this way, and only one writer
+// wins: a concurrent Register that already flipped the row to online leaves
+// this update matching zero rows, so the recovery path stays silent and the
+// Register broadcast — which carries the device's authoritative shares and SSH
+// port — is the only DeviceOnline peers see. (#69)
+func (s *sqliteStore) MarkOnlineIfOffline(ctx context.Context, deviceID, ip string) (bool, error) {
+	const q = `
+		UPDATE devices SET status = ?, last_ip = COALESCE(NULLIF(?, ''), last_ip)
+		WHERE device_id = ? AND status = ?`
+	res, err := s.db.ExecContext(ctx, q, string(StatusOnline), ip, deviceID, string(StatusOffline))
+	if err != nil {
+		return false, fmt.Errorf("mark device %q online: %w", deviceID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark device %q online: rows affected: %w", deviceID, err)
+	}
+	return affected > 0, nil
+}
+
+// requireAffected turns an UPDATE that matched no row into ErrNotFound. SQLite
+// treats such an update as a success, which is how a pruned device could keep
+// looking alive to the hub. (#69)
+func requireAffected(res sql.Result, what string) error {
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s: rows affected: %w", what, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%s: %w", what, ErrNotFound)
 	}
 	return nil
 }
 
 // UpdateHeartbeat records the current UTC time as the last_heartbeat for a device.
+// A device row that no longer exists (pruned, or removed by `hubfuse leave`)
+// yields ErrNotFound rather than a silent success: an UPDATE that matches no row
+// is not an error for SQLite, so without the RowsAffected check a pruned device's
+// heartbeat would be reported as accepted and the agent would keep believing the
+// hub knows it. (#69)
 func (s *sqliteStore) UpdateHeartbeat(ctx context.Context, deviceID string) error {
 	const q = `UPDATE devices SET last_heartbeat = ? WHERE device_id = ?`
-	_, err := s.db.ExecContext(ctx, q, time.Now().UTC(), deviceID)
+	res, err := s.db.ExecContext(ctx, q, time.Now().UTC(), deviceID)
 	if err != nil {
 		return fmt.Errorf("update heartbeat for device %q: %w", deviceID, err)
 	}
-	return nil
+	return requireAffected(res, fmt.Sprintf("update heartbeat for device %q", deviceID))
 }
 
 // GetStaleDevices returns devices that are online but have not sent a heartbeat
@@ -617,6 +691,17 @@ func scanDevice(row rowScanner) (*Device, error) {
 	}
 	d.LastHeartbeat = t
 	return &d, nil
+}
+
+// notFoundOrErr maps the driver's "no such row" signal to the package's own
+// ErrNotFound sentinel and passes every other error through untouched. Callers
+// wrap the result with their own context, so errors.Is(err, ErrNotFound) works
+// across the wrapping while the SQL detail stays inside this package. (#69)
+func notFoundOrErr(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
 }
 
 // scanDevices iterates over rows and scans each into a Device.

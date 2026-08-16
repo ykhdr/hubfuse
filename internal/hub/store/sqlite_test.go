@@ -53,6 +53,7 @@ func TestGetDevice_NotFound(t *testing.T) {
 
 	_, err := s.GetDevice(ctx, "nonexistent")
 	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound, "a missing device must be distinguishable from a real query failure")
 }
 
 func TestCreateDevice_DuplicateNickname(t *testing.T) {
@@ -92,6 +93,7 @@ func TestGetDeviceByNickname_NotFound(t *testing.T) {
 
 	_, err := s.GetDeviceByNickname(ctx, "nobody")
 	assert.Error(t, err, "expected error for nonexistent nickname")
+	assert.ErrorIs(t, err, ErrNotFound, "a missing nickname must be distinguishable from a real query failure")
 }
 
 func TestListOnlineDevices(t *testing.T) {
@@ -163,6 +165,182 @@ func TestUpdateHeartbeat(t *testing.T) {
 	require.NoError(t, err, "GetDevice")
 	assert.False(t, got.LastHeartbeat.Before(before) || got.LastHeartbeat.After(after),
 		"LastHeartbeat %v not in expected range [%v, %v]", got.LastHeartbeat, before, after)
+}
+
+// TestUpdateHeartbeat_UnknownDevice pins the #69 fix: an UPDATE that matches no
+// row is not an SQL error, so without the RowsAffected check the hub would
+// answer Heartbeat with Success=true for a device it had already pruned — and
+// the agent would keep believing it was registered.
+func TestUpdateHeartbeat_UnknownDevice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	err := s.UpdateHeartbeat(ctx, "never-existed")
+	require.Error(t, err, "heartbeat for an unknown device must fail")
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestUpdateHeartbeat_AfterDelete covers the actual issue #69 sequence: the
+// device existed, was pruned, and its old identity keeps heartbeating.
+func TestUpdateHeartbeat_AfterDelete(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateHeartbeat(ctx, "dev-1"), "heartbeat while the device exists")
+
+	require.NoError(t, s.DeleteDevice(ctx, "dev-1"), "DeleteDevice")
+
+	err := s.UpdateHeartbeat(ctx, "dev-1")
+	require.Error(t, err, "heartbeat after prune must fail")
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestMarkOfflineIfStale_DemotesStaleOnlineDevice covers the happy path of the
+// conditional demotion the heartbeat monitor uses.
+func TestMarkOfflineIfStale_DemotesStaleOnlineDevice(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	d := makeDevice("dev-1", "alice")
+	d.Status = StatusOnline
+	d.LastHeartbeat = time.Now().UTC().Add(-10 * time.Minute)
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
+
+	changed, err := s.MarkOfflineIfStale(ctx, "dev-1", time.Now().UTC().Add(-time.Minute))
+	require.NoError(t, err, "MarkOfflineIfStale")
+	assert.True(t, changed, "a stale online device must be demoted")
+
+	got, err := s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, StatusOffline, got.Status)
+
+	// Second call is a no-op: the device is no longer online, so nothing
+	// changes and no further DeviceOffline broadcast is warranted.
+	changed, err = s.MarkOfflineIfStale(ctx, "dev-1", time.Now().UTC().Add(-time.Minute))
+	require.NoError(t, err, "MarkOfflineIfStale (repeat)")
+	assert.False(t, changed, "an already-offline device must not report a transition")
+}
+
+// TestMarkOfflineIfStale_FreshHeartbeatWinsTheRace is the regression for the
+// read-then-write window in the heartbeat monitor (#69): GetStaleDevices
+// snapshots the stale set, a heartbeat lands, and only then does the demotion
+// run. The demotion must lose — otherwise peers get a DeviceOffline for a
+// device that just proved it is alive.
+func TestMarkOfflineIfStale_FreshHeartbeatWinsTheRace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	d := makeDevice("dev-1", "alice")
+	d.Status = StatusOnline
+	d.LastHeartbeat = time.Now().UTC().Add(-10 * time.Minute)
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
+
+	// The monitor computed this threshold before the heartbeat arrived.
+	threshold := time.Now().UTC().Add(-time.Minute)
+	require.NoError(t, s.UpdateHeartbeat(ctx, "dev-1"), "heartbeat lands inside the window")
+
+	changed, err := s.MarkOfflineIfStale(ctx, "dev-1", threshold)
+	require.NoError(t, err, "MarkOfflineIfStale")
+	assert.False(t, changed, "a device that heartbeated after the snapshot must stay online")
+
+	got, err := s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, StatusOnline, got.Status)
+}
+
+// TestMarkOnlineIfOffline covers the recovery transition: only an offline
+// device is promoted, exactly once, and a non-empty IP refreshes last_ip.
+func TestMarkOnlineIfOffline(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	d := makeDevice("dev-1", "alice") // makeDevice starts offline
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
+
+	changed, err := s.MarkOnlineIfOffline(ctx, "dev-1", "10.0.0.9")
+	require.NoError(t, err, "MarkOnlineIfOffline")
+	assert.True(t, changed, "an offline device must be promoted")
+
+	got, err := s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, StatusOnline, got.Status)
+	assert.Equal(t, "10.0.0.9", got.LastIP, "a known caller address must refresh last_ip")
+	assert.Equal(t, 22, got.SSHPort, "recovery must not touch the stored SSH port")
+
+	// Already online — the caller (e.g. a concurrent Register) owns the
+	// broadcast, so this must report no transition.
+	changed, err = s.MarkOnlineIfOffline(ctx, "dev-1", "10.0.0.10")
+	require.NoError(t, err, "MarkOnlineIfOffline (repeat)")
+	assert.False(t, changed, "an online device must not report a transition")
+
+	got, err = s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, "10.0.0.9", got.LastIP, "a no-op transition must not rewrite last_ip")
+}
+
+// TestMarkOnlineIfOffline_EmptyIPKeepsStoredAddress — peerIP can come back
+// empty for an unusual transport; that must not blank out a usable address.
+func TestMarkOnlineIfOffline_EmptyIPKeepsStoredAddress(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+
+	changed, err := s.MarkOnlineIfOffline(ctx, "dev-1", "")
+	require.NoError(t, err, "MarkOnlineIfOffline")
+	assert.True(t, changed)
+
+	got, err := s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, "192.168.1.1", got.LastIP, "empty caller address must leave last_ip alone")
+}
+
+// TestMarkOnlineIfOffline_UnknownDevice — a pruned device must not be revived.
+func TestMarkOnlineIfOffline_UnknownDevice(t *testing.T) {
+	s := newTestStore(t)
+
+	changed, err := s.MarkOnlineIfOffline(context.Background(), "never-existed", "10.0.0.1")
+	require.NoError(t, err, "a missing row is not a query failure")
+	assert.False(t, changed)
+}
+
+// TestUpdateDevice_NoOpWriteStillCountsAsAffected pins the property the
+// ErrNotFound-on-zero-rows checks rest on: SQLite's changes() counts the rows an
+// UPDATE MATCHED, not the ones whose values differed (that is MySQL's default
+// behaviour). Were it otherwise, re-registering an unchanged device — the
+// supervisor does exactly that on every reconnect — would report ErrNotFound for
+// a device that is plainly there. A driver or engine swap that changes this
+// must fail here rather than in production.
+func TestUpdateDevice_NoOpWriteStillCountsAsAffected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+	require.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222), "first status write")
+
+	assert.NoError(t, s.UpdateDeviceStatus(ctx, "dev-1", StatusOnline, "10.0.0.1", 2222),
+		"re-registering with identical values must not look like a missing device")
+	assert.NoError(t, s.UpdateDeviceNickname(ctx, "dev-1", "alice"),
+		"renaming to the current nickname must not look like a missing device")
+}
+
+// TestUpdateDeviceStatus_UnknownDevice / TestUpdateDeviceNickname_UnknownDevice
+// close the same silent-success hole as UpdateHeartbeat.
+func TestUpdateDeviceStatus_UnknownDevice(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.UpdateDeviceStatus(context.Background(), "never-existed", StatusOnline, "10.0.0.1", 2222)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestUpdateDeviceNickname_UnknownDevice(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.UpdateDeviceNickname(context.Background(), "never-existed", "ghost")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestGetStaleDevices(t *testing.T) {
