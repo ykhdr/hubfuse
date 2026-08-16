@@ -23,6 +23,15 @@ import (
 // rather than the raw generated stub.
 func joinAgentClient(t *testing.T, h *hubtest.Harness, deviceID, nickname string) *agent.HubClient {
 	t.Helper()
+	return joinAgentClientAt(t, h, h.Addr, deviceID, nickname)
+}
+
+// joinAgentClientAt is joinAgentClient with the dial address decoupled from the
+// hub's own: the join goes to the hub directly, while the returned client talks
+// to dialAddr. Tests that put something between the agent and the hub (a relay
+// standing in for a network that stops delivering) use it. (#72)
+func joinAgentClientAt(t *testing.T, h *hubtest.Harness, dialAddr, deviceID, nickname string) *agent.HubClient {
+	t.Helper()
 
 	token, _, err := h.Registry.IssueJoinToken(context.Background())
 	require.NoError(t, err, "IssueJoinToken")
@@ -42,7 +51,7 @@ func joinAgentClient(t *testing.T, h *hubtest.Harness, deviceID, nickname string
 	keyPath := writeTempFile(t, dir, "client.key", joinResp.ClientKey)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	client, err := agent.DialWithMTLS(h.Addr, caPath, certPath, keyPath, logger)
+	client, err := agent.DialWithMTLS(dialAddr, caPath, certPath, keyPath, logger)
 	require.NoError(t, err, "DialWithMTLS")
 	t.Cleanup(func() { _ = client.Close() })
 

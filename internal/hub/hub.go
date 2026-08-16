@@ -108,11 +108,7 @@ func NewHub(config Config) (*Hub, error) {
 func (h *Hub) Start(ctx context.Context) error {
 	creds := credentials.NewTLS(h.tlsCfg)
 
-	h.grpcServer = grpc.NewServer(
-		grpc.Creds(creds),
-		grpc.UnaryInterceptor(AuthUnaryInterceptor),
-		grpc.StreamInterceptor(AuthStreamInterceptor),
-	)
+	h.grpcServer = grpc.NewServer(ServerOptions(creds)...)
 
 	srv := NewServer(h.registry, h.logger)
 	pb.RegisterHubFuseServer(h.grpcServer, srv)

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -118,8 +119,23 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 			beatCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 			err := d.heartbeatFn(beatCtx)
 			cancel()
-			if err != nil {
-				d.logger.Warn("heartbeat failed", "error", err)
+			if err == nil {
+				d.heartbeatFails.Store(0)
+				continue
+			}
+
+			d.logger.Warn("heartbeat failed", "error", err)
+
+			// Consecutive failures are the application-level evidence that this
+			// session is over. gRPC keepalive covers a transport nobody
+			// answers, but a hub that answers PINGs at the HTTP/2 layer while
+			// its RPCs go nowhere looks perfectly healthy to it — only a real
+			// call can tell, and the heartbeat is the one that runs on a fixed
+			// cadence. Ending the session hands the recovery to the supervisor,
+			// which already knows how to re-register and remount. (#72)
+			if d.heartbeatFails.Add(1) >= maxHeartbeatFailures {
+				d.heartbeatFails.Store(0)
+				d.dropSession(fmt.Sprintf("%d consecutive heartbeat failures", maxHeartbeatFailures))
 			}
 		}
 	}

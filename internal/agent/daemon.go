@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -72,6 +73,15 @@ type Daemon struct {
 	// lifetime. The supervisor re-runs sessionOnce on every reconnect, but the
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
+
+	// sessionCancel ends the current hub session's event stream. sessionOnce
+	// installs it, dropSession calls it, and the next session replaces it. Both
+	// are reachable from the heartbeat goroutine and the supervisor, hence the
+	// lock; heartbeatFails is the consecutive-failure count that drives
+	// dropSession and is reset whenever a session is (re)established. (#72)
+	sessionMu      sync.Mutex
+	sessionCancel  context.CancelFunc
+	heartbeatFails atomic.Int32
 
 	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
 	// it on the first successful Register and runServices asks again as a
@@ -533,8 +543,16 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	cfg := d.config
 	d.mu.RUnlock()
 
+	// Bound the registration. It is the other call on the critical path that a
+	// dead-but-unclosed connection can swallow whole: without a deadline a
+	// reconnect attempt blocks here forever and the supervisor's backoff never
+	// gets to run, so the daemon looks like it is retrying when it is not.
+	// Twenty seconds is far beyond what a few SQLite queries need and still
+	// inside the hub's own liveness timeout. (#72)
+	regCtx, cancelReg := context.WithTimeout(ctx, registerTimeout)
 	shares := configSharesToProto(cfg.Shares)
-	regResp, err := d.registerFn(ctx, shares, d.sshPort)
+	regResp, err := d.registerFn(regCtx, shares, d.sshPort)
+	cancelReg()
 	if err != nil {
 		return nil, fmt.Errorf("register with hub: %w", err)
 	}
@@ -563,12 +581,65 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 
 	d.processInitialDevices(regResp.DevicesOnline)
 
-	stream, err := d.subscribeFn(ctx)
+	// The event stream runs on a context of its own so the daemon can end this
+	// session deliberately — see dropSession. Cancelling it makes Recv fail,
+	// which is the one signal supervise already acts on. (#72)
+	sessionCtx := d.newSessionCtx(ctx)
+
+	stream, err := d.subscribeFn(sessionCtx)
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
 
 	return stream, nil
+}
+
+// registerTimeout bounds the Register RPC of a session setup. See sessionOnce.
+const registerTimeout = 20 * time.Second
+
+// maxHeartbeatFailures is how many consecutive heartbeat failures end the hub
+// session. Three of them span the hub's own 30s liveness timeout
+// (hub.DefaultHeartbeatTimeout at the default 10s cadence): by then the hub has
+// stopped counting this device as online anyway, so there is nothing left to
+// preserve and everything to gain from a fresh session. (#72)
+const maxHeartbeatFailures = 3
+
+// newSessionCtx derives a cancellable context for the session about to start,
+// cancels the previous one, and clears the heartbeat failure count so a fresh
+// session never inherits the failures that ended the last.
+func (d *Daemon) newSessionCtx(parent context.Context) context.Context {
+	sessionCtx, cancel := context.WithCancel(parent)
+
+	d.sessionMu.Lock()
+	prev := d.sessionCancel
+	d.sessionCancel = cancel
+	d.sessionMu.Unlock()
+
+	if prev != nil {
+		prev()
+	}
+	d.heartbeatFails.Store(0)
+
+	return sessionCtx
+}
+
+// dropSession ends the current hub session so the supervisor establishes a new
+// one. It is the application-level counterpart to gRPC keepalive: keepalive
+// notices a transport nobody is answering, while this notices a hub that
+// answers at the transport level and not at the application one — the pings are
+// served by the HTTP/2 layer either way, so only a real RPC can tell the
+// difference. Safe to call when no session is live. (#72)
+func (d *Daemon) dropSession(reason string) {
+	d.sessionMu.Lock()
+	cancel := d.sessionCancel
+	d.sessionCancel = nil
+	d.sessionMu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+	d.logger.Warn("ending hub session; the supervisor will establish a new one", "reason", reason)
+	cancel()
 }
 
 // readStream consumes events from the hub subscription until Recv returns an

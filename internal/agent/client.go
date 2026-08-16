@@ -8,12 +8,48 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
 	pb "github.com/ykhdr/hubfuse/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
+
+// Hub-connection keepalive. Without it a hub connection that dies half-open —
+// the agent's socket stays ESTABLISHED while the hub's side is already gone —
+// is indistinguishable from an idle one: the Subscribe stream never ends, so
+// the supervisor never reconnects, and every unary RPC blocks trying to open a
+// stream on a transport nobody will ever answer. The device then stays offline
+// forever and its shares stay unmounted on every peer. (#72)
+//
+// hubKeepaliveTime is deliberately a third of the hub's 30s liveness timeout
+// (hub.DefaultHeartbeatTimeout): a dead transport is detected within
+// Time+Timeout = 15s, leaving the agent time to re-establish the session before
+// the hub gives up on it. PermitWithoutStream is required rather than optional
+// — between sessions there is no open stream, and that is exactly when the
+// connection still needs checking. The hub's EnforcementPolicy.MinTime must
+// stay below hubKeepaliveTime or the hub answers these pings with
+// GOAWAY too_many_pings (see hub.ServerOptions).
+const (
+	hubKeepaliveTime    = 10 * time.Second
+	hubKeepaliveTimeout = 5 * time.Second
+)
+
+// dialOptions returns the options every hub connection is built with. Both
+// dials go through it so the pinned bootstrap connection and the long-lived
+// mTLS one cannot drift apart in how they detect a dead hub. (#72)
+func dialOptions(creds credentials.TransportCredentials) []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                hubKeepaliveTime,
+			Timeout:             hubKeepaliveTimeout,
+			PermitWithoutStream: true,
+		}),
+	}
+}
 
 // ErrHubRejected marks an application-level refusal: the RPC itself completed
 // (nil gRPC error) but the hub answered Success=false. Callers that must tell
@@ -51,7 +87,7 @@ func DialPinned(hubAddr, expectedFP string, logger *slog.Logger) (*HubClient, er
 	}
 	creds := credentials.NewTLS(tlsCfg)
 
-	conn, err := grpc.NewClient(hubAddr, grpc.WithTransportCredentials(creds))
+	conn, err := grpc.NewClient(hubAddr, dialOptions(creds)...)
 	if err != nil {
 		return nil, fmt.Errorf("dial hub %q (pinned): %w", hubAddr, err)
 	}
@@ -71,7 +107,7 @@ func DialWithMTLS(hubAddr, caCertPath, clientCertPath, clientKeyPath string, log
 	}
 
 	creds := credentials.NewTLS(tlsCfg)
-	conn, err := grpc.NewClient(hubAddr, grpc.WithTransportCredentials(creds))
+	conn, err := grpc.NewClient(hubAddr, dialOptions(creds)...)
 	if err != nil {
 		return nil, fmt.Errorf("dial hub %q (mTLS): %w", hubAddr, err)
 	}

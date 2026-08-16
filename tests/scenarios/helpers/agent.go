@@ -34,6 +34,11 @@ type Agent struct {
 	SSHPort      int
 	StubMountDir string
 
+	// hubAddr is the address this agent joins and connects to. It defaults to
+	// the hub's own address; WithHubAddress points it somewhere else — a relay
+	// standing in for a network that can stop delivering (#72).
+	hubAddr string
+
 	hub          *Hub
 	logBuf       *LogBuffer
 	envExtra     []string
@@ -46,6 +51,13 @@ type AgentOption func(*Agent)
 
 func WithEnv(kv ...string) AgentOption {
 	return func(a *Agent) { a.envExtra = append(a.envExtra, kv...) }
+}
+
+// WithHubAddress makes the agent join and connect through addr instead of the
+// hub's own address. Used to put a testrelay.Relay in front of the hub so a
+// scenario can silence the connection without either side being told. (#72)
+func WithHubAddress(addr string) AgentOption {
+	return func(a *Agent) { a.hubAddr = addr }
 }
 
 // WithExport appends a directory export with the given alias to the agent.
@@ -87,6 +99,7 @@ func StartAgent(t *testing.T, hub *Hub, nickname string, opts ...AgentOption) *A
 	a := &Agent{
 		Nickname: nickname,
 		HomeDir:  home,
+		hubAddr:  hub.Address,
 		hub:      hub,
 		logBuf:   &LogBuffer{},
 	}
@@ -145,7 +158,7 @@ func (a *Agent) Join(t *testing.T) {
 	t.Helper()
 	token := a.hub.IssueJoinToken(t)
 	stdin := []byte(a.Nickname + "\n")
-	a.runWithStdin(t, stdin, "join", a.hub.Address, "--token", token)
+	a.runWithStdin(t, stdin, "join", a.hubAddr, "--token", token)
 }
 
 // TryJoinWithoutToken runs `hubfuse join <addr>` with no --token flag and
@@ -247,7 +260,7 @@ func (a *Agent) prepareDaemonRun(t *testing.T) []string {
 		// Join should have written this, but be defensive.
 		cfg = config.DefaultConfig()
 		cfg.Device.Nickname = a.Nickname
-		cfg.Hub.Address = a.hub.Address
+		cfg.Hub.Address = a.hubAddr
 	}
 
 	// Apply SSH port override — write only the port; shares are added after
@@ -520,14 +533,24 @@ func (a *Agent) MountMarker(dst string) string {
 // activeMounts entry, nothing to heal) instead of creating a dead mount.
 func (a *Agent) WaitForDaemonLog(t *testing.T, substr string, timeout time.Duration) {
 	t.Helper()
+	a.WaitForDaemonLogCount(t, substr, 1, timeout)
+}
+
+// WaitForDaemonLogCount is WaitForDaemonLog for a line that must appear a given
+// number of times — the way a scenario observes a REPEATED transition, e.g. a
+// second "registered with hub" proving the daemon re-established its session
+// rather than merely still holding the first one. (#72)
+func (a *Agent) WaitForDaemonLogCount(t *testing.T, substr string, want int, timeout time.Duration) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if strings.Contains(a.logBuf.String(), substr) {
+		if strings.Count(a.logBuf.String(), substr) >= want {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("WaitForDaemonLog: %q did not appear in %s's daemon log within %s", substr, a.Nickname, timeout)
+	t.Fatalf("WaitForDaemonLogCount: %q appeared %d times (want %d) in %s's daemon log within %s",
+		substr, strings.Count(a.logBuf.String(), substr), want, a.Nickname, timeout)
 }
 
 // KillStubMount simulates "the sshfs process died" (issue #67) for this
@@ -634,4 +657,3 @@ func sanitizeForMarker(p string) string {
 	r := strings.NewReplacer("/", "_", `\`, "_", ":", "_", " ", "_")
 	return r.Replace(strings.TrimPrefix(p, "/"))
 }
-
