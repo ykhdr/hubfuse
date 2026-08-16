@@ -1,5 +1,18 @@
 # Issue #67: обнаружение и лечение мёртвых sshfs-маунтов (Transport endpoint is not connected)
 
+> **Статус: частично заменён.** Постановка задачи, разбор корневых причин и Tasks 1, 4–8
+> остаются в силе — они и описывают то, что поехало в ветку. Механизм лечения из Tasks 2–3
+> (`Mounter.DeadMounts` + detect-then-act `healDeadMounts`) снят по результатам ревью:
+> `mountpointGoneCtx` заводил новую горутину на каждый маунт на каждом тике, поэтому
+> зависший `stat` копил заблокированные горутины бесконечно, а классификатор считал мёртвым
+> любую ошибку пробы, включая EACCES/EINTR.
+>
+> Действующий дизайн — **generation-bound single-flight проба внутри `Mount` (Ensure-семантика)
+> плюс desired-state реконсиляция `reconcileMounts` в демоне**; см.
+> [`20260717-issue-67-single-flight-health-rework.md`](20260717-issue-67-single-flight-health-rework.md).
+> `DeadMounts`/`healDeadMounts` в коде отсутствуют. Отмеченные ниже галочки Tasks 2–3 отражают
+> состояние на момент того плана, а не текущий код.
+
 ## Overview
 
 Маунт, чей sshfs-процесс умер (ENOTCONN-зомби), никогда не обнаруживается и не заменяется —
@@ -192,6 +205,10 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
 
 ### Task 2: `Mounter.DeadMounts` — bounded-обход активных маунтов
 
+> ⚠️ **Снят.** `DeadMounts` удалён; его заменила single-flight проба, привязанная к поколению
+> маунта, внутри `Mount` (шаги 1–3 rework-плана). Причина — утечка горутин на зависшем `stat`
+> и схлопывание любой ошибки пробы в «мёртв».
+
 **Files:**
 - Modify: `internal/agent/mounter.go`
 - Modify: `internal/agent/mounter_test.go`
@@ -210,6 +227,13 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
       `go vet ./...`, `-race` прогон)
 
 ### Task 3: Монитор здоровья маунтов в daemon
+
+> ⚠️ **Частично снят.** `runMountMonitor`, поле `mountMonitorInterval`, дефолт 15s и
+> env-override `HUBFUSE_MOUNT_MONITOR_INTERVAL` действуют как описано. А вот тело тика —
+> detect-then-act `healDeadMounts` по устаревшему снапшоту `[]*Mount` — заменено на
+> desired-state `reconcileMounts` (шаг 4 rework-плана): тик пересобирает желаемое состояние
+> и зовёт `Mount` для каждой записи, чем и лечит мёртвые, и доделывает маунты, которые
+> предыдущий неудачный remount оставил отсутствующими.
 
 **Files:**
 - Modify: `internal/agent/daemon.go`
@@ -372,7 +396,9 @@ scratchpad `design-issue-67.md` брейншторм-сессии.
       маркер+PID описана там, где описаны тесты)
 - [x] обновить план: все чекбоксы, ➕/⚠️ по факту (Tasks 1–7 полностью `[x]`,
       ➕-аннотации Tasks 2/3/5/6 сохранены; ⚠️-блокеров не возникало)
-- [x] переместить план в `docs/plans/completed/` (moved by harness after reviews)
+- [ ] переместить план в `docs/plans/completed/` — не сделано: ревью сняло Tasks 2–3 и
+      породило rework-план `20260717-...`; оба плана переезжают в `completed/` вместе,
+      после мержа PR #68
 
 ## Post-Completion
 
