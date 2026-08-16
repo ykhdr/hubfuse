@@ -763,7 +763,8 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 		// about. Otherwise a stale penalty from an earlier failed establish
 		// would suppress healing for minutes — and because a skipped key never
 		// calls Mount, it would never observe the success that clears it.
-		if !d.mounter.IsActive(key.Device, key.Share) && !d.reconcileDue(key) {
+		establishing := !d.mounter.IsActive(key.Device, key.Share)
+		if establishing && !d.reconcileDue(key) {
 			continue
 		}
 
@@ -777,7 +778,14 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 		// holding local files is the classic one — and this loop retries every
 		// mountMonitorInterval forever. Repeating the same error every 15s
 		// would bury the log for a condition that has not changed.
-		if d.noteReconcileFailure(key, err.Error()) {
+		//
+		// Only an establish attempt feeds the backoff. A failure while the
+		// entry is still active is a probe or teardown failure (e.g. the force
+		// unmount ladder losing to a wedged mount); those retry every tick by
+		// design, and counting them would silently inflate the delay that
+		// applies later, once the entry does go away — stalling the re-mount
+		// for minutes in exactly the dead-mount scenario #67 is about.
+		if d.noteReconcileFailure(key, err.Error(), establishing) {
 			d.logger.Error("mount reconcile: mount failed",
 				"device", mc.Device,
 				"share", mc.Share,
@@ -870,16 +878,19 @@ func (d *Daemon) reconcileDue(key mountKey) bool {
 	return !time.Now().Before(st.nextTry)
 }
 
-// noteReconcileFailure records a failed attempt for key and schedules the next
-// one with exponential backoff, returning whether this failure should be logged
-// at Error (true for the first failure and for any changed message).
+// noteReconcileFailure records a failed attempt for key, returning whether this
+// failure should be logged at Error (true for the first failure and for any
+// changed message).
 //
-// The backoff matters beyond log volume: Mount holds the mounter lock for the
-// whole mount-verify window when a mount cannot be established, so retrying an
-// unreachable-but-online peer every tick would keep that lock busy nearly
-// continuously and queue up Unmount, DeviceOffline teardown and shutdown behind
-// it. (#67)
-func (d *Daemon) noteReconcileFailure(key mountKey, msg string) bool {
+// establishing says whether the attempt was a mount-from-scratch; only those
+// extend the backoff. The backoff matters beyond log volume: Mount holds the
+// mounter lock for the whole mount-verify window when a mount cannot be
+// established, so retrying an unreachable-but-online peer every tick would keep
+// that lock busy nearly continuously and queue up Unmount, DeviceOffline
+// teardown and shutdown behind it. Failures against an entry that is still
+// active are probe/teardown failures, which are cheap and must keep retrying
+// every tick. (#67)
+func (d *Daemon) noteReconcileFailure(key mountKey, msg string, establishing bool) bool {
 	d.reconcileMu.Lock()
 	defer d.reconcileMu.Unlock()
 	if d.reconcileFails == nil {
@@ -889,6 +900,13 @@ func (d *Daemon) noteReconcileFailure(key mountKey, msg string) bool {
 	if !ok {
 		st = &reconcileState{}
 		d.reconcileFails[key] = st
+	}
+
+	if !establishing {
+		// Log gate only — no backoff accrual.
+		shouldLog := st.lastErr != msg
+		st.lastErr = msg
+		return shouldLog
 	}
 
 	base := d.mountMonitorInterval

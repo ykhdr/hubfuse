@@ -253,16 +253,6 @@ func classifyMountHealth(isMnt bool, err error) mountHealth {
 // while active, and it is re-applied on unmount/reap.
 const guardMode os.FileMode = 0o500
 
-// probeEntry tracks a single in-flight health probe. It is scoped to a
-// mountKey + generation (the *Mount pointer): a probe that completes after
-// the mount was replaced is discarded. (#67 single-flight)
-//
-// done is the broadcast channel: the probe owner writes health and then closes
-// done exactly once. Closing (rather than sending) is what makes the result
-// readable by an UNBOUNDED number of joiners — a send on a buffered channel
-// would be drained by whichever joiner received first, wedging the rest
-// forever. The close/receive pair also establishes the happens-before edge
-// that makes the health read race-free.
 // probeOutcome says what became of the probed activeMounts entry by the time
 // the probe finished. The caller needs the distinction: a replaced entry means
 // someone else already did the work, while a vanished one means nothing is
@@ -275,6 +265,16 @@ const (
 	probeEntryVanished                     // the entry was removed entirely
 )
 
+// probeEntry tracks a single in-flight health probe. It is scoped to a
+// mountKey + generation (the *Mount pointer): a probe that completes after
+// the mount was replaced is discarded. (#67 single-flight)
+//
+// done is the broadcast channel: the probe owner writes health and then closes
+// done exactly once. Closing (rather than sending) is what makes the result
+// readable by an UNBOUNDED number of joiners — a send on a buffered channel
+// would be drained by whichever joiner received first, wedging the rest
+// forever. The close/receive pair also establishes the happens-before edge
+// that makes the health read race-free.
 type probeEntry struct {
 	mount *Mount        // the generation this probe is bound to
 	done  chan struct{} // closed exactly once, after health is written

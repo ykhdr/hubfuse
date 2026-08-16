@@ -1947,19 +1947,19 @@ func TestReconcileErrLogGate(t *testing.T) {
 	key := mountKey{Device: "laptop", Share: "docs"}
 	other := mountKey{Device: "laptop", Share: "photos"}
 
-	assert.True(t, d.noteReconcileFailure(key, "boom"), "first failure must log")
-	assert.False(t, d.noteReconcileFailure(key, "boom"), "an unchanged repeat must not log")
-	assert.False(t, d.noteReconcileFailure(key, "boom"), "still must not log on later ticks")
+	assert.True(t, d.noteReconcileFailure(key, "boom", true), "first failure must log")
+	assert.False(t, d.noteReconcileFailure(key, "boom", true), "an unchanged repeat must not log")
+	assert.False(t, d.noteReconcileFailure(key, "boom", true), "still must not log on later ticks")
 
-	assert.True(t, d.noteReconcileFailure(key, "different"), "a changed error must log")
-	assert.False(t, d.noteReconcileFailure(key, "different"), "…then dedupe on the new message")
+	assert.True(t, d.noteReconcileFailure(key, "different", true), "a changed error must log")
+	assert.False(t, d.noteReconcileFailure(key, "different", true), "…then dedupe on the new message")
 
 	// Failures are tracked per mount, not globally.
-	assert.True(t, d.noteReconcileFailure(other, "boom"), "a different mount must log independently")
+	assert.True(t, d.noteReconcileFailure(other, "boom", true), "a different mount must log independently")
 
 	// A success clears the memory, so a later relapse is reported again.
 	d.clearReconcileErr(key)
-	assert.True(t, d.noteReconcileFailure(key, "different"), "a relapse after success must log")
+	assert.True(t, d.noteReconcileFailure(key, "different", true), "a relapse after success must log")
 
 	// clearReconcileErr on an unknown key (and on a nil map) must not panic.
 	fresh, _ := buildTestDaemon(t)
@@ -1977,7 +1977,7 @@ func TestReconcileBackoff(t *testing.T) {
 
 	assert.True(t, d.reconcileDue(key), "a mount with no failure history is always due")
 
-	d.noteReconcileFailure(key, "boom")
+	d.noteReconcileFailure(key, "boom", true)
 	assert.False(t, d.reconcileDue(key), "a just-failed mount must not be retried on the next tick")
 
 	// The delay grows with consecutive failures.
@@ -1985,7 +1985,7 @@ func TestReconcileBackoff(t *testing.T) {
 	first := d.reconcileFails[key].nextTry
 	d.reconcileMu.Unlock()
 
-	d.noteReconcileFailure(key, "boom")
+	d.noteReconcileFailure(key, "boom", true)
 	d.reconcileMu.Lock()
 	second := d.reconcileFails[key].nextTry
 	attempts := d.reconcileFails[key].attempts
@@ -1996,7 +1996,7 @@ func TestReconcileBackoff(t *testing.T) {
 
 	// Backoff is capped, not unbounded.
 	for i := 0; i < 40; i++ {
-		d.noteReconcileFailure(key, "boom")
+		d.noteReconcileFailure(key, "boom", true)
 	}
 	d.reconcileMu.Lock()
 	capped := time.Until(d.reconcileFails[key].nextTry)
@@ -2007,6 +2007,40 @@ func TestReconcileBackoff(t *testing.T) {
 	// A success clears the penalty entirely.
 	d.clearReconcileErr(key)
 	assert.True(t, d.reconcileDue(key), "a recovered mount must be due immediately")
+}
+
+// TestReconcileBackoff_OnlyEstablishAttemptsAccrue verifies that failures
+// against a still-active entry — probe or teardown failures, e.g. the force
+// unmount ladder losing to a wedged mount — do not extend the backoff. They
+// retry every tick by design, and counting them would inflate the delay that
+// applies later, once the entry does go away, stalling the re-mount for
+// minutes in exactly the dead-mount scenario #67 exists for. (#67)
+func TestReconcileBackoff_OnlyEstablishAttemptsAccrue(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	key := mountKey{Device: "laptop", Share: "docs"}
+
+	// Many failures while the entry is still active must not accrue backoff.
+	for i := 0; i < 8; i++ {
+		d.noteReconcileFailure(key, "unmount ladder failed", false)
+	}
+	assert.True(t, d.reconcileDue(key), "non-establish failures must not schedule a backoff")
+
+	d.reconcileMu.Lock()
+	attempts := d.reconcileFails[key].attempts
+	d.reconcileMu.Unlock()
+	assert.Zero(t, attempts, "non-establish failures must not count toward the backoff exponent")
+
+	// The log gate still works for them.
+	assert.False(t, d.noteReconcileFailure(key, "unmount ladder failed", false), "unchanged message must not re-log")
+	assert.True(t, d.noteReconcileFailure(key, "something else", false), "a changed message must log")
+
+	// The first real establish failure starts from one interval, not from the
+	// inflated count those eight failures would otherwise have produced.
+	d.noteReconcileFailure(key, "establish failed", true)
+	d.reconcileMu.Lock()
+	delay := time.Until(d.reconcileFails[key].nextTry)
+	d.reconcileMu.Unlock()
+	assert.LessOrEqual(t, delay, defaultMountMonitorInterval, "the first establish failure must back off by one interval")
 }
 
 // TestReconcileMounts_BackoffDoesNotBlockHealing verifies that the retry
@@ -2036,7 +2070,7 @@ func TestReconcileMounts_BackoffDoesNotBlockHealing(t *testing.T) {
 	d.reconcileMounts(context.Background())
 	require.True(t, d.mounter.IsActive("laptop", "docs"), "setup: the mount must exist")
 
-	d.noteReconcileFailure(mountKey{Device: "laptop", Share: "docs"}, "earlier failure")
+	d.noteReconcileFailure(mountKey{Device: "laptop", Share: "docs"}, "earlier failure", true)
 	require.False(t, d.reconcileDue(mountKey{Device: "laptop", Share: "docs"}), "setup: the key must be backing off")
 
 	// The mount now dies. The next sweep must still probe and heal it.
