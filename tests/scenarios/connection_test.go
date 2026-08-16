@@ -49,12 +49,15 @@ func TestAgentRecoversFromSilentlyDeadHubConnection(t *testing.T) {
 
 	// Only a keepalive ping going unanswered can notice this. Without it the
 	// daemon sits here forever.
-	bob.WaitForDaemonLog(t, "hub session lost", 45*time.Second)
-	bob.WaitForDaemonLogCount(t, "registered with hub", 2, 45*time.Second)
+	// Budgets are deliberately tight-but-sufficient (detection ~15s, then one
+	// reconnect): a regression must surface as these assertions, not as a
+	// package-wide timeout panic that also swallows the other scenarios.
+	bob.WaitForDaemonLog(t, "hub session lost", 30*time.Second)
+	bob.WaitForDaemonLogCount(t, "registered with hub", 2, 30*time.Second)
 
 	require.Eventually(t, func() bool {
 		row, ok := alice.PeerStatus(t, "bob")
 		return ok && row.Status == "online"
-	}, 45*time.Second, 500*time.Millisecond,
+	}, 30*time.Second, 500*time.Millisecond,
 		"bob must be back online without a restart")
 }

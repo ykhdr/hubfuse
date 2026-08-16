@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -74,14 +73,17 @@ type Daemon struct {
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
 
-	// sessionCancel ends the current hub session's event stream. sessionOnce
-	// installs it, dropSession calls it, and the next session replaces it. Both
-	// are reachable from the heartbeat goroutine and the supervisor, hence the
-	// lock; heartbeatFails is the consecutive-failure count that drives
-	// dropSession and is reset whenever a session is (re)established. (#72)
+	// sessionCancel ends the current hub session's event stream and
+	// heartbeatFails counts the consecutive heartbeat failures that decide to
+	// call it. Both live under sessionMu, and deliberately so: counting and
+	// cancelling have to be one atomic step, or a failure evaluated against a
+	// session that has already died would cancel the healthy session that
+	// replaced it in between. sessionOnce installs the cancel and clears the
+	// count under the same lock, so a new session is never dropped by the
+	// failures that ended the last one. (#72)
 	sessionMu      sync.Mutex
 	sessionCancel  context.CancelFunc
-	heartbeatFails atomic.Int32
+	heartbeatFails int
 
 	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
 	// it on the first successful Register and runServices asks again as a
@@ -560,6 +562,13 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
+	// The session exists from here on: the event stream will run on this
+	// context, and cancelling it is how the daemon ends a session it has
+	// decided is dead (dropSession). It is created BEFORE the heartbeat starts
+	// and before the mount reconciliation below, so a session that goes bad
+	// during either can still be ended rather than silently discarded. (#72)
+	sessionCtx := d.newSessionCtx(ctx)
+
 	// Liveness first, before anything that can block. processInitialDevices
 	// below mounts synchronously, and a single unreachable mount burns the full
 	// mount-verify window under the mounter lock — long enough for the hub to
@@ -580,11 +589,6 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	})
 
 	d.processInitialDevices(regResp.DevicesOnline)
-
-	// The event stream runs on a context of its own so the daemon can end this
-	// session deliberately — see dropSession. Cancelling it makes Recv fail,
-	// which is the one signal supervise already acts on. (#72)
-	sessionCtx := d.newSessionCtx(ctx)
 
 	stream, err := d.subscribeFn(sessionCtx)
 	if err != nil {
@@ -613,14 +617,54 @@ func (d *Daemon) newSessionCtx(parent context.Context) context.Context {
 	d.sessionMu.Lock()
 	prev := d.sessionCancel
 	d.sessionCancel = cancel
+	d.heartbeatFails = 0
 	d.sessionMu.Unlock()
 
 	if prev != nil {
 		prev()
 	}
-	d.heartbeatFails.Store(0)
 
 	return sessionCtx
+}
+
+// noteHeartbeatFailure records one failed heartbeat and ends the session once
+// maxHeartbeatFailures of them have happened in a row.
+//
+// Counting and cancelling happen in one critical section on purpose. Split
+// apart, a goroutine that decided to drop the session could be overtaken by the
+// supervisor establishing a new one and cancel that instead — a healthy session
+// killed by the failures of a dead one. Because sessionOnce clears the count
+// under the same lock, the worst outcome now is cancelling an already-dead
+// session, which is a no-op. (#72)
+func (d *Daemon) noteHeartbeatFailure() {
+	d.sessionMu.Lock()
+	d.heartbeatFails++
+	if d.heartbeatFails < maxHeartbeatFailures {
+		d.sessionMu.Unlock()
+		return
+	}
+	d.heartbeatFails = 0
+	cancel := d.sessionCancel
+	d.sessionCancel = nil
+	d.sessionMu.Unlock()
+
+	if cancel == nil {
+		// No session to end: the failures happened between sessions, and the
+		// supervisor is already trying to establish one.
+		d.logger.Debug("heartbeats failing with no live hub session; the supervisor is reconnecting")
+		return
+	}
+	d.logger.Warn("ending hub session; the supervisor will establish a new one",
+		"reason", fmt.Sprintf("%d consecutive heartbeat failures", maxHeartbeatFailures))
+	cancel()
+}
+
+// clearHeartbeatFailures forgets the running failure count after a heartbeat
+// the hub answered.
+func (d *Daemon) clearHeartbeatFailures() {
+	d.sessionMu.Lock()
+	d.heartbeatFails = 0
+	d.sessionMu.Unlock()
 }
 
 // dropSession ends the current hub session so the supervisor establishes a new

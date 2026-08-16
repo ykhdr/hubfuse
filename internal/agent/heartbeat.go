@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"time"
 )
@@ -120,7 +119,7 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 			err := d.heartbeatFn(beatCtx)
 			cancel()
 			if err == nil {
-				d.heartbeatFails.Store(0)
+				d.clearHeartbeatFailures()
 				continue
 			}
 
@@ -133,10 +132,7 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 			// call can tell, and the heartbeat is the one that runs on a fixed
 			// cadence. Ending the session hands the recovery to the supervisor,
 			// which already knows how to re-register and remount. (#72)
-			if d.heartbeatFails.Add(1) >= maxHeartbeatFailures {
-				d.heartbeatFails.Store(0)
-				d.dropSession(fmt.Sprintf("%d consecutive heartbeat failures", maxHeartbeatFailures))
-			}
+			d.noteHeartbeatFailure()
 		}
 	}
 }

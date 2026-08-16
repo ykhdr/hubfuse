@@ -46,9 +46,10 @@ func TestIntegration_ClientDetectsSilentlyDeadConnection(t *testing.T) {
 
 	relay.Break()
 
-	// Generous budget: the assertion is that the call RETURNS, and returns
-	// because the transport was found dead — not because this deadline fired.
-	callCtx, cancelCall := context.WithTimeout(ctx, 90*time.Second)
+	// Budgeted so a regression still produces this test's assertion rather than
+	// a package-wide timeout panic: detection takes ~15s, the whole test has to
+	// fit inside `make test-integration`'s 120s alongside the other tests.
+	callCtx, cancelCall := context.WithTimeout(ctx, 45*time.Second)
 	defer cancelCall()
 
 	start := time.Now()
@@ -58,7 +59,7 @@ func TestIntegration_ClientDetectsSilentlyDeadConnection(t *testing.T) {
 	require.Error(t, err, "a heartbeat on a dead connection must fail, not hang")
 	require.NoError(t, callCtx.Err(),
 		"the call must end because keepalive killed the transport, not because the test's deadline expired")
-	assert.Less(t, elapsed, 45*time.Second,
+	assert.Less(t, elapsed, 30*time.Second,
 		"detection must fit inside the hub's liveness timeout budget, got %s", elapsed)
 
 	// The event stream must die too — that is the signal the daemon's
@@ -71,7 +72,7 @@ func TestIntegration_ClientDetectsSilentlyDeadConnection(t *testing.T) {
 	select {
 	case recvErr := <-streamErr:
 		require.Error(t, recvErr, "the event stream must end when the transport dies")
-	case <-time.After(30 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("the event stream never ended; the supervisor would never reconnect")
 	}
 }

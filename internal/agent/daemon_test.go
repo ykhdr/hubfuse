@@ -1745,13 +1745,18 @@ func TestNewSessionCtx_CancelsPreviousAndClearsFailures(t *testing.T) {
 	defer cancel()
 
 	first := d.newSessionCtx(ctx)
-	d.heartbeatFails.Store(maxHeartbeatFailures - 1)
+	d.sessionMu.Lock()
+	d.heartbeatFails = maxHeartbeatFailures - 1
+	d.sessionMu.Unlock()
 
 	second := d.newSessionCtx(ctx)
 
 	assert.Error(t, first.Err(), "the previous session context must be cancelled")
 	assert.NoError(t, second.Err(), "the new session context must be live")
-	assert.Zero(t, d.heartbeatFails.Load(), "a new session starts with a clean failure count")
+	d.sessionMu.Lock()
+	fails := d.heartbeatFails
+	d.sessionMu.Unlock()
+	assert.Zero(t, fails, "a new session starts with a clean failure count")
 
 	// Dropping is idempotent and safe when no session is live.
 	d.dropSession("test")

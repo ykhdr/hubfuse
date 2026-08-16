@@ -24,9 +24,17 @@ type Relay struct {
 
 	listener net.Listener
 	mu       sync.Mutex
-	conns    []*atomic.Bool // one "dead" flag per accepted connection pair
-	closed   atomic.Bool
-	wg       sync.WaitGroup
+	pairs    []*connPair
+}
+
+// connPair is one accepted connection and its upstream counterpart. dead marks
+// the pair as silenced; both sockets are kept so stop can actually close them —
+// leaving them open would strand two goroutines per connection blocked in Read
+// for the rest of the test binary's life.
+type connPair struct {
+	client   net.Conn
+	upstream net.Conn
+	dead     atomic.Bool
 }
 
 // Start listens on a free local port and forwards every connection to target.
@@ -41,9 +49,7 @@ func Start(t *testing.T, target string) *Relay {
 
 	r := &Relay{Addr: lis.Addr().String(), listener: lis}
 
-	r.wg.Add(1)
 	go func() {
-		defer r.wg.Done()
 		for {
 			client, acceptErr := lis.Accept()
 			if acceptErr != nil {
@@ -55,14 +61,13 @@ func Start(t *testing.T, target string) *Relay {
 				continue
 			}
 
-			dead := &atomic.Bool{}
+			pair := &connPair{client: client, upstream: upstream}
 			r.mu.Lock()
-			r.conns = append(r.conns, dead)
+			r.pairs = append(r.pairs, pair)
 			r.mu.Unlock()
 
-			r.wg.Add(2)
-			go func() { defer r.wg.Done(); r.pipe(upstream, client, dead) }()
-			go func() { defer r.wg.Done(); r.pipe(client, upstream, dead) }()
+			go pipe(upstream, client, &pair.dead)
+			go pipe(client, upstream, &pair.dead)
 		}
 	}()
 
@@ -71,13 +76,12 @@ func Start(t *testing.T, target string) *Relay {
 }
 
 // Break silences every connection that exists right now. Later connections are
-// forwarded as usual.
+// forwarded as usual, which is what lets a test observe recovery too.
 func (r *Relay) Break() {
 	r.mu.Lock()
-	for _, dead := range r.conns {
-		dead.Store(true)
+	for _, pair := range r.pairs {
+		pair.dead.Store(true)
 	}
-	r.conns = nil
 	r.mu.Unlock()
 }
 
@@ -85,7 +89,7 @@ func (r *Relay) Break() {
 // which everything read is dropped on the floor. Both sockets stay open: a
 // closed socket would surface as a clean error, which is exactly what the
 // failure being reproduced never provides.
-func (r *Relay) pipe(dst, src net.Conn, dead *atomic.Bool) {
+func pipe(dst, src net.Conn, dead *atomic.Bool) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
@@ -100,7 +104,18 @@ func (r *Relay) pipe(dst, src net.Conn, dead *atomic.Bool) {
 	}
 }
 
+// stop closes the listener and every connection it is still forwarding, so no
+// pipe goroutine outlives the test that created the relay.
 func (r *Relay) stop() {
-	r.closed.Store(true)
 	_ = r.listener.Close()
+
+	r.mu.Lock()
+	pairs := r.pairs
+	r.pairs = nil
+	r.mu.Unlock()
+
+	for _, pair := range pairs {
+		_ = pair.client.Close()
+		_ = pair.upstream.Close()
+	}
 }
