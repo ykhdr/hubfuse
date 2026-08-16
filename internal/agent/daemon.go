@@ -73,6 +73,19 @@ type Daemon struct {
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
 
+	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
+	// it on the first successful Register and runServices asks again as a
+	// safety net, but exactly one goroutine may exist for the daemon's
+	// lifetime. See startHeartbeat. (#69)
+	heartbeatOnce sync.Once
+
+	// heartbeatInterval is the cadence of the heartbeat loop. NewDaemon sets
+	// defaultHeartbeatInterval, overridable via HUBFUSE_HEARTBEAT_INTERVAL (a
+	// test handle for scenario tests that shorten the hub's liveness timeout).
+	// Unlike the mount monitor's interval, a non-positive value never disables
+	// the loop — runHeartbeat falls back to the default. (#69)
+	heartbeatInterval time.Duration
+
 	// minReconnectInterval is the floor on how frequently the supervisor starts a
 	// new hub session. It serves two roles, both keyed off the same minimum so a
 	// flapping hub is never hammered: (1) supervise waits out this interval when a
@@ -114,6 +127,12 @@ type Daemon struct {
 	// fakes to drive sessionOnce / reconnectSession / supervise without a live hub.
 	registerFn  func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error)
 	subscribeFn func(ctx context.Context) (pb.HubFuse_SubscribeClient, error)
+
+	// heartbeatFn is the same kind of seam over HubClient.Heartbeat, so a unit
+	// test can observe that liveness starts before the initial mount
+	// reconciliation without a live hub. A nil value means "no transport" and
+	// runHeartbeat declines to start (test fixtures that never register). (#69)
+	heartbeatFn func(ctx context.Context) error
 
 	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
 	// config-watcher's share-publish path (onConfigChange) is testable without a
@@ -211,6 +230,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		mountMonitorInterval: mountMonitorIntervalFromEnv(
 			os.Getenv("HUBFUSE_MOUNT_MONITOR_INTERVAL"),
 			defaultMountMonitorInterval, logger),
+		heartbeatInterval: heartbeatIntervalFromEnv(
+			os.Getenv("HUBFUSE_HEARTBEAT_INTERVAL"),
+			defaultHeartbeatInterval, logger),
 	}
 
 	// Wire the hub-session seams to the live client. The closures read d.hubClient
@@ -225,6 +247,9 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	}
 	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
 		return d.hubClient.UpdateShares(ctx, shares)
+	}
+	d.heartbeatFn = func(ctx context.Context) error {
+		return d.hubClient.Heartbeat(ctx)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
@@ -517,9 +542,19 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 		"online_devices", len(regResp.DevicesOnline),
 	)
 
+	// Liveness first, before anything that can block. processInitialDevices
+	// below mounts synchronously, and a single unreachable mount burns the full
+	// mount-verify window under the mounter lock — long enough for the hub to
+	// declare this device offline and for its peers to unmount the shares it is
+	// serving. The heartbeat loop is independent of all of that and must not
+	// queue behind it. (#69)
+	d.startHeartbeat(ctx)
+
 	// onReady is optional (nil in tests and when the cmd layer wants no PID
 	// hook), so guard the nil case inside the Once — a bare Do(d.onReady) would
-	// panic on a nil func.
+	// panic on a nil func. Note this runs only after a Register the hub
+	// ACCEPTED: a refused registration returns above, so no PID file is written
+	// for a daemon the hub does not know. (#69)
 	d.readyOnce.Do(func() {
 		if d.onReady != nil {
 			d.onReady()
@@ -634,10 +669,14 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 	}
 }
 
-// runServices starts the heartbeat ticker, the mount-health monitor (#67), and
-// the config watcher, then blocks until ctx is cancelled before shutting down.
+// runServices starts the mount-health monitor (#67) and the config watcher,
+// then blocks until ctx is cancelled before shutting down. The heartbeat loop
+// is normally already running — sessionOnce starts it as soon as the hub
+// accepts the registration, well before this point (#69) — and startHeartbeat
+// is idempotent, so asking again here costs nothing and keeps this the single
+// place that guarantees every background service is up.
 func (d *Daemon) runServices(ctx context.Context) error {
-	go d.runHeartbeat(ctx)
+	d.startHeartbeat(ctx)
 	go d.runMountMonitor(ctx)
 
 	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)

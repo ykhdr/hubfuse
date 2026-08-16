@@ -1408,6 +1408,195 @@ func TestSessionOnce_RemountsPeerAtChangedEndpoint(t *testing.T) {
 	assert.Equal(t, "10.0.0.99", mounts[0].IP, "mount must follow the peer to the new endpoint after reconnect")
 }
 
+// ─── heartbeat / liveness ordering (#69) ──────────────────────────────────────
+
+// TestSessionOnce_HeartbeatStartsBeforeMountReconciliation is the regression for
+// the liveness half of issue #69.
+//
+// The proof is structural rather than time-based: the mount's verify poll only
+// succeeds once a heartbeat has actually been sent. If the heartbeat loop still
+// started after processInitialDevices — as it did when runServices owned it —
+// the mount could never complete, the verify poll would burn its whole timeout,
+// and the assertion below would fail. With liveness starting the moment the hub
+// accepts the registration, the beat lands while the mount is still in flight
+// and both succeed.
+func TestSessionOnce_HeartbeatStartsBeforeMountReconciliation(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+	d.config.Mounts = []agentconfig.MountConfig{
+		{Device: "peer", Share: "docs", To: mountTo},
+	}
+	writePubKey(t, dir, "peer-device")
+
+	var beats atomic.Int32
+	d.heartbeatInterval = 10 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		beats.Add(1)
+		return nil
+	}
+
+	// The mountpoint "appears" only after the daemon has proved it is alive.
+	d.mounter.checkMountpoint = func(string) (bool, error) {
+		return beats.Load() > 0, nil
+	}
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return &pb.RegisterResponse{
+			DevicesOnline: []*pb.DeviceInfo{{
+				DeviceId: "peer-device",
+				Nickname: "peer",
+				Ip:       "10.0.0.5",
+				SshPort:  2222,
+				Shares:   []*pb.Share{{Alias: "docs", Permissions: "ro"}},
+			}},
+		}, nil
+	}
+	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {
+		return errStream(), nil
+	}
+
+	_, err := d.sessionOnce(ctx)
+	require.NoError(t, err, "sessionOnce")
+
+	assert.Positive(t, beats.Load(), "the daemon must heartbeat while the initial mount reconciliation is still running")
+	assert.True(t, d.mounter.IsActive("peer", "docs"),
+		"the mount only completes if a heartbeat was sent first — it timed out, so liveness started too late")
+}
+
+// TestStartHeartbeat_StartsExactlyOnce pins the Once: sessionOnce runs again on
+// every reconnect and runServices asks a second time, but a daemon must never
+// end up with two heartbeat loops racing each other into the hub.
+//
+// The first start is handed an already-cancelled context, so its goroutine
+// returns immediately without ever ticking. A second loop — if the Once did not
+// hold — would tick freely on the live context, so any beat at all is a failure.
+func TestStartHeartbeat_StartsExactlyOnce(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	var beats atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		beats.Add(1)
+		return nil
+	}
+
+	dead, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	d.startHeartbeat(dead)
+
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	d.startHeartbeat(live)
+	d.startHeartbeat(live)
+
+	time.Sleep(60 * time.Millisecond) // ~12 ticks for any loop that started
+
+	assert.Zero(t, beats.Load(), "startHeartbeat must start the loop exactly once for the daemon's lifetime")
+}
+
+// TestSessionOnce_RejectedRegisterStartsNothing — a hub that refuses the
+// registration (the pruned identity in issue #69) must leave the daemon with no
+// PID file and no heartbeat loop: it is not registered, and pretending otherwise
+// is what made the failure invisible in the first place.
+func TestSessionOnce_RejectedRegisterStartsNothing(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var readyCalls int
+	d.onReady = func() { readyCalls++ }
+
+	var beats atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		beats.Add(1)
+		return nil
+	}
+
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		// What HubClient.Register now returns for Success=false.
+		return nil, errors.New("hub rejected the request: registration refused: this device is not registered on the hub")
+	}
+
+	_, err := d.sessionOnce(ctx)
+	require.Error(t, err, "a refused registration must surface as an error")
+	assert.Contains(t, err.Error(), "register with hub", "the error must keep the register context")
+
+	time.Sleep(30 * time.Millisecond)
+
+	assert.Zero(t, readyCalls, "no PID file may be written for a registration the hub refused")
+	assert.Zero(t, beats.Load(), "no heartbeat loop may start for a registration the hub refused")
+}
+
+func TestHeartbeatIntervalFromEnv(t *testing.T) {
+	const def = 10 * time.Second
+
+	tests := []struct {
+		name     string
+		raw      string
+		want     time.Duration
+		wantWarn bool
+	}{
+		{name: "empty keeps default", raw: "", want: def},
+		{name: "valid override", raw: "250ms", want: 250 * time.Millisecond},
+		{name: "zero falls back", raw: "0s", want: def, wantWarn: true},
+		{name: "negative falls back", raw: "-5s", want: def, wantWarn: true},
+		{name: "garbage falls back", raw: "soon", want: def, wantWarn: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			got := heartbeatIntervalFromEnv(tt.raw, def, captureLogger(&buf))
+			assert.Equal(t, tt.want, got)
+			if tt.wantWarn {
+				assert.Contains(t, buf.String(), "HUBFUSE_HEARTBEAT_INTERVAL",
+					"a rejected value must be reported — a silently disabled heartbeat means guaranteed offline")
+			} else {
+				assert.Empty(t, buf.String(), "an accepted value must not warn")
+			}
+		})
+	}
+}
+
+// TestNewDaemon_HeartbeatIntervalDefaultAndEnvOverride verifies the wiring in
+// NewDaemon: the default cadence lands on the daemon, and
+// HUBFUSE_HEARTBEAT_INTERVAL overrides it (the handle scenario tests use to
+// beat faster than a shortened hub timeout). (#69)
+func TestNewDaemon_HeartbeatIntervalDefaultAndEnvOverride(t *testing.T) {
+	cfgContent := `device {
+    nickname "my-device"
+}
+hub {
+    address "localhost:9090"
+}
+agent {
+    ssh-port 2222
+}
+`
+	t.Run("default", func(t *testing.T) {
+		t.Setenv("HUBFUSE_HEARTBEAT_INTERVAL", "") // isolate from the outer env
+		daemon, err := NewDaemon(writeDaemonFixture(t, cfgContent), discardLogger(), DaemonOptions{})
+		require.NoError(t, err, "NewDaemon")
+		assert.Equal(t, defaultHeartbeatInterval, daemon.heartbeatInterval,
+			"NewDaemon must default the heartbeat interval")
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv("HUBFUSE_HEARTBEAT_INTERVAL", "1s")
+		daemon, err := NewDaemon(writeDaemonFixture(t, cfgContent), discardLogger(), DaemonOptions{})
+		require.NoError(t, err, "NewDaemon")
+		assert.Equal(t, time.Second, daemon.heartbeatInterval,
+			"the env override must reach the daemon")
+	})
+}
+
 // ─── preflightMountBinary ──────────────────────────────────────────────────────
 
 // captureLogger returns a logger that writes warnings (and above) into buf so a
