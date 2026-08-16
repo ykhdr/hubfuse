@@ -32,17 +32,45 @@ type Hub struct {
 	cancel context.CancelFunc
 }
 
+// HubOption tunes the hub process a scenario starts. Options translate to
+// `hubfuse-hub start` flags, so a scenario expresses timing requirements
+// (retention, liveness timeout) instead of duplicating the launch code.
+type HubOption func(*[]string)
+
+// WithRetention prunes offline devices older than the given duration. Use a
+// short duration (e.g. 5s) so pruning is observable within CI timelines.
+func WithRetention(retention time.Duration) HubOption {
+	return func(args *[]string) {
+		*args = append(*args, "--device-retention", retention.String())
+	}
+}
+
+// WithHeartbeatTimeout shortens how long a device may go without a heartbeat
+// before the hub demotes it. The production default is 30s, which no scenario
+// can afford to wait out several times; pair it with the agent's
+// HUBFUSE_HEARTBEAT_INTERVAL so agents beat well inside the window. (#69)
+func WithHeartbeatTimeout(timeout time.Duration) HubOption {
+	return func(args *[]string) {
+		*args = append(*args, "--heartbeat-timeout", timeout.String())
+	}
+}
+
 // StartHub launches a hub in a temp data dir and returns once it is listening.
-func StartHub(t *testing.T) *Hub {
+func StartHub(t *testing.T, opts ...HubOption) *Hub {
 	t.Helper()
 	port := FreePort(t)
 	dataDir := t.TempDir()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, HubBinaryPath, "start",
+	args := []string{"start",
 		"--listen", fmt.Sprintf("127.0.0.1:%d", port),
 		"--data-dir", dataDir,
-	)
+	}
+	for _, o := range opts {
+		o(&args)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, HubBinaryPath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	logBuf := &LogBuffer{}
@@ -71,43 +99,9 @@ func StartHub(t *testing.T) *Hub {
 
 // StartHubWithRetention launches a hub with the given device-retention duration.
 // Devices offline longer than retention will be pruned from the store entirely.
-// Use a short duration (e.g. 5s) in tests so pruning is observable within CI
-// timelines. Mirror of StartHub; all other options use hub defaults.
 func StartHubWithRetention(t *testing.T, retention time.Duration) *Hub {
 	t.Helper()
-	port := FreePort(t)
-	dataDir := t.TempDir()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, HubBinaryPath, "start",
-		"--listen", fmt.Sprintf("127.0.0.1:%d", port),
-		"--data-dir", dataDir,
-		"--device-retention", retention.String(),
-	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	logBuf := &LogBuffer{}
-	cmd.Stdout = logBuf
-	cmd.Stderr = logBuf
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("start hub with retention: %v", err)
-	}
-
-	h := &Hub{
-		Address: fmt.Sprintf("127.0.0.1:%d", port),
-		DataDir: dataDir,
-		port:    port,
-		cmd:     cmd,
-		logBuf:  logBuf,
-		cancel:  cancel,
-	}
-	DumpOnFailure(t, "hub", logBuf)
-	t.Cleanup(func() { h.Stop(t) })
-
-	WaitForPort(t, port, 5*time.Second)
-	return h
+	return StartHub(t, WithRetention(retention))
 }
 
 // IssueJoinToken runs `hubfuse-hub issue-join --data-dir <DataDir>` against

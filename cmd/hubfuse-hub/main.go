@@ -64,6 +64,7 @@ func startCmd() *cobra.Command {
 		extraSANs []string
 		daemon    bool
 		deviceRet string
+		hbTimeout string
 	)
 
 	cmd := &cobra.Command{
@@ -101,15 +102,21 @@ func startCmd() *cobra.Command {
 				return err
 			}
 
+			heartbeatTimeout, err := resolveHeartbeatTimeout(hbTimeout, cmd.Flags().Changed("heartbeat-timeout"), configPath)
+			if err != nil {
+				return err
+			}
+
 			cfg := hub.Config{
-				ListenAddr:      listen,
-				DataDir:         dataDir,
-				LogFile:         logFile,
-				LogLevel:        common.ParseLogLevel(logLevel),
-				Verbose:         verbose,
-				ExtraSANs:       extraSANs,
-				DeviceRetention: retention,
-				JoinTokenTTL:    joinTokenTTL,
+				ListenAddr:       listen,
+				DataDir:          dataDir,
+				LogFile:          logFile,
+				LogLevel:         common.ParseLogLevel(logLevel),
+				Verbose:          verbose,
+				ExtraSANs:        extraSANs,
+				DeviceRetention:  retention,
+				JoinTokenTTL:     joinTokenTTL,
+				HeartbeatTimeout: heartbeatTimeout,
 				OnReady: func() {
 					if err := daemonize.WritePIDFile(pidPath); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: write pid file: %v\n", err)
@@ -156,6 +163,7 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&extraSANs, "san", nil, "additional SANs for TLS certificate (IPs or hostnames)")
 	cmd.Flags().BoolVarP(&daemon, "daemon", "d", false, "detach from terminal and run in the background")
 	cmd.Flags().StringVar(&deviceRet, "device-retention", hub.DefaultDeviceRetention.String(), "prune offline devices older than this duration (0 = never prune)")
+	cmd.Flags().StringVar(&hbTimeout, "heartbeat-timeout", hub.DefaultHeartbeatTimeout.String(), "mark a device offline after this long without a heartbeat")
 
 	return cmd
 }
@@ -181,4 +189,3 @@ func statusCmd() *cobra.Command {
 		},
 	}
 }
-

@@ -221,11 +221,12 @@ func (a *Agent) RestartDaemon(t *testing.T) {
 	a.launchDaemon(t)
 }
 
-// launchDaemon is the daemon-process core shared by StartDaemon and
-// RestartDaemon: it prepares config.kdl (SSH port) and the stub-marker dir,
-// starts `hubfuse start` with the stub-sshfs PATH override, and returns once
-// the SSH server port is confirmed listening. It does NOT touch exports.
-func (a *Agent) launchDaemon(t *testing.T) {
+// prepareDaemonRun performs the setup every daemon launch needs — SSH port
+// selection, the stub-marker directory, and the config.kdl rewrite — and
+// returns the environment for the daemon process. It is shared by launchDaemon
+// and StartDaemonExpectFailure so a daemon expected to die runs under exactly
+// the same conditions as one expected to live. It does NOT touch exports.
+func (a *Agent) prepareDaemonRun(t *testing.T) []string {
 	t.Helper()
 
 	// Pick a free port if not already set (RestartDaemon keeps the first one).
@@ -269,7 +270,66 @@ func (a *Agent) launchDaemon(t *testing.T) {
 		"PATH=" + stubDir + ":" + existingPath(),
 		"HUBFUSE_STUB_MOUNT_DIR=" + a.StubMountDir,
 	}
-	daemonEnv = append(daemonEnv, a.envExtra...)
+	return append(daemonEnv, a.envExtra...)
+}
+
+// StartDaemonExpectFailure runs `hubfuse start` in the foreground and waits for
+// it to exit non-zero, returning the combined output. Use it for the startup
+// paths that must abort loudly — the pruned identity of issue #69, where the
+// hub refuses the registration and the daemon has nothing useful left to do.
+//
+// It deliberately does not go through launchDaemon: that one waits for the SSH
+// port and registers a Stop cleanup, both meaningless for a process that is
+// supposed to die on its own.
+func (a *Agent) StartDaemonExpectFailure(t *testing.T, timeout time.Duration) string {
+	t.Helper()
+
+	daemonEnv := a.prepareDaemonRun(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, AgentBinaryPath, "start")
+	cmd.Env = daemonEnv
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	out, err := cmd.CombinedOutput()
+	_, _ = a.logBuf.Write([]byte("$ hubfuse start  (expect failure)\n"))
+	_, _ = a.logBuf.Write(out)
+
+	if ctx.Err() != nil {
+		t.Fatalf("StartDaemonExpectFailure: %s's daemon was still running after %s; output:\n%s",
+			a.Nickname, timeout, out)
+	}
+	if err == nil {
+		t.Fatalf("StartDaemonExpectFailure: %s's daemon exited zero, expected a startup failure; output:\n%s",
+			a.Nickname, out)
+	}
+	return string(out)
+}
+
+// AddMount registers a mount in config.kdl WITHOUT waiting for it to come up.
+// Unlike Mount, it makes no claim that the mount can succeed — which is the
+// point for scenarios that need a configured-but-unreachable mount (issue #69:
+// a stale entry that burns the whole mount-verify window on every attempt).
+// The daemon may be stopped when this is called; the entry is then picked up by
+// the next start.
+func (a *Agent) AddMount(t *testing.T, src, dst string) {
+	t.Helper()
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatalf("AddMount: mkdir %s: %v", dst, err)
+	}
+	a.run(t, "mount", "add", src, "--to", dst)
+}
+
+// launchDaemon is the daemon-process core shared by StartDaemon and
+// RestartDaemon: it prepares the run (see prepareDaemonRun), starts
+// `hubfuse start` with the stub-sshfs PATH override, and returns once the SSH
+// server port is confirmed listening. It does NOT touch exports.
+func (a *Agent) launchDaemon(t *testing.T) {
+	t.Helper()
+
+	daemonEnv := a.prepareDaemonRun(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, AgentBinaryPath, "start")

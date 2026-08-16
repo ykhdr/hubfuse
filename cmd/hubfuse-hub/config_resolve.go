@@ -38,6 +38,41 @@ func resolveDeviceRetention(flagValue string, flagChanged bool, configPath strin
 	return flagDuration, nil
 }
 
+// resolveHeartbeatTimeout determines how long a device may go without a
+// heartbeat before the monitor demotes it. Same precedence as
+// resolveDeviceRetention: an explicitly set flag wins, otherwise config.kdl,
+// otherwise the flag default.
+//
+// Zero means "use the hub default" (hub.DefaultHeartbeatTimeout); negative is
+// rejected outright, since a non-positive timeout would demote every device on
+// the first sweep. (#69)
+func resolveHeartbeatTimeout(flagValue string, flagChanged bool, configPath string) (time.Duration, error) {
+	flagDuration, err := time.ParseDuration(flagValue)
+	if err != nil {
+		return 0, fmt.Errorf("parse heartbeat-timeout flag: %w", err)
+	}
+	if flagDuration < 0 {
+		return 0, fmt.Errorf("heartbeat-timeout cannot be negative")
+	}
+
+	if flagChanged {
+		return flagDuration, nil
+	}
+
+	cfg, err := hub.LoadHubConfigFile(configPath)
+	if err != nil {
+		return 0, err
+	}
+	if cfg.HeartbeatTimeout != nil {
+		if *cfg.HeartbeatTimeout < 0 {
+			return 0, fmt.Errorf("heartbeat-timeout cannot be negative")
+		}
+		return *cfg.HeartbeatTimeout, nil
+	}
+
+	return flagDuration, nil
+}
+
 // resolveJoinTokenTTL determines the effective join-token TTL from the config
 // file only (no CLI flag). Returns 10 minutes when the config file does not
 // set the value.
