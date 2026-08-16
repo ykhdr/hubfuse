@@ -489,6 +489,28 @@ func TestRegister_RefusedWhileDraining(t *testing.T) {
 	assert.NotEqual(t, store.StatusOnline, d.Status, "no online row may be written while draining")
 }
 
+// TestRegister_RefusedWhenDrainStartsMidRegistration — Drain can land in any of
+// the round-trips Register makes, and Hub.Stop's GracefulStop then WAITS for
+// this RPC, so a top-of-function check alone would let the online row outlive
+// the sweep. The write itself must be guarded.
+func TestRegister_RefusedWhenDrainStartsMidRegistration(t *testing.T) {
+	r := newTestRegistry(t)
+	ctx := context.Background()
+
+	joinDevice(t, r, "dev-1", "alice", "")
+
+	// Stand in for "Drain happened after Register's early check": the guard the
+	// status write itself consults must still refuse.
+	r.Drain()
+	err := r.markOnlineUnlessDraining(ctx, "dev-1", "10.0.0.1", 2222)
+	require.Error(t, err, "the guarded write must refuse while draining")
+	assert.ErrorIs(t, err, common.ErrHubShuttingDown)
+
+	d, err := r.store.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.NotEqual(t, store.StatusOnline, d.Status, "no online row may outlive the shutdown sweep")
+}
+
 // TestWriteErr_TranslatesAnyFailureForAVanishedDevice — a prune between two
 // statements of the same RPC does not always surface as ErrNotFound: with
 // foreign keys on, writing shares for a deleted device fails as a constraint

@@ -99,11 +99,12 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, common.ErrUnsupportedProtocol
 	}
 
-	// A hub on its way out must not accept new online rows: the shutdown sweep
-	// has already run by the time an in-flight Register reaches this point, so
-	// the row would survive into the next hub start and be served to peers as
-	// an endpoint nobody is listening on. The agent retries with backoff and
-	// registers against the hub that comes back. (#69)
+	// A hub on its way out must not accept new online rows: such a row survives
+	// into the next hub start and is served to peers as an endpoint nobody is
+	// listening on. This is the cheap early exit — the authoritative check is
+	// in markOnlineUnlessDraining, next to the write it guards, because Drain
+	// can land during the several round-trips in between. The agent retries
+	// with backoff and registers against the hub that comes back. (#69)
 	if r.draining.Load() {
 		return nil, common.ErrHubShuttingDown
 	}
@@ -134,7 +135,10 @@ func (r *Registry) Register(ctx context.Context, deviceID, ip string, sshPort in
 		return nil, r.writeErr(ctx, deviceID, err)
 	}
 
-	if err := r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort); err != nil {
+	if err := r.markOnlineUnlessDraining(ctx, deviceID, ip, sshPort); err != nil {
+		if errors.Is(err, common.ErrHubShuttingDown) {
+			return nil, err
+		}
 		return nil, r.writeErr(ctx, deviceID, err)
 	}
 
@@ -224,7 +228,7 @@ func (r *Registry) Heartbeat(ctx context.Context, deviceID, ip string) error {
 	}
 	if !r.canRecover(deviceID) {
 		// Offline for a reason other than "the hub gave up on a live device".
-		// This is only the cheap early exit — recoverIfConnected re-checks the
+		// This is only the cheap early exit — recoverAndAnnounce re-checks the
 		// same guard atomically with the write. See canRecover.
 		return nil
 	}
@@ -339,16 +343,36 @@ func (r *Registry) recoverAndAnnounce(ctx context.Context, deviceID, ip string, 
 	return true, nil
 }
 
+// markOnlineUnlessDraining writes the online row with the draining flag
+// re-checked inside the same critical section, mirroring recoverAndAnnounce.
+//
+// Register performs several round-trips before it gets here, and Drain can land
+// in any of those gaps: Hub.Stop drains, sweeps every online device offline, and
+// only then calls GracefulStop — which WAITS for this very RPC. A status write
+// that slipped past a top-of-function check would therefore land after the
+// sweep and outlive the hub. Drain takes the write lock, so it either precedes
+// this guard (and the registration is refused) or follows the write (and the
+// sweep that comes after it demotes the row). (#69)
+func (r *Registry) markOnlineUnlessDraining(ctx context.Context, deviceID, ip string, sshPort int) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.draining.Load() {
+		return common.ErrHubShuttingDown
+	}
+	return r.store.UpdateDeviceStatus(ctx, deviceID, store.StatusOnline, ip, sshPort)
+}
+
 // Drain stops heartbeat-driven recovery for the rest of this hub's life. Hub
 // shutdown marks every online device offline and then waits for in-flight RPCs
 // to finish; without this, a heartbeat processed inside that window would flip
 // a device back to online and leave a phantom-online row behind for the next
 // hub start to serve to its peers.
 //
-// The flag is set under the WRITE lock so it cannot land inside
-// recoverIfConnected's guarded window: either it wins and every later heartbeat
-// is refused, or it waits for the in-flight promotion and the shutdown sweep
-// that follows demotes that device along with the rest. (#69)
+// The flag is set under the WRITE lock so it cannot land inside the guarded
+// windows of recoverAndAnnounce or markOnlineUnlessDraining: either it wins and
+// every later promotion is refused, or it waits for the in-flight one and the
+// shutdown sweep that follows demotes that device along with the rest. (#69)
 func (r *Registry) Drain() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -407,7 +431,7 @@ func (r *Registry) UpdateShares(ctx context.Context, deviceID string, shares []*
 // broadcasts a DeviceOffline event — in that order. Closing the subscription
 // first is load-bearing, not cosmetic: it is what stops a heartbeat still in
 // flight from recovering a device that deliberately went away (see
-// recoverIfConnected). (#69)
+// recoverAndAnnounce). (#69)
 func (r *Registry) Deregister(ctx context.Context, deviceID string) error {
 	device, err := r.store.GetDevice(ctx, deviceID)
 	if err != nil {
