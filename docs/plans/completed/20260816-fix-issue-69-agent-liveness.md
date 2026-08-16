@@ -209,23 +209,23 @@
 - [x] тесты `internal/hub/store/sqlite_test.go`: `errors.Is(err, ErrNotFound)` для обоих
       геттеров и для heartbeat несуществующего устройства; успешный heartbeat по-прежнему nil
 
-### Task 1b: store — условные переходы статуса (➕ по итогам ревью Codex)
+### Task 1b: store — условные переходы статуса (➕ по итогам ревью Codex) ✅
 
-- [ ] `MarkOfflineIfStale` и `MarkOnlineIfOffline` в интерфейсе и в sqlite-реализации
-- [ ] `UpdateDeviceStatus`/`UpdateDeviceNickname` — проверка `RowsAffected`
-- [ ] тесты: переход происходит ровно один раз; свежий heartbeat отменяет пометку офлайн;
+- [x] `MarkOfflineIfStale` и `MarkOnlineIfOffline` в интерфейсе и в sqlite-реализации
+- [x] `UpdateDeviceStatus`/`UpdateDeviceNickname` — проверка `RowsAffected`
+- [x] тесты: переход происходит ровно один раз; свежий heartbeat отменяет пометку офлайн;
       уже-онлайн устройство не «восстанавливается» повторно
 
-### Task 2: hub — восстановление устройства по heartbeat
+### Task 2: hub — восстановление устройства по heartbeat ✅
 
-- [ ] `Registry.Heartbeat(ctx, deviceID, ip)`: трансляция `store.ErrNotFound`, условный флип
+- [x] `Registry.Heartbeat(ctx, deviceID, ip)`: трансляция `store.ErrNotFound`, условный флип
       `offline → online`, broadcast `DeviceOnline`, INFO-лог
-- [ ] `Registry.MarkOffline(ctx, device, threshold)`: условный переход, событие только при
+- [x] `Registry.MarkOffline(ctx, device, threshold)`: условный переход, событие только при
       реальном изменении; `checkStale` передаёт свой threshold
-- [ ] `Server.Heartbeat`: передать `peerIP`, вернуть `Success=false` при ошибке
-- [ ] `Server.Register`: actionable-текст для `common.ErrDeviceNotFound` без подстроки
+- [x] `Server.Heartbeat`: передать `peerIP`, вернуть `Success=false` при ошибке
+- [x] `Server.Register`: actionable-текст для `common.ErrDeviceNotFound` без подстроки
       `device not found`
-- [ ] тесты `internal/hub/registry_test.go` + `heartbeat_test.go`: (а) heartbeat
+- [x] тесты `internal/hub/registry_test.go` + `heartbeat_test.go`: (а) heartbeat
       онлайн-устройства не шлёт событий; (б) heartbeat офлайн-устройства переводит в online,
       шлёт `DeviceOnline` с шарами и свежим IP, не шлёт его самому устройству; (в) heartbeat
       неизвестного устройства — `common.ErrDeviceNotFound`; (г) свежий heartbeat между
@@ -236,42 +236,42 @@
 - [x] `internal/agent/client.go`: проверка `Success` в `Register`, `Heartbeat`,
       `UpdateShares`, `Deregister`, `Rename` + сентинел `ErrHubRejected`
 - [x] `cmd/hubfuse/main.go`: убрать мёртвую ветку `!resp.Success` в `rename`
-- [ ] `Daemon.Shutdown`: отклонённый `Deregister` — WARN, не ошибка завершения
-- [ ] тесты `tests/integration`: Register удалённого устройства → ошибка с подсказкой re-join;
+- [x] `Daemon.Shutdown`: отклонённый `Deregister` — WARN, не ошибка завершения
+- [x] тесты `tests/integration`: Register удалённого устройства → ошибка с подсказкой re-join;
       Heartbeat неизвестного устройства → ошибка; успешные пути не сломаны
 
-### Task 4: agent — heartbeat стартует до реконсиляции маунтов
+### Task 4: agent — heartbeat стартует до реконсиляции маунтов ✅
 
-- [ ] `Daemon.heartbeatFn` + `Daemon.heartbeatInterval` + `mountMonitorIntervalFromEnv`-образный
+- [x] `Daemon.heartbeatFn` + `Daemon.heartbeatInterval` + `mountMonitorIntervalFromEnv`-образный
       парсер `heartbeatIntervalFromEnv`
-- [ ] `startHeartbeatOnce` и его вызов из `sessionOnce` (после успешного Register, до
+- [x] `startHeartbeatOnce` и его вызов из `sessionOnce` (после успешного Register, до
       `processInitialDevices`) + страховочный вызов в `runServices`
-- [ ] `runHeartbeat` использует сид и клампит интервал
-- [ ] тесты `internal/agent/daemon_test.go`: (а) heartbeat случается, пока
+- [x] `runHeartbeat` использует сид и клампит интервал
+- [x] тесты `internal/agent/daemon_test.go`: (а) heartbeat случается, пока
       `processInitialDevices` ещё заблокирован в `Mount`; (б) heartbeat стартует ровно один раз
       на несколько сессий; (в) провалившийся Register не стартует heartbeat и не пишет PID;
       (г) парсер env (валид/мусор/ноль/отрицательное)
 
-### Task 5: тестовые ручки таймингов
+### Task 5: тестовые ручки таймингов ✅
 
-- [ ] хаб: `hub.Config.HeartbeatTimeout`, флаг `--heartbeat-timeout`, ключ конфига,
+- [x] хаб: `hub.Config.HeartbeatTimeout`, флаг `--heartbeat-timeout`, ключ конфига,
       `resolveHeartbeatTimeout`
-- [ ] тесты `cmd/hubfuse-hub/config_resolve_test.go`: флаг побеждает конфиг, конфиг
+- [x] тесты `cmd/hubfuse-hub/config_resolve_test.go`: флаг побеждает конфиг, конфиг
       побеждает дефолт, отрицательное значение — ошибка
-- [ ] `tests/scenarios/helpers`: `StartHubWithHeartbeatTimeout` (или опции у `StartHub`),
+- [x] `tests/scenarios/helpers`: `StartHubWithHeartbeatTimeout` (или опции у `StartHub`),
       `Agent.AddMount` (конфиг без ожидания маркера), `Agent.StartDaemonExpectFailure`
 
-### Task 6: сценарные регресс-тесты issue #69
+### Task 6: сценарные регресс-тесты issue #69 ✅
 
-- [ ] `tests/scenarios/liveness_test.go`: агент с недоступным исходящим маунтом остаётся
+- [x] `tests/scenarios/liveness_test.go`: агент с недоступным исходящим маунтом остаётся
       online ≥3 heartbeat-таймаутов, а его шара у пира не отваливается — проверяем не
       «в итоге восстановилось», а **отсутствие транзиента**: PID маркера у пира обязан
       остаться тем же (`DeviceOffline` → `UnmountDevice` убил бы стаб)
-- [ ] `tests/scenarios/prune_test.go` (или новый файл): pruned-идентичность стартует и падает
+- [x] `tests/scenarios/prune_test.go` (или новый файл): pruned-идентичность стартует и падает
       с внятной ошибкой; в логе нет `registered with hub`
 
-### Task 7: документация
+### Task 7: документация ✅
 
-- [ ] `CLAUDE.md`: обновить описания `internal/agent/daemon.go` (порядок liveness),
+- [x] `CLAUDE.md`: обновить описания `internal/agent/daemon.go` (порядок liveness),
       `internal/hub` (восстановление по heartbeat, новый флаг), тестовых ручек
-- [ ] перенести этот план в `docs/plans/completed/` **в этой же ветке до мержа**
+- [x] перенести этот план в `docs/plans/completed/` **в этой же ветке до мержа**
