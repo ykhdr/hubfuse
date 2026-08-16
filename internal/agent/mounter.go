@@ -402,10 +402,6 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 	// then re-acquires m.mu and verifies the mount generation is unchanged
 	// before acting on the result. (#67)
 	if existing, exists := m.activeMounts[key]; exists {
-		// teardown says whether the stale entry below must be unmounted before
-		// the normal mount flow runs. It stays false when the entry turned out
-		// to be gone already — there is then nothing to tear down.
-		teardown := true
 		if existing.IP == deviceIP && existing.SSHPort == sshPort {
 			// Same endpoint — probe liveness using the generation-bound
 			// single-flight mechanism. probeGenerationLocked temporarily
@@ -418,10 +414,15 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 				// owns the entry now and re-mounting would fight it.
 				return nil
 			case outcome == probeEntryVanished:
-				// The entry was removed under us (concurrent Unmount /
-				// DeviceOffline / config change). Nothing to tear down —
-				// fall through and establish the mount.
-				teardown = false
+				// The entry was removed under us. Do NOT re-create it here:
+				// the most likely remover is Unmount via a config removal or
+				// DeviceOffline, and Mount cannot tell "gone because it is no
+				// longer wanted" from "gone by accident". Re-mounting would
+				// resurrect a de-configured mount that no later reconcile tick
+				// or event would ever clean up, because reconcileMounts only
+				// walks entries the config still lists. If the mount IS still
+				// desired, the monitor re-establishes it within one tick.
+				return nil
 			case health == mountHealthHealthy || health == mountHealthUnknown:
 				// Alive (or not confirmed dead) — the live mount already
 				// points at the right place. Return BEFORE guardTarget so
@@ -459,16 +460,14 @@ func (m *Mounter) Mount(ctx context.Context, mc agentconfig.MountConfig, deviceI
 		// escalate (the force ladder reaches umount -l). reguard=false: the
 		// normal flow below re-guards the target via guardTarget. Bound the
 		// unmount with unmountOpTimeout — this remount path has no caller deadline.
-		if teardown {
-			rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
-			err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
-			cancel()
-			if err != nil {
-				// Could not tear down the stale mount — do NOT start a new one; the
-				// stale entry is retained (by unmountKey) for a later retry.
-				return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
-					mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
-			}
+		rctx, cancel := context.WithTimeout(ctx, unmountOpTimeout)
+		err := m.unmountKey(rctx, key, true, false) // force=true, reguard=false
+		cancel()
+		if err != nil {
+			// Could not tear down the stale mount — do NOT start a new one; the
+			// stale entry is retained (by unmountKey) for a later retry.
+			return fmt.Errorf("re-mount %q from device %q: unmount stale endpoint %s:%d: %w",
+				mc.Share, mc.Device, existing.IP, existing.SSHPort, err)
 		}
 		// Stale entry removed; continue into the normal mount flow below.
 	}

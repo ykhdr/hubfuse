@@ -756,8 +756,14 @@ func (d *Daemon) reconcileMounts(ctx context.Context) {
 			continue
 		}
 
-		if !d.reconcileDue(key) {
-			// Backing off after repeated failures — see noteReconcileFailure.
+		// The backoff gates ESTABLISHING a mount from scratch — that is the
+		// path that burns the whole verify window under the mounter lock. It
+		// must never gate an existing entry: probing one is cheap (bounded,
+		// single-flight) and is exactly the dead-mount healing this issue is
+		// about. Otherwise a stale penalty from an earlier failed establish
+		// would suppress healing for minutes — and because a skipped key never
+		// calls Mount, it would never observe the success that clears it.
+		if !d.mounter.IsActive(key.Device, key.Share) && !d.reconcileDue(key) {
 			continue
 		}
 

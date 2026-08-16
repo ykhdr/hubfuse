@@ -2009,6 +2009,54 @@ func TestReconcileBackoff(t *testing.T) {
 	assert.True(t, d.reconcileDue(key), "a recovered mount must be due immediately")
 }
 
+// TestReconcileMounts_BackoffDoesNotBlockHealing verifies that the retry
+// backoff gates only establishing a mount from scratch, never probing one that
+// already exists. A stale penalty left by earlier failed establishes must not
+// suppress dead-mount healing — that is the whole point of #67 — and since a
+// skipped key never calls Mount, it would never observe the success that
+// clears the penalty either. (#67)
+func TestReconcileMounts_BackoffDoesNotBlockHealing(t *testing.T) {
+	d, dir := buildTestDaemon(t)
+
+	mountTo := filepath.Join(dir, "mnt", "docs")
+	t.Cleanup(func() { _ = os.Chmod(mountTo, 0o755) })
+
+	mc := agentconfig.MountConfig{Device: "laptop", Share: "docs", To: mountTo}
+	d.config.Mounts = []agentconfig.MountConfig{mc}
+	writePubKey(t, dir, "device-123")
+
+	d.mu.Lock()
+	d.onlineDevices["device-123"] = &OnlineDevice{
+		DeviceID: "device-123", Nickname: "laptop", IP: "10.0.0.5", SSHPort: 2222, Shares: []string{"docs"},
+	}
+	d.mu.Unlock()
+
+	// Establish the mount, then saddle the key with a long backoff penalty as
+	// an earlier run of failed establishes would have.
+	d.reconcileMounts(context.Background())
+	require.True(t, d.mounter.IsActive("laptop", "docs"), "setup: the mount must exist")
+
+	d.noteReconcileFailure(mountKey{Device: "laptop", Share: "docs"}, "earlier failure")
+	require.False(t, d.reconcileDue(mountKey{Device: "laptop", Share: "docs"}), "setup: the key must be backing off")
+
+	// The mount now dies. The next sweep must still probe and heal it.
+	var probes atomic.Int32
+	d.mounter.SetMountpointCheckForTests(func(string) (bool, error) {
+		probes.Add(1)
+		return false, nil // confirmed dead
+	})
+	var execCalls atomic.Int32
+	d.mounter.SetExecCommandForTests(func(_ context.Context, _ string, _ ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return exec.Command("true")
+	})
+
+	d.reconcileMounts(context.Background())
+
+	assert.Positive(t, probes.Load(), "an existing mount must be probed despite the backoff")
+	assert.Positive(t, execCalls.Load(), "a confirmed-dead mount must be re-mounted despite the backoff")
+}
+
 // TestReconcileMounts_RevalidatesBeforeEachMount verifies that the sweep does
 // not act on a sweep-start snapshot. A single Mount can hold the mounter lock
 // for the whole verify window, so a config reload lands mid-sweep routinely.

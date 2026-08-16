@@ -2237,6 +2237,67 @@ func TestProbeGenerationLocked_WedgedProbeSpawnsOneGoroutine(t *testing.T) {
 	require.Len(t, m.ActiveMounts(), 1, "the mount must be retained across every tick")
 }
 
+// TestMount_EntryVanishedMidProbeDoesNotResurrect verifies that when the active
+// entry is removed while its health probe is in flight, Mount does NOT
+// re-create it. The remover is normally Unmount via a config removal or
+// DeviceOffline, and Mount cannot tell "gone because it is no longer wanted"
+// from "gone by accident" — re-mounting here would strand a de-configured
+// mount that no reconcile tick would ever clean up, since reconcileMounts only
+// walks entries the config still lists. A still-desired mount is re-established
+// by the next monitor tick instead. (#67)
+func TestMount_EntryVanishedMidProbeDoesNotResurrect(t *testing.T) {
+	dir := t.TempDir()
+	knownDir := filepath.Join(dir, common.KnownDevicesDir)
+	keyPath := filepath.Join(dir, "id_ed25519")
+	mountTo := filepath.Join(dir, "mnt", "docs")
+
+	writePubKeyFile(t, knownDir, "device-a")
+
+	m := newTestMounter(t, knownDir, keyPath, nil, func(_ context.Context, _ string, _ bool) error {
+		return nil
+	})
+
+	mc := agentconfig.MountConfig{Device: "device-a", Share: "docs", To: mountTo}
+	require.NoError(t, m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222), "first Mount()")
+
+	// Count backend invocations from here on: a resurrection would exec again.
+	var execCalls atomic.Int32
+	baseExec := m.execCommand
+	m.execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		execCalls.Add(1)
+		return baseExec(ctx, name, args...)
+	}
+
+	// Block the probe so we can remove the entry underneath it.
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var startOnce sync.Once
+	m.SetMountpointCheckForTests(func(string) (bool, error) {
+		startOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		return true, nil
+	})
+
+	mountDone := make(chan error, 1)
+	go func() { mountDone <- m.Mount(context.Background(), mc, "device-a", "10.0.0.1", 2222) }()
+
+	<-probeStarted
+	// The mount is de-configured while the probe is in flight. Unmount can take
+	// m.mu because probeGenerationLocked released it for the wait.
+	require.NoError(t, m.Unmount("device-a", "docs"), "concurrent Unmount")
+	close(releaseProbe)
+
+	select {
+	case err := <-mountDone:
+		require.NoError(t, err, "Mount must return cleanly when its entry vanished")
+	case <-time.After(10 * time.Second):
+		t.Fatal("Mount did not return after the probe was released")
+	}
+
+	assert.Zero(t, execCalls.Load(), "a vanished entry must not be re-mounted")
+	assert.Empty(t, m.ActiveMounts(), "the removed mount must stay removed")
+}
+
 // ─── Test 3: probeGenerationLocked stale-generation safety ────────────────────
 
 // TestProbeGenerationLocked_StaleGenerationDiscarded verifies that when a
