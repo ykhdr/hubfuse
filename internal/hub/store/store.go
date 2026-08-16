@@ -37,10 +37,23 @@ type Store interface {
 	ListAllDevices(ctx context.Context) ([]*Device, error)
 
 	// UpdateDeviceStatus sets the status, last_ip, and ssh_port for a device.
+	// Returns an error wrapping ErrNotFound when no such device row exists.
 	UpdateDeviceStatus(ctx context.Context, deviceID string, status DeviceStatus, ip string, sshPort int) error
 
 	// UpdateDeviceNickname changes the nickname of a device.
+	// Returns an error wrapping ErrNotFound when no such device row exists.
 	UpdateDeviceNickname(ctx context.Context, deviceID string, nickname string) error
+
+	// MarkOfflineIfStale marks the device offline only if it is currently
+	// online AND its last_heartbeat is older than threshold, in a single
+	// statement. It reports whether the row changed, so callers broadcast a
+	// DeviceOffline only for a demotion that really happened.
+	MarkOfflineIfStale(ctx context.Context, deviceID string, threshold time.Time) (bool, error)
+
+	// MarkOnlineIfOffline returns a currently-offline device to online in a
+	// single statement, replacing last_ip when ip is non-empty. It reports
+	// whether the row changed, so exactly one writer broadcasts DeviceOnline.
+	MarkOnlineIfOffline(ctx context.Context, deviceID, ip string) (bool, error)
 
 	// UpdateHeartbeat records the current time as the last_heartbeat for a
 	// device. Returns an error wrapping ErrNotFound when no such device row

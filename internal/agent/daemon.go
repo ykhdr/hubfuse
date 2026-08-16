@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -951,8 +952,18 @@ func (d *Daemon) Shutdown() error {
 	}
 
 	if d.hubClient != nil {
+		// A hub that REFUSES the deregistration (Success=false) has nothing left
+		// to deregister — the classic case is an identity the hub already pruned,
+		// which is exactly the #69 scenario. Nothing the daemon can do about it at
+		// exit time, and turning a clean shutdown into a failure would make
+		// `hubfuse stop` exit non-zero for a healthy stop. Transport errors still
+		// aggregate: those say the hub never heard us. (#69)
 		if err := d.hubClient.Deregister(context.Background()); err != nil {
-			errs = append(errs, fmt.Sprintf("deregister: %v", err))
+			if errors.Is(err, ErrHubRejected) {
+				d.logger.Warn("hub refused deregistration; shutting down anyway", "error", err)
+			} else {
+				errs = append(errs, fmt.Sprintf("deregister: %v", err))
+			}
 		}
 	}
 

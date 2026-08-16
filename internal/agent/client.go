@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -13,6 +14,14 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
+
+// ErrHubRejected marks an application-level refusal: the RPC itself completed
+// (nil gRPC error) but the hub answered Success=false. Callers that must tell
+// "the hub is unreachable, keep retrying" apart from "the hub answered and said
+// no" match on this — Daemon.Shutdown uses it so a deregistration the hub
+// refuses (typically because it already pruned the device) does not turn a
+// clean shutdown into a failure. (#69)
+var ErrHubRejected = errors.New("hub rejected the request")
 
 // HubClient wraps a gRPC connection to the hub.
 type HubClient struct {
@@ -88,6 +97,13 @@ func (c *HubClient) Join(ctx context.Context, deviceID, nickname, joinToken stri
 }
 
 // Register announces this device to the hub with its current shares and SSH port.
+//
+// A hub that refuses the registration answers with a nil gRPC error and
+// Success=false (see hub.Server.Register) — the transport call worked, the
+// application-level request did not. Returning that as success made a daemon
+// whose identity the hub had pruned log "registered with hub" and write its PID
+// file while the hub knew nothing about it, so the failure is translated into a
+// real Go error here. resp.Error carries the hub's own, actionable text. (#69)
 func (c *HubClient) Register(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
 	resp, err := c.client.Register(ctx, &pb.RegisterRequest{
 		Shares:          shares,
@@ -97,10 +113,15 @@ func (c *HubClient) Register(ctx context.Context, shares []*pb.Share, sshPort in
 	if err != nil {
 		return nil, fmt.Errorf("Register RPC: %w", err)
 	}
+	if !resp.GetSuccess() {
+		return nil, fmt.Errorf("%w: registration refused: %s", ErrHubRejected, rejectionReason(resp.GetError()))
+	}
 	return resp, nil
 }
 
-// Rename requests a nickname change for this device.
+// Rename requests a nickname change for this device. An application-level
+// refusal (nickname taken) comes back as Success=false and is returned as an
+// error, so callers only have to handle err. (#69)
 func (c *HubClient) Rename(ctx context.Context, newNickname string) (*pb.RenameResponse, error) {
 	resp, err := c.client.Rename(ctx, &pb.RenameRequest{
 		NewNickname: newNickname,
@@ -108,36 +129,66 @@ func (c *HubClient) Rename(ctx context.Context, newNickname string) (*pb.RenameR
 	if err != nil {
 		return nil, fmt.Errorf("Rename RPC: %w", err)
 	}
+	if !resp.GetSuccess() {
+		return nil, fmt.Errorf("%w: rename refused: %s", ErrHubRejected, rejectionReason(resp.GetError()))
+	}
 	return resp, nil
 }
 
-// Heartbeat sends a liveness ping to the hub.
+// Heartbeat sends a liveness ping to the hub. A hub that does not know this
+// device (pruned identity, or a hub restarted on an empty database) answers
+// Success=false with a nil gRPC error; that must surface as an error, otherwise
+// the daemon keeps "heartbeating" into the void while the hub counts it as
+// absent. HeartbeatResponse carries no error string, so the message is
+// generic — the actionable one comes from the Register path. (#69)
 func (c *HubClient) Heartbeat(ctx context.Context) error {
-	_, err := c.client.Heartbeat(ctx, &pb.HeartbeatRequest{})
+	resp, err := c.client.Heartbeat(ctx, &pb.HeartbeatRequest{})
 	if err != nil {
 		return fmt.Errorf("Heartbeat RPC: %w", err)
+	}
+	if !resp.GetSuccess() {
+		return fmt.Errorf("%w: heartbeat refused — the hub does not recognise this device (re-join may be required)", ErrHubRejected)
 	}
 	return nil
 }
 
-// UpdateShares pushes the current share list to the hub.
+// UpdateShares pushes the current share list to the hub. (#69: Success=false is
+// an error, not a silent no-op — a share list the hub never stored would leave
+// peers mounting shares that are not published.)
 func (c *HubClient) UpdateShares(ctx context.Context, shares []*pb.Share) error {
-	_, err := c.client.UpdateShares(ctx, &pb.UpdateSharesRequest{
+	resp, err := c.client.UpdateShares(ctx, &pb.UpdateSharesRequest{
 		Shares: shares,
 	})
 	if err != nil {
 		return fmt.Errorf("UpdateShares RPC: %w", err)
 	}
+	if !resp.GetSuccess() {
+		return fmt.Errorf("%w: share update refused", ErrHubRejected)
+	}
 	return nil
 }
 
-// Deregister removes this device from the hub.
+// Deregister removes this device from the hub. (#69: Success=false is an error
+// so shutdown reports a deregistration the hub did not perform.)
 func (c *HubClient) Deregister(ctx context.Context) error {
-	_, err := c.client.Deregister(ctx, &pb.DeregisterRequest{})
+	resp, err := c.client.Deregister(ctx, &pb.DeregisterRequest{})
 	if err != nil {
 		return fmt.Errorf("Deregister RPC: %w", err)
 	}
+	if !resp.GetSuccess() {
+		return fmt.Errorf("%w: deregistration refused", ErrHubRejected)
+	}
 	return nil
+}
+
+// rejectionReason renders the error string of an application-level refusal,
+// substituting a placeholder when the hub sent none — an empty reason would
+// otherwise produce a dangling "hub rejected registration: " line.
+func rejectionReason(reason string) string {
+	if reason == "" {
+		return "no reason given"
+	}
+	return reason
 }
 
 // Leave deregisters this device permanently. The hub deletes the device row

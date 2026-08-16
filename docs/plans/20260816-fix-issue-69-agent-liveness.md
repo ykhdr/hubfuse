@@ -119,36 +119,57 @@
 
 - Сентинел `ErrNotFound` в пакете store (слой БД не должен импортировать `internal/common` с
   gRPC-статусами). `GetDevice`/`GetDeviceByNickname` возвращают `%w`-обёрнутый `ErrNotFound`
-  при `sql.ErrNoRows`; `UpdateHeartbeat` смотрит `RowsAffected() == 0` → `ErrNotFound`.
-- Реестр транслирует `store.ErrNotFound` → `common.ErrDeviceNotFound` (gRPC NotFound), чтобы
-  прикладной слой отвечал одинаково независимо от реализации стора.
+  при `sql.ErrNoRows`; `UpdateHeartbeat`, `UpdateDeviceStatus`, `UpdateDeviceNickname`
+  смотрят `RowsAffected() == 0` → `ErrNotFound` (тот же класс «тихого успеха», что и в issue;
+  `SetShares` оставлен как есть — там 0 строк ничего не доказывает, а `Register` уже
+  защищён предшествующим `GetDevice`).
+- **Условные переходы статуса** (compare-and-set одной SQL-командой) — без них два
+  read-then-write окна остаются открытыми:
+  - `MarkOfflineIfStale(ctx, deviceID, threshold) (changed bool, err error)`:
+    `UPDATE ... SET status='offline' WHERE device_id=? AND status='online' AND last_heartbeat < ?`.
+    `checkStale` читает список устаревших, а пишет — позже; heartbeat, пришедший в это окно,
+    иначе будет затёрт «офлайном» и пиры получат ложный `DeviceOffline` (ровно исходный
+    симптом issue: маунт исчезает через 30 секунд).
+  - `MarkOnlineIfOffline(ctx, deviceID, ip) (changed bool, err error)`:
+    `UPDATE ... SET status='online', last_ip=? WHERE device_id=? AND status='offline'`.
+    Событие `DeviceOnline` рассылается **только** при `changed` — параллельный `Register`,
+    успевший поставить `online`, забирает право на рассылку себе (и рассылает
+    авторитетные шары/порт).
 
 ### Hub (`internal/hub`)
 
 - `Registry.Heartbeat(ctx, deviceID, ip)`:
-  1. `UpdateHeartbeat` (ошибка «нет такого устройства» → `common.ErrDeviceNotFound`);
-  2. `GetDevice`; если `Status != offline` — выход (никаких лишних событий);
-  3. `UpdateDeviceStatus(online, ip, device.SSHPort)`, где `ip` — свежий адрес вызывающего
-     (`peerIP`), с фолбэком на `device.LastIP`, если адрес не определился;
-  4. `GetShares` → `Broadcast(DeviceOnline, excludeDevice=deviceID)`;
-  5. INFO-лог `device recovered via heartbeat`.
-- `Server.Heartbeat` передаёт `peerIP(ctx)` и возвращает `Success=false` + текст ошибки
-  (поле `error` в `HeartbeatResponse` **не** добавляем — протокол не меняем; текст пойдёт в
-  лог агента через generic-сообщение).
-- `Server.Register` при `common.ErrDeviceNotFound` формирует actionable-текст:
-  `device not found on hub — re-join with 'hubfuse join <hub-address> --token <token>'`.
-  Остальные ошибки — как раньше (`err.Error()`).
-- Гонка с параллельным `Register` того же устройства безвредна: оба пути идемпотентно ставят
-  `online`; порядок событий у пира разрешает `Mount` (remount по смене эндпоинта, #61).
-  Гонка с `checkStale` тоже безвредна: `MarkOffline` только снимает статус, а следующий
-  heartbeat вернёт его.
+  1. `UpdateHeartbeat` (ошибка «нет такого устройства» → `common.ErrDeviceNotFound`) —
+     строго первым, чтобы условие `last_heartbeat < threshold` у `MarkOfflineIfStale` уже
+     не срабатывало;
+  2. `MarkOnlineIfOffline(deviceID, ip)`; `changed == false` → выход без событий;
+  3. `GetDevice` + `GetShares` → `Broadcast(DeviceOnline, excludeDevice=deviceID)`;
+  4. INFO-лог `device recovered via heartbeat`.
+  `ip` — свежий адрес вызывающего (`peerIP`); пустой адрес не затирает `last_ip`.
+- `Registry.MarkOffline(ctx, device, threshold) (bool, error)` — переводит через
+  `MarkOfflineIfStale` и шлёт `DeviceOffline` только при реальном переходе.
+- `Server.Heartbeat` передаёт `peerIP(ctx)` и возвращает `Success=false` при ошибке
+  (поле `error` в `HeartbeatResponse` **не** добавляем — протокол не меняем).
+- `Server.Register` при `common.ErrDeviceNotFound` формирует actionable-текст. Он
+  сознательно **не** содержит подстроку `device not found`: `cmd/internal/clierrors`
+  (`statusFromMessage`, `translateStatus`) схлопывает любое сообщение с этой подстрокой в
+  голое `device not found` и подсказка бы потерялась.
+- Остаточный (задокументированный) зазор: `handleDeviceOnline` у пира только монтирует и
+  никогда не размонтирует шары, которых больше нет в событии. Если восстановление по
+  heartbeat разошлёт снапшот шар, который параллельный `Register` тут же сузит, у пира
+  может остаться лишний маунт до следующего `SharesUpdated`. Это ровно тот
+  add-only-no-prune компромисс, что уже описан в `mountsForOnlineDevice` (#61), а не новый
+  дефект; сужать его — отдельная задача.
 
 ### Agent (`internal/agent`)
 
 - `HubClient`: `Register`, `Heartbeat`, `UpdateShares`, `Deregister`, `Rename` возвращают
-  ошибку при `Success=false`. Формат: `register rejected by hub: <error>` (у ответов без поля
-  `error` — `heartbeat rejected by hub`). CLI `rename` теряет свою ветку `!resp.Success` и
-  просто оборачивает ошибку в `clierrors`.
+  ошибку при `Success=false`, обёрнутую сентинелом `ErrHubRejected` («транспорт сработал,
+  запрос отклонён»). CLI `rename` теряет свою ветку `!resp.Success` и просто оборачивает
+  ошибку в `clierrors`.
+- `Daemon.Shutdown` различает отказ и обрыв: отклонённый хабом `Deregister` (устройство уже
+  удалено — типично при prune) уходит в WARN и не превращает штатное завершение в ошибку;
+  транспортные ошибки по-прежнему агрегируются.
 - `Daemon.heartbeatFn` — сид над `HubClient.Heartbeat` (как `registerFn`), чтобы юнит-тесты
   наблюдали heartbeat без живого gRPC. `runHeartbeat` использует сид; при nil — Error-лог и
   выход (защита для `buildTestDaemon`).
@@ -179,31 +200,43 @@
 
 ## Tasks
 
-### Task 1: store — сентинел ErrNotFound и честный UpdateHeartbeat
+### Task 1: store — сентинел ErrNotFound и честный UpdateHeartbeat ✅
 
-- [ ] `internal/hub/store/store.go`: экспортировать `ErrNotFound`, обновить doc-комментарии
+- [x] `internal/hub/store/store.go`: экспортировать `ErrNotFound`, обновить doc-комментарии
       `GetDevice`/`GetDeviceByNickname`/`UpdateHeartbeat`
-- [ ] `internal/hub/store/sqlite.go`: маппинг `sql.ErrNoRows` → `ErrNotFound`;
+- [x] `internal/hub/store/sqlite.go`: маппинг `sql.ErrNoRows` → `ErrNotFound`;
       `UpdateHeartbeat` проверяет `RowsAffected`
-- [ ] тесты `internal/hub/store/sqlite_test.go`: `errors.Is(err, ErrNotFound)` для обоих
+- [x] тесты `internal/hub/store/sqlite_test.go`: `errors.Is(err, ErrNotFound)` для обоих
       геттеров и для heartbeat несуществующего устройства; успешный heartbeat по-прежнему nil
+
+### Task 1b: store — условные переходы статуса (➕ по итогам ревью Codex)
+
+- [ ] `MarkOfflineIfStale` и `MarkOnlineIfOffline` в интерфейсе и в sqlite-реализации
+- [ ] `UpdateDeviceStatus`/`UpdateDeviceNickname` — проверка `RowsAffected`
+- [ ] тесты: переход происходит ровно один раз; свежий heartbeat отменяет пометку офлайн;
+      уже-онлайн устройство не «восстанавливается» повторно
 
 ### Task 2: hub — восстановление устройства по heartbeat
 
-- [ ] `Registry.Heartbeat(ctx, deviceID, ip)`: трансляция `store.ErrNotFound`, флип
+- [ ] `Registry.Heartbeat(ctx, deviceID, ip)`: трансляция `store.ErrNotFound`, условный флип
       `offline → online`, broadcast `DeviceOnline`, INFO-лог
+- [ ] `Registry.MarkOffline(ctx, device, threshold)`: условный переход, событие только при
+      реальном изменении; `checkStale` передаёт свой threshold
 - [ ] `Server.Heartbeat`: передать `peerIP`, вернуть `Success=false` при ошибке
-- [ ] `Server.Register`: actionable-текст для `common.ErrDeviceNotFound`
-- [ ] тесты `internal/hub/registry_test.go`: (а) heartbeat онлайн-устройства не шлёт событий;
-      (б) heartbeat офлайн-устройства переводит в online, шлёт `DeviceOnline` с шарами и
-      свежим IP, не шлёт его самому устройству; (в) heartbeat неизвестного устройства —
-      `common.ErrDeviceNotFound`
+- [ ] `Server.Register`: actionable-текст для `common.ErrDeviceNotFound` без подстроки
+      `device not found`
+- [ ] тесты `internal/hub/registry_test.go` + `heartbeat_test.go`: (а) heartbeat
+      онлайн-устройства не шлёт событий; (б) heartbeat офлайн-устройства переводит в online,
+      шлёт `DeviceOnline` с шарами и свежим IP, не шлёт его самому устройству; (в) heartbeat
+      неизвестного устройства — `common.ErrDeviceNotFound`; (г) свежий heartbeat между
+      выборкой и записью отменяет пометку офлайн
 
-### Task 3: agent client — прикладные ошибки перестают быть «успехом»
+### Task 3: agent client — прикладные ошибки перестают быть «успехом» ✅
 
-- [ ] `internal/agent/client.go`: проверка `Success` в `Register`, `Heartbeat`,
-      `UpdateShares`, `Deregister`, `Rename`
-- [ ] `cmd/hubfuse/main.go`: убрать мёртвую ветку `!resp.Success` в `rename`
+- [x] `internal/agent/client.go`: проверка `Success` в `Register`, `Heartbeat`,
+      `UpdateShares`, `Deregister`, `Rename` + сентинел `ErrHubRejected`
+- [x] `cmd/hubfuse/main.go`: убрать мёртвую ветку `!resp.Success` в `rename`
+- [ ] `Daemon.Shutdown`: отклонённый `Deregister` — WARN, не ошибка завершения
 - [ ] тесты `tests/integration`: Register удалённого устройства → ошибка с подсказкой re-join;
       Heartbeat неизвестного устройства → ошибка; успешные пути не сломаны
 
@@ -231,7 +264,9 @@
 ### Task 6: сценарные регресс-тесты issue #69
 
 - [ ] `tests/scenarios/liveness_test.go`: агент с недоступным исходящим маунтом остаётся
-      online ≥3 heartbeat-таймаутов, а его шара у пира не отваливается
+      online ≥3 heartbeat-таймаутов, а его шара у пира не отваливается — проверяем не
+      «в итоге восстановилось», а **отсутствие транзиента**: PID маркера у пира обязан
+      остаться тем же (`DeviceOffline` → `UnmountDevice` убил бы стаб)
 - [ ] `tests/scenarios/prune_test.go` (или новый файл): pruned-идентичность стартует и падает
       с внятной ошибкой; в логе нет `registered with hub`
 
