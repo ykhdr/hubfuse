@@ -930,3 +930,81 @@ func TestDeleteExpiredJoinTokens(t *testing.T) {
 	_, err = s.GetJoinToken(ctx, "HUB-EXP-001")
 	assert.Error(t, err, "expected error for expired join token after cleanup")
 }
+
+// TestMarkAllOffline_DemotesOnlyOnlineRows — the sweep must be one statement,
+// but it must still mean the same thing: devices that are registered-but-never-
+// online, or already offline, are not transitions and their rows must not be
+// touched. The count is what the hub logs, and what tells it at startup whether
+// anything needed reconciling at all.
+func TestMarkAllOffline_DemotesOnlyOnlineRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	online1 := makeDevice("dev-1", "alice")
+	online1.Status = StatusOnline
+	require.NoError(t, s.CreateDevice(ctx, online1), "CreateDevice online1")
+
+	online2 := makeDevice("dev-2", "bob")
+	online2.Status = StatusOnline
+	require.NoError(t, s.CreateDevice(ctx, online2), "CreateDevice online2")
+
+	offline := makeDevice("dev-3", "carol")
+	offline.Status = StatusOffline
+	require.NoError(t, s.CreateDevice(ctx, offline), "CreateDevice offline")
+
+	registered := makeDevice("dev-4", "dave")
+	registered.Status = StatusRegistered
+	require.NoError(t, s.CreateDevice(ctx, registered), "CreateDevice registered")
+
+	n, err := s.MarkAllOffline(ctx)
+	require.NoError(t, err, "MarkAllOffline")
+	assert.Equal(t, int64(2), n, "only the two online rows are transitions")
+
+	for _, id := range []string{"dev-1", "dev-2", "dev-3"} {
+		d, err := s.GetDevice(ctx, id)
+		require.NoErrorf(t, err, "GetDevice(%q)", id)
+		assert.Equalf(t, StatusOffline, d.Status, "%s must be offline", id)
+	}
+
+	d, err := s.GetDevice(ctx, "dev-4")
+	require.NoError(t, err, "GetDevice(dev-4)")
+	assert.Equal(t, StatusRegistered, d.Status,
+		"a device that never came online has no online status to clear")
+}
+
+// TestMarkAllOffline_PreservesEndpoint — last_ip and ssh_port are the endpoint
+// the hub announces for a device, and a heartbeat can bring a device back online
+// from exactly these columns without a fresh Register (#69). Clearing them
+// during the sweep would leave the hub with nothing to announce.
+func TestMarkAllOffline_PreservesEndpoint(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	d := makeDevice("dev-1", "alice")
+	d.Status = StatusOnline
+	d.LastIP = "10.0.0.7"
+	d.SSHPort = 2222
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice")
+
+	_, err := s.MarkAllOffline(ctx)
+	require.NoError(t, err, "MarkAllOffline")
+
+	got, err := s.GetDevice(ctx, "dev-1")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, StatusOffline, got.Status)
+	assert.Equal(t, "10.0.0.7", got.LastIP, "last_ip must survive the sweep")
+	assert.Equal(t, 2222, got.SSHPort, "ssh_port must survive the sweep")
+	assert.Equal(t, d.LastHeartbeat, got.LastHeartbeat, "last_heartbeat must survive the sweep")
+}
+
+// TestMarkAllOffline_NoOnlineDevices — the ordinary shutdown of an idle hub.
+func TestMarkAllOffline_NoOnlineDevices(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.CreateDevice(ctx, makeDevice("dev-1", "alice")), "CreateDevice")
+
+	n, err := s.MarkAllOffline(ctx)
+	require.NoError(t, err, "MarkAllOffline")
+	assert.Zero(t, n, "nothing to demote")
+}

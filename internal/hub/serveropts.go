@@ -26,18 +26,25 @@ const (
 )
 
 // ServerOptions returns the gRPC server options every HubFuse hub is built
-// with: the transport credentials, the identity interceptors, and the
+// with: the transport credentials, the drain and identity interceptors, and the
 // keepalive settings above.
 //
 // It exists because the hub is constructed in two places — the real one in
 // Hub.Start and the in-process one in hubtest — and options that drift apart
 // mean the tests exercise a different transport from production. Adding an
 // option here reaches both. (#72)
-func ServerOptions(creds credentials.TransportCredentials) []grpc.ServerOption {
+//
+// The interceptors are registered with the Chain* variants, and that is not a
+// stylistic choice: grpc.UnaryInterceptor and grpc.StreamInterceptor panic when
+// set a second time ("the unary server interceptor was already set and may not
+// be reset"), so a second option cannot be appended to this slice. Chain order
+// is execution order, and the drain guard deliberately runs first — a hub on its
+// way out has no interest in who is knocking. (#75)
+func ServerOptions(creds credentials.TransportCredentials, registry *Registry) []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.Creds(creds),
-		grpc.UnaryInterceptor(AuthUnaryInterceptor),
-		grpc.StreamInterceptor(AuthStreamInterceptor),
+		grpc.ChainUnaryInterceptor(DrainUnaryInterceptor(registry), AuthUnaryInterceptor),
+		grpc.ChainStreamInterceptor(DrainStreamInterceptor(registry), AuthStreamInterceptor),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    serverKeepaliveTime,
 			Timeout: serverKeepaliveTimeout,

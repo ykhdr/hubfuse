@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ykhdr/hubfuse/internal/agent"
 	"github.com/ykhdr/hubfuse/internal/hub/hubtest"
@@ -96,10 +98,8 @@ func TestIntegration_WedgeIsConnectionScoped(t *testing.T) {
 	// The mirror image of TestIntegration_ClientDetectsSilentlyDeadConnection:
 	// there, the CALLER's deadline survives and keepalive kills the transport.
 	// Here nothing on the wire is broken, so keepalive never fires — only the
-	// caller's own budget can end the call, and this is the assertion that it
-	// really was the caller, not the hub.
-	assert.ErrorIs(t, callCtx.Err(), context.DeadlineExceeded,
-		"the call must end because OUR deadline expired, not because the hub answered")
+	// caller's own budget can end the call.
+	assertEndedOnOurDeadline(t, err, elapsed, callDeadline)
 	assert.Less(t, elapsed, callDeadline+3*time.Second, "the call must not outlive its own deadline by much")
 
 	// The load-bearing observation: the event stream must NOT have died. A
@@ -137,8 +137,30 @@ func TestIntegration_WedgeIsConnectionScoped(t *testing.T) {
 	// silences a connection, not a device.
 	oldCtx, cancelOld := context.WithTimeout(ctx, callDeadline)
 	defer cancelOld()
+	oldStart := time.Now()
 	err = client.Heartbeat(oldCtx)
+	oldElapsed := time.Since(oldStart)
 	require.Error(t, err, "the old connection must still fail")
-	assert.ErrorIs(t, oldCtx.Err(), context.DeadlineExceeded,
-		"the old connection must still be failing on OUR deadline, unchanged by the fresh one existing")
+	assertEndedOnOurDeadline(t, err, oldElapsed, callDeadline)
+}
+
+// assertEndedOnOurDeadline pins the distinction the whole #77 classifier rests
+// on: the call died because OUR budget ran out, not because the hub answered.
+//
+// It reads the returned error and the time spent, NOT ctx.Err(). Reading the
+// context is a race: gRPC runs its own deadline timer, so it can return
+// DeadlineExceeded a moment before the caller's goroutine observes ctx.Err()
+// as set — which showed up as an intermittent "expected deadline, got nil" at
+// exactly 6.004s of a 6s budget.
+//
+// The pair of assertions is what keeps it strong. A hub that answered
+// DeadlineExceeded itself — a real possibility, and the case the classifier
+// must NOT treat as a wedge — would come back long before the budget was gone,
+// so spending the whole budget is the half that says the deadline was ours.
+func assertEndedOnOurDeadline(t *testing.T, err error, elapsed, budget time.Duration) {
+	t.Helper()
+	assert.Equal(t, codes.DeadlineExceeded, status.Code(err),
+		"the call must end on a deadline; got %v", err)
+	assert.GreaterOrEqual(t, elapsed, budget,
+		"the call must have spent its whole budget — a hub that answered would have returned sooner")
 }

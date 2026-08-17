@@ -95,11 +95,14 @@ func Start(t *testing.T, h *hubtest.Harness) *Wedge {
 		release: make(chan struct{}),
 	}
 
-	// The production options already install the identity interceptors, and
-	// grpc.UnaryInterceptor panics if set twice — so the wedge chains onto
-	// them rather than replacing them. It runs after authentication, which is
-	// what a real hub stall would look like too.
-	opts := append(hub.ServerOptions(credentials.NewTLS(tlsCfg)),
+	// The production options already install the drain and identity
+	// interceptors, so the wedge chains onto them rather than replacing them.
+	// It runs after both, which is what a real hub stall would look like too:
+	// a hub that is neither draining nor rejecting the caller, just not
+	// answering. ServerOptions takes the registry because the drain guard reads
+	// it (#75); passing the harness's own means a wedged hub still refuses new
+	// RPCs once it starts shutting down, exactly like production.
+	opts := append(hub.ServerOptions(credentials.NewTLS(tlsCfg), h.Registry),
 		grpc.ChainUnaryInterceptor(w.unaryInterceptor),
 		grpc.ChainStreamInterceptor(w.streamInterceptor),
 	)

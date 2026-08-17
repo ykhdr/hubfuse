@@ -72,8 +72,15 @@ func SignalStop(pidPath, name string) error {
 
 // waitForExit polls the given pid with syscall.Kill(pid, 0) until the process
 // is gone (ESRCH) or the deadline expires. Returns true if the process exited.
-// Using the raw syscall avoids the os.Process zombie caveat where Signal(0)
-// returns nil until the caller has called Wait.
+// Kill(pid, 0) does NOT dodge the zombie caveat — it returns nil for a zombie
+// just as os.Process.Signal(0) would. This helper is correct only because
+// `hubfuse-hub stop` is never the hub's parent: the zombie belongs to whoever
+// IS the parent (init, once the daemonizing parent has gone), and it is that
+// process's Wait that clears the pid — at which point this poll finally sees
+// ESRCH. Reused from the parent of the signalled process, this would poll a
+// zombie pid until the deadline and then wrongly report "refused to exit after
+// SIGKILL" — a parent must call Wait, not poll Kill(pid, 0). The scenario-test
+// harness IS a parent, which is why it uses cmd.Wait() instead (issue #75).
 func waitForExit(pid int, deadline time.Duration) bool {
 	end := time.Now().Add(deadline)
 	for time.Now().Before(end) {

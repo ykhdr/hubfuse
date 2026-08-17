@@ -21,9 +21,9 @@ func TestRegistry_Leave_RemovesDeviceAndBroadcasts(t *testing.T) {
 	joinDevice(t, r, "bob-id", "bob", "10.0.0.2")
 
 	// Subscribe both devices before calling Leave.
-	aliceCh, aliceUnsub := r.Subscribe("alice-id")
+	aliceCh, aliceUnsub := mustSubscribe(t, r, "alice-id")
 	defer aliceUnsub()
-	bobCh, bobUnsub := r.Subscribe("bob-id")
+	bobCh, bobUnsub := mustSubscribe(t, r, "bob-id")
 	defer bobUnsub()
 
 	// Alice leaves.

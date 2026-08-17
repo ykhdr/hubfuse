@@ -76,7 +76,7 @@ func TestHeartbeatMonitor_BroadcastsOfflineEvent(t *testing.T) {
 	err := r.store.UpdateDeviceStatus(ctx, "dev-stale", store.StatusOnline, "10.0.0.1", 22)
 	require.NoError(t, err, "UpdateDeviceStatus")
 
-	ch, unsub := r.Subscribe("dev-watcher")
+	ch, unsub := mustSubscribe(t, r, "dev-watcher")
 	defer unsub()
 
 	timeout := 50 * time.Millisecond
@@ -141,7 +141,7 @@ func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
 	}
 
 	// Simulate an active subscriber for dev-active to ensure it is skipped.
-	activeCh, activeUnsub := r.Subscribe("dev-active")
+	activeCh, activeUnsub := mustSubscribe(t, r, "dev-active")
 	defer activeUnsub()
 	// Drain to avoid blocking (channel may never get events).
 	go func() {
@@ -149,7 +149,7 @@ func TestHeartbeatMonitor_PrunesInactiveDevices(t *testing.T) {
 		}
 	}()
 
-	watchCh, watchUnsub := r.Subscribe("watcher")
+	watchCh, watchUnsub := mustSubscribe(t, r, "watcher")
 	defer watchUnsub()
 
 	stopHeartbeats := make(chan struct{})

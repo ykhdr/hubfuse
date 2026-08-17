@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -33,7 +34,20 @@ func TestServerOptions_EnforcementPolicyToleratesAgentPings(t *testing.T) {
 // the real hub and hubtest build their server from it, so an option added in
 // one place cannot go missing in the other.
 func TestServerOptions_AreComplete(t *testing.T) {
-	opts := ServerOptions(insecure.NewCredentials())
+	opts := ServerOptions(insecure.NewCredentials(), newTestRegistry(t))
 	assert.Len(t, opts, 5,
-		"expected creds, unary and stream interceptors, keepalive params and enforcement policy")
+		"expected creds, chained unary and stream interceptors, keepalive params and enforcement policy")
+}
+
+// TestServerOptions_BuildAServer is the only honest check that the interceptors
+// are registered legally. grpc.UnaryInterceptor/StreamInterceptor panic when set
+// twice, so the drain guard had to be chained onto the auth one rather than
+// appended as another option — and a mistake there is a panic inside
+// grpc.NewServer, in production and in every hubtest alike, not a failed
+// assertion. Building a real server is what surfaces it. (#75)
+func TestServerOptions_BuildAServer(t *testing.T) {
+	require.NotPanics(t, func() {
+		srv := grpc.NewServer(ServerOptions(insecure.NewCredentials(), newTestRegistry(t))...)
+		srv.Stop()
+	}, "the hub's own server options must not be rejected by grpc.NewServer")
 }

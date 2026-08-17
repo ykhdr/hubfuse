@@ -4,6 +4,7 @@
 package hubtest
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -152,11 +153,20 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
+	// The harness starts a hub, so it reconciles device statuses like a hub —
+	// otherwise a test restarting against the same DataDir would see online rows
+	// that production would have cleared, and the two lifecycles would diverge
+	// exactly where the tests are meant to prove they do not. (#75)
+	if err := hub.ReconcileDeviceStatuses(context.Background(), s, logger); err != nil {
+		_ = s.Close()
+		t.Fatalf("hubtest: reconcile device statuses: %v", err)
+	}
+
 	registry := hub.NewRegistry(s, caCert, caKey, logger, 0)
 
 	// Built from the same options as the real hub (hub.ServerOptions) so tests
 	// exercise the production transport — keepalive settings included. (#72)
-	grpcServer := grpc.NewServer(hub.ServerOptions(credentials.NewTLS(tlsCfg))...)
+	grpcServer := grpc.NewServer(hub.ServerOptions(credentials.NewTLS(tlsCfg), registry)...)
 	srv := hub.NewServer(registry, logger)
 	pb.RegisterHubFuseServer(grpcServer, srv)
 
@@ -174,7 +184,29 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 			return
 		}
 		stopped = true
-		grpcServer.GracefulStop()
+
+		// Same sequence Hub.Stop uses (Drain, CloseAllSubscribers, StopServer,
+		// then close the store only if the server actually stopped cleanly) —
+		// bypassing it here would mean a fix living only in hub.go never gets
+		// exercised by the tests built on this harness. (#75)
+		registry.Drain()
+		registry.CloseAllSubscribers()
+
+		// Derived from the one exported shutdown constant rather than a second
+		// hardcoded literal, so the harness cannot drift from production's own
+		// bound while still keeping the split between grace and hard limit.
+		grace := hub.DefaultShutdownBudget / 2
+		_ = hub.StopServer(grpcServer, grace, hub.DefaultShutdownBudget-grace, logger)
+
+		// The harness closes the store unconditionally, where production skips
+		// it on a forced stop. The reasoning differs because the lifetimes do:
+		// production is about to exit anyway, so leaving the database open
+		// costs nothing and avoids handing a live handler
+		// "sql: database is closed". This process outlives every test in the
+		// binary, so a store left open on a forced stop leaks a connection for
+		// the rest of the run — and a harness restarted over the same DataDir
+		// (tests/integration/reconnect_test.go) would then open the database
+		// with the previous handle still holding it. (#75)
 		_ = s.Close()
 	}
 	t.Cleanup(stop)

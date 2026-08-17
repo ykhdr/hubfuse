@@ -50,6 +50,14 @@ type Store interface {
 	// DeviceOffline only for a demotion that really happened.
 	MarkOfflineIfStale(ctx context.Context, deviceID string, threshold time.Time) (bool, error)
 
+	// MarkAllOffline marks every online device offline in ONE statement and
+	// returns how many rows changed. It backs both ends of the hub's
+	// lifecycle: the shutdown sweep, which must not spend its budget on N
+	// round-trips against a store limited to a single connection, and the
+	// reconciliation at startup, which is what makes a truncated sweep (or no
+	// sweep at all, after SIGKILL) safe to recover from.
+	MarkAllOffline(ctx context.Context) (int64, error)
+
 	// MarkOnlineIfOffline returns a currently-offline device to online in a
 	// single statement, replacing last_ip when ip is non-empty. It reports
 	// whether the row changed, so exactly one writer broadcasts DeviceOnline.

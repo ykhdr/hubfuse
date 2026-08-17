@@ -93,7 +93,7 @@ func (m *HeartbeatMonitor) Start(ctx context.Context) {
 			tickCount++
 			if tickCount%invitePruneEvery == 0 {
 				if err := m.store.DeleteExpiredInvites(ctx); err != nil {
-					m.logger.Warn("heartbeat monitor: prune expired invites", slog.Any("error", err))
+					logCancelable(m.logger, slog.LevelWarn, "heartbeat monitor: prune expired invites", err)
 				}
 			}
 		case <-pruneCh:
@@ -107,7 +107,7 @@ func (m *HeartbeatMonitor) checkStale(ctx context.Context) {
 	threshold := time.Now().Add(-m.timeout)
 	stale, err := m.store.GetStaleDevices(ctx, threshold)
 	if err != nil {
-		m.logger.Error("heartbeat monitor: get stale devices", slog.Any("error", err))
+		logCancelable(m.logger, slog.LevelError, "heartbeat monitor: get stale devices", err)
 		return
 	}
 
@@ -120,9 +120,8 @@ func (m *HeartbeatMonitor) checkStale(ctx context.Context) {
 		demoted, err := m.registry.MarkOffline(ctx, d, threshold)
 		switch {
 		case err != nil:
-			m.logger.Error("heartbeat monitor: mark offline",
-				slog.String("device_id", d.DeviceID),
-				slog.Any("error", err))
+			logCancelable(m.logger, slog.LevelError, "heartbeat monitor: mark offline", err,
+				slog.String("device_id", d.DeviceID))
 		case demoted:
 			m.logger.Info("heartbeat monitor: marked device offline",
 				slog.String("device_id", d.DeviceID))
@@ -142,7 +141,7 @@ func (m *HeartbeatMonitor) pruneInactive(ctx context.Context) {
 
 	pruned, err := m.store.DeletePrunedDevices(ctx, threshold, activeSubs)
 	if err != nil {
-		m.logger.Error("heartbeat monitor: prune inactive devices", slog.Any("error", err))
+		logCancelable(m.logger, slog.LevelError, "heartbeat monitor: prune inactive devices", err)
 		return
 	}
 

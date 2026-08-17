@@ -379,6 +379,16 @@ func (r *Registry) Drain() {
 	r.draining.Store(true)
 }
 
+// Draining reports whether Hub.Stop has begun. The gRPC interceptors read it to
+// refuse new RPCs on a hub that is going away, so a client cannot open work the
+// shutdown sequence has already accounted for — a Subscribe accepted after
+// CloseAllSubscribers would never be closed, and a Join would burn its
+// single-use token on a hub that will not be there to honour the certificate.
+// (#75)
+func (r *Registry) Draining() bool {
+	return r.draining.Load()
+}
+
 // writeErr classifies a failed device-addressed write. A device pruned between
 // two statements of the same RPC does not always surface as ErrNotFound: with
 // foreign keys enabled, inserting shares for a deleted device fails as a
@@ -493,10 +503,25 @@ func (r *Registry) Leave(ctx context.Context, deviceID string) error {
 // already has a registered channel (e.g. due to reconnect), the old channel
 // is closed and replaced. The returned function unsubscribes and closes the
 // channel.
-func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
+//
+// A draining hub refuses, returning common.ErrHubShuttingDown. The drain
+// interceptor already turns new Subscribe RPCs away, but that check is a cheap
+// early exit outside the lock: a subscription that slipped between it and the
+// insertion below would be registered AFTER CloseAllSubscribers had run, leaving
+// a channel nobody will ever close and a stream GracefulStop waits on forever.
+// The authoritative guard therefore lives in the same critical section as the
+// write it protects — the markOnlineUnlessDraining pattern from #69. (#75)
+//
+// The unsubscribe function is never nil, including on the refusal path: callers
+// defer it (see Server.Subscribe), and a nil there panics.
+func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func(), error) {
 	ch := make(chan *pb.Event, 64)
 
 	r.mu.Lock()
+	if r.draining.Load() {
+		r.mu.Unlock()
+		return nil, func() {}, common.ErrHubShuttingDown
+	}
 	if old, ok := r.subscribers[deviceID]; ok {
 		close(old)
 	}
@@ -512,7 +537,46 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 		r.mu.Unlock()
 	}
 
-	return ch, unsub
+	return ch, unsub, nil
+}
+
+// CloseAllSubscribers ends every event subscription and reports how many it
+// closed. It is the main fix for #75.
+//
+// Subscribe is a long-lived server stream whose handler sits in a select on its
+// channel, and GracefulStop waits for every in-flight RPC. Nothing about the
+// hub's own shutdown ends that stream: not the sweep, not GracefulStop's GOAWAY
+// (the first one deliberately leaves existing streams alone). Measured, a hub
+// with a single HEALTHY agent took 29.99s to exit — three failed heartbeats on
+// the agent's side — while a hub whose agent had deregistered took 11ms. The
+// difference is precisely this: closed channels. So the hub stops waiting for
+// its clients to notice and closes the subscriptions itself; each handler reads
+// !ok, returns, and the client drops the connection on the first GOAWAY.
+//
+// The WRITE lock is not negotiable. Broadcast and BroadcastAll send under the
+// READ lock, so closing a channel under the read lock would race a concurrent
+// send and panic with "send on closed channel" — and the send racing us is the
+// sweep's own final DeviceOffline. A fix for a hang that panics the process it
+// is shutting down is worse than the hang.
+//
+// delete + close belong to the same critical section for the same reason unsub
+// compares channel identity: leaving the map populated and clearing it later
+// would let unsub (or a Subscribe replacing a reconnecting device) close an
+// already-closed channel.
+//
+// Callers must broadcast BEFORE calling this — a receive from a closed buffered
+// channel drains the buffer first and only then reports !ok, so events queued by
+// the sweep still reach their subscribers. (#75)
+func (r *Registry) CloseAllSubscribers() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	closed := len(r.subscribers)
+	for deviceID, ch := range r.subscribers {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	return closed
 }
 
 // ActiveSubscribers returns the device IDs that currently have an active

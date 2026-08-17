@@ -41,6 +41,17 @@ func joinDevice(t *testing.T, r *Registry, deviceID, nickname, ip string) {
 	require.NoErrorf(t, err, "Join(%q, %q)", deviceID, nickname)
 }
 
+// mustSubscribe is a helper for the common case: a test that wants a live
+// subscription and treats a refusal as a test failure. Subscribe only refuses a
+// draining hub, which the tests that care about drive through the three-valued
+// call directly.
+func mustSubscribe(t *testing.T, r *Registry, deviceID string) (<-chan *pb.Event, func()) {
+	t.Helper()
+	ch, unsub, err := r.Subscribe(deviceID)
+	require.NoErrorf(t, err, "Subscribe(%q)", deviceID)
+	return ch, unsub
+}
+
 // registerDevice is a helper that calls Register (online) and fatals on error.
 func registerDevice(t *testing.T, r *Registry, deviceID, ip string, port int) []*store.Device {
 	t.Helper()
@@ -145,7 +156,7 @@ func TestRegister_BroadcastsDeviceOnline(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 
 	// Subscribe dev-2 before dev-1 registers.
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
@@ -209,7 +220,7 @@ func TestHeartbeat_OnlineDeviceBroadcastsNothing(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
@@ -242,13 +253,13 @@ func TestHeartbeat_RecoversOfflineDevice(t *testing.T) {
 	require.NoError(t, err, "MarkOffline")
 	require.True(t, demoted, "MarkOffline should demote a device past the threshold")
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 	// dev-1's own subscription stands in for its live daemon: an open stream is
 	// how the hub tells "demoted while connected" from "deregistered on
 	// purpose" (Registry.canRecover). It doubles as the assertion below that
 	// the recovered device is not sent its own event.
-	selfCh, selfUnsub := r.Subscribe("dev-1")
+	selfCh, selfUnsub := mustSubscribe(t, r, "dev-1")
 	defer selfUnsub()
 
 	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.7"), "Heartbeat")
@@ -300,10 +311,10 @@ func TestHeartbeat_DoesNotResurrectDeregisteredDevice(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
 
-	_, unsub := r.Subscribe("dev-1") // a connected daemon, as after a real Register
+	_, unsub := mustSubscribe(t, r, "dev-1") // a connected daemon, as after a real Register
 	defer unsub()
 
-	watchCh, watchUnsub := r.Subscribe("dev-2")
+	watchCh, watchUnsub := mustSubscribe(t, r, "dev-2")
 	defer watchUnsub()
 
 	require.NoError(t, r.Deregister(ctx, "dev-1"), "Deregister")
@@ -337,7 +348,7 @@ func TestHeartbeat_DrainingHubDoesNotRecover(t *testing.T) {
 
 	joinDevice(t, r, "dev-1", "alice", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
-	_, unsub := r.Subscribe("dev-1")
+	_, unsub := mustSubscribe(t, r, "dev-1")
 	defer unsub()
 
 	d1, err := r.store.GetDevice(ctx, "dev-1")
@@ -366,10 +377,10 @@ func TestHeartbeat_OfflineDeviceWithoutSSHPortIsNotRecovered(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	require.NoError(t, r.store.UpdateDeviceStatus(ctx, "dev-1", store.StatusOffline, "10.0.0.1", 0), "UpdateDeviceStatus")
 
-	_, selfUnsub := r.Subscribe("dev-1") // connected, so only the missing port can block recovery
+	_, selfUnsub := mustSubscribe(t, r, "dev-1") // connected, so only the missing port can block recovery
 	defer selfUnsub()
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
@@ -419,9 +430,9 @@ func TestHeartbeat_RecoveryAnnouncementIsNotOverridden(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 2222)
 
-	_, selfUnsub := r.Subscribe("dev-1")
+	_, selfUnsub := mustSubscribe(t, r, "dev-1")
 	defer selfUnsub()
-	watchCh, watchUnsub := r.Subscribe("dev-2")
+	watchCh, watchUnsub := mustSubscribe(t, r, "dev-2")
 	defer watchUnsub()
 
 	d1, err := r.store.GetDevice(ctx, "dev-1")
@@ -511,6 +522,164 @@ func TestRegister_RefusedWhenDrainStartsMidRegistration(t *testing.T) {
 	assert.NotEqual(t, store.StatusOnline, d.Status, "no online row may outlive the shutdown sweep")
 }
 
+// TestSubscribe_RefusedWhileDraining — the interceptor already turns new
+// Subscribe RPCs away, but that check happens outside the subscriber lock. A
+// subscription that slipped between it and the map insertion would be registered
+// after CloseAllSubscribers had already run: nobody would ever close that
+// channel, its handler would sit in its select, and GracefulStop would wait on
+// the stream for as long as the client stayed alive — the #75 hang, reopened by
+// its own fix. The authoritative guard is therefore the one inside the critical
+// section, and this is the test for it.
+func TestSubscribe_RefusedWhileDraining(t *testing.T) {
+	r := newTestRegistry(t)
+
+	r.Drain()
+
+	ch, unsub, err := r.Subscribe("dev-1")
+	require.Error(t, err, "a draining hub must refuse new subscriptions")
+	assert.ErrorIs(t, err, common.ErrHubShuttingDown)
+	assert.Nil(t, ch, "a refused subscription must not hand out a channel")
+	assert.Empty(t, r.ActiveSubscribers(), "a refused subscription must leave no entry behind")
+
+	// Server.Subscribe defers unsub before it can know the outcome, so the
+	// refusal path must still return something callable.
+	require.NotNil(t, unsub, "unsub must never be nil, even on the refusal path")
+	assert.NotPanics(t, unsub, "the no-op unsub must be safe to call")
+}
+
+// TestSubscribe_WorksBeforeDraining is the other half of the guard: it must be
+// invisible until Hub.Stop actually starts.
+func TestSubscribe_WorksBeforeDraining(t *testing.T) {
+	r := newTestRegistry(t)
+
+	ch, unsub, err := r.Subscribe("dev-1")
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+	assert.Equal(t, []string{"dev-1"}, r.ActiveSubscribers())
+
+	unsub()
+	assert.Empty(t, r.ActiveSubscribers(), "unsub must remove the subscription")
+}
+
+// TestCloseAllSubscribers_ClosesAndClearsEverySubscription is the core of the
+// #75 fix: a hub that closes its subscriptions has nothing left for
+// GracefulStop to wait on. Measured on real binaries, this is the difference
+// between a 29.99s shutdown (one healthy agent) and 11ms.
+func TestCloseAllSubscribers_ClosesAndClearsEverySubscription(t *testing.T) {
+	r := newTestRegistry(t)
+
+	chA, unsubA := mustSubscribe(t, r, "dev-a")
+	defer unsubA()
+	chB, unsubB := mustSubscribe(t, r, "dev-b")
+	defer unsubB()
+
+	assert.Equal(t, 2, r.CloseAllSubscribers(), "must report how many it closed")
+
+	for name, ch := range map[string]<-chan *pb.Event{"dev-a": chA, "dev-b": chB} {
+		select {
+		case _, ok := <-ch:
+			assert.False(t, ok, "%s: channel must be closed, not merely empty", name)
+		case <-time.After(time.Second):
+			t.Fatalf("%s: subscription was not closed", name)
+		}
+	}
+
+	assert.Empty(t, r.ActiveSubscribers(), "the subscriber map must be cleared, not just closed")
+}
+
+// TestCloseAllSubscribers_DeliversBufferedEventsFirst pins the ordering the
+// shutdown sequence depends on. Hub.Stop broadcasts DeviceOffline for every
+// device and only then closes the subscriptions; that is safe because a receive
+// from a closed buffered channel drains the buffer before reporting !ok. If it
+// were not, peers would lose the very DeviceOffline that tells them to unmount.
+func TestCloseAllSubscribers_DeliversBufferedEventsFirst(t *testing.T) {
+	r := newTestRegistry(t)
+
+	ch, unsub := mustSubscribe(t, r, "dev-a")
+	defer unsub()
+
+	r.BroadcastAll(&pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-b", Nickname: "bob"},
+	}})
+
+	r.CloseAllSubscribers()
+
+	event, ok := <-ch
+	require.True(t, ok, "the event queued before the close must still arrive")
+	require.NotNil(t, event.GetDeviceOffline())
+	assert.Equal(t, "dev-b", event.GetDeviceOffline().DeviceId)
+
+	_, ok = <-ch
+	assert.False(t, ok, "the stream must end once the buffer is drained")
+}
+
+// TestCloseAllSubscribers_UnsubAfterwardsDoesNotPanic — Server.Subscribe always
+// runs `defer unsub()`, so every handler woken by the close calls it on the way
+// out. Clearing the map inside the same critical section is what makes that
+// call a no-op instead of a close of a closed channel.
+func TestCloseAllSubscribers_UnsubAfterwardsDoesNotPanic(t *testing.T) {
+	r := newTestRegistry(t)
+
+	_, unsub := mustSubscribe(t, r, "dev-a")
+
+	r.CloseAllSubscribers()
+
+	assert.NotPanics(t, unsub, "unsub after CloseAllSubscribers must be a no-op")
+	assert.NotPanics(t, unsub, "and must stay one when the handler is late twice over")
+}
+
+// TestCloseAllSubscribers_BroadcastAfterwardsDoesNotPanic — Broadcast and
+// BroadcastAll send under the READ lock. A heartbeat or a Leave still in flight
+// can publish while the hub is shutting down, and it must find an empty map
+// rather than a closed channel. This is the same hazard from the other side that
+// forces CloseAllSubscribers to take the WRITE lock.
+func TestCloseAllSubscribers_BroadcastAfterwardsDoesNotPanic(t *testing.T) {
+	r := newTestRegistry(t)
+
+	_, unsub := mustSubscribe(t, r, "dev-a")
+	defer unsub()
+
+	r.CloseAllSubscribers()
+
+	event := &pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-a", Nickname: "alice"},
+	}}
+	assert.NotPanics(t, func() { r.BroadcastAll(event) }, "BroadcastAll after the close")
+	assert.NotPanics(t, func() { r.Broadcast(event, "dev-b") }, "Broadcast after the close")
+}
+
+// TestCloseAllSubscribers_ConcurrentWithBroadcast is the race the write lock
+// exists for, and it only fails under -race: closing under the read lock that
+// BroadcastAll holds gives "send on closed channel", turning the #75 fix into a
+// panic on the exact path it repairs.
+func TestCloseAllSubscribers_ConcurrentWithBroadcast(t *testing.T) {
+	r := newTestRegistry(t)
+
+	for _, id := range []string{"dev-a", "dev-b", "dev-c"} {
+		_, unsub := mustSubscribe(t, r, id)
+		defer unsub()
+	}
+
+	event := &pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-z", Nickname: "zoe"},
+	}}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			r.BroadcastAll(event)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		r.CloseAllSubscribers()
+	}()
+
+	assert.NotPanics(t, wg.Wait, "a broadcast racing the shutdown close must not panic")
+}
+
 // TestWriteErr_TranslatesAnyFailureForAVanishedDevice — a prune between two
 // statements of the same RPC does not always surface as ErrNotFound: with
 // foreign keys on, writing shares for a deleted device fails as a constraint
@@ -562,7 +731,7 @@ func TestMarkOffline_FreshHeartbeatKeepsDeviceOnline(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 	require.NoError(t, r.Heartbeat(ctx, "dev-1", "10.0.0.1"), "Heartbeat")
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	demoted, err := r.MarkOffline(ctx, d1, threshold)
@@ -585,7 +754,7 @@ func TestMarkOffline_FreshHeartbeatKeepsDeviceOnline(t *testing.T) {
 func TestSubscribe_ReceivesEvents(t *testing.T) {
 	r := newTestRegistry(t)
 
-	ch, unsub := r.Subscribe("dev-1")
+	ch, unsub := mustSubscribe(t, r, "dev-1")
 	defer unsub()
 
 	event := &pb.Event{
@@ -606,9 +775,9 @@ func TestSubscribe_ReceivesEvents(t *testing.T) {
 func TestBroadcast_ExcludesSender(t *testing.T) {
 	r := newTestRegistry(t)
 
-	ch1, unsub1 := r.Subscribe("dev-1")
+	ch1, unsub1 := mustSubscribe(t, r, "dev-1")
 	defer unsub1()
-	ch2, unsub2 := r.Subscribe("dev-2")
+	ch2, unsub2 := mustSubscribe(t, r, "dev-2")
 	defer unsub2()
 
 	event := &pb.Event{
@@ -639,7 +808,7 @@ func TestBroadcast_ExcludesSender(t *testing.T) {
 func TestSubscribe_UnsubscribeStopsEvents(t *testing.T) {
 	r := newTestRegistry(t)
 
-	ch, unsub := r.Subscribe("dev-1")
+	ch, unsub := mustSubscribe(t, r, "dev-1")
 	unsub()
 
 	event := &pb.Event{
@@ -671,7 +840,7 @@ func TestDeregister_MarksOfflineAndBroadcasts(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	err := r.Deregister(ctx, "dev-1")
@@ -701,7 +870,7 @@ func TestDeregister_RemovesSubscriber(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
-	ch, _ := r.Subscribe("dev-1")
+	ch, _ := mustSubscribe(t, r, "dev-1")
 
 	err := r.Deregister(ctx, "dev-1")
 	require.NoError(t, err, "Deregister")
@@ -730,7 +899,7 @@ func TestUpdateShares_StoresAndBroadcasts(t *testing.T) {
 	joinDevice(t, r, "dev-1", "alice", "")
 	joinDevice(t, r, "dev-2", "bob", "")
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	shares := []*pb.Share{
@@ -795,7 +964,7 @@ func TestMarkOffline_MarksAndBroadcasts(t *testing.T) {
 	joinDevice(t, r, "dev-2", "bob", "")
 	registerDevice(t, r, "dev-1", "10.0.0.1", 22)
 
-	ch, unsub := r.Subscribe("dev-2")
+	ch, unsub := mustSubscribe(t, r, "dev-2")
 	defer unsub()
 
 	d1, err := r.store.GetDevice(ctx, "dev-1")
