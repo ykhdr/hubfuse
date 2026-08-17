@@ -346,6 +346,50 @@ func TestStopResultFor_SettledAndCloseStoreAreSeparateQuestions(t *testing.T) {
 	}
 }
 
+// TestWaitForBackground_PrefersDoneOverAnExpiredBudget pins the case that made
+// the result non-deterministic: the goroutines have finished AND the shutdown
+// budget has run out. Both channels are ready, and a single select over the two
+// would pick uniformly between them, so the store would be closed on some runs
+// and left open on others with nothing about the run differing. The wait must
+// report finished whenever the goroutines actually finished, however late.
+//
+// Looped because a one-shot assertion passes half the time against the very bug
+// it is meant to catch.
+func TestWaitForBackground_PrefersDoneOverAnExpiredBudget(t *testing.T) {
+	done := make(chan struct{})
+	close(done) // the goroutines finished
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel() // ...and the budget ran out. Both cases are ready.
+
+	for i := range 200 {
+		require.True(t, waitForBackground(expired, done),
+			"iteration %d: the goroutines had finished, so the wait must say so even though the budget was spent", i)
+	}
+}
+
+func TestWaitForBackground_ReportsUnfinishedWhenTheBudgetRunsOut(t *testing.T) {
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.False(t, waitForBackground(expired, make(chan struct{})),
+		"goroutines still running past the budget must be reported, so the caller leaves the store open")
+}
+
+func TestWaitForBackground_WaitsForALateFinish(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	assert.True(t, waitForBackground(ctx, done),
+		"the wait must block for goroutines that finish inside the budget, not check once and give up")
+}
+
 // TestSplitRemaining_DividesCtxDeadlineNotFullWant covers the fix at the
 // heart of the "one budget" requirement: StopServer's grace and hardLimit
 // must come from what is left of the shutdown deadline, not be re-measured

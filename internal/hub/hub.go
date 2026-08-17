@@ -164,7 +164,20 @@ func (h *Hub) Start(ctx context.Context) error {
 
 	// Before anything is served: a hub that has just started has no online
 	// devices, whatever the database says. See ReconcileDeviceStatuses. (#75)
+	//
+	// A Stop landing while this runs fails it, and not with an error worth
+	// reporting: cancelling the context makes database/sql return
+	// context.Canceled before it even takes the connection, and a Stop that
+	// wins the race to store.Close() turns it into "sql: database is closed".
+	// Both mean the shutdown got here first, which is a clean stop seen from an
+	// unlucky angle — the same case the Serve call below already filters, and
+	// the same systemd-records-a-failed-unit outcome if it is not filtered
+	// here too. The state check is what separates that from a genuine store
+	// failure at startup, which must still be fatal. (#75)
 	if err := ReconcileDeviceStatuses(ctx, h.store, h.logger); err != nil {
+		if h.stopped() {
+			return nil
+		}
 		return err
 	}
 
@@ -350,21 +363,27 @@ func (h *Hub) stop() (bool, error) {
 	// busy_timeout, so a heartbeat mid-write when cancelBG fired can still be
 	// holding it; store.Close() underneath that write would race it. Waiting
 	// here, rather than trusting cancellation alone, is what keeps that race
-	// from ever happening — and if the wait itself outlives what remains of
-	// the budget, closing the store anyway would be exactly the live-handler
-	// hazard the closeStore gate above exists to prevent, so this reports
-	// unsettled instead, unlike the StopForced case above. (#75)
+	// from ever happening, and running out of budget mid-wait means the store
+	// is left open — the same live-writer hazard the closeStore gate above
+	// exists to prevent.
+	//
+	// It still reports SETTLED. This branch is reachable only on StopGraceful,
+	// so the gRPC server came down cleanly and grpc-go has already waited out
+	// every handler; what is late here is one of the hub's OWN background
+	// goroutines, which no client is waiting on. Reporting unsettled would exit
+	// non-zero for a shutdown strictly healthier than the StopForced case that
+	// exits zero a few lines up — and the trigger is mundane: a sweep that sat
+	// out the store's 5s busy_timeout behind a concurrent `hubfuse-hub
+	// issue-join` leaves splitRemaining almost nothing. (#75)
 	bgDone := make(chan struct{})
 	go func() {
 		h.bgWG.Wait()
 		close(bgDone)
 	}()
 
-	select {
-	case <-bgDone:
-	case <-ctx.Done():
-		h.logger.Warn("stop: background goroutines did not exit within the shutdown budget")
-		return false, nil
+	if !waitForBackground(ctx, bgDone) {
+		h.logger.Warn("stop: background goroutines did not exit within the shutdown budget; leaving the store open")
+		return true, nil
 	}
 
 	if err := h.store.Close(); err != nil {
@@ -372,6 +391,38 @@ func (h *Hub) stop() (bool, error) {
 	}
 
 	return true, nil
+}
+
+// waitForBackground reports whether done closed before ctx ran out. A false
+// result gates store.Close() only — the caller still reports the shutdown
+// settled, because this runs on the graceful path where the server is already
+// down.
+//
+// The two-stage select is the point of the function. Callers reach it with a
+// budget that is routinely already spent, so a single select over both channels
+// would choose at random whenever the goroutines had finished AND the deadline
+// had passed — Go picks uniformly among ready cases — and the store would be
+// closed or left open by coin toss on runs that differ in nothing. Checking
+// done first makes "finished, if only just" win deterministically.
+//
+// It takes the channel rather than the WaitGroup so the choice above is what
+// gets tested. Given a WaitGroup it would have to start the waiting goroutine
+// itself, and whether that goroutine had reached its close by the first check
+// would be down to the scheduler — the test would race the code instead of
+// pinning it. (#75)
+func waitForBackground(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // stopResultFor translates StopServer's outcome into the two separate
