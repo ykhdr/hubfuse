@@ -561,6 +561,125 @@ func TestSubscribe_WorksBeforeDraining(t *testing.T) {
 	assert.Empty(t, r.ActiveSubscribers(), "unsub must remove the subscription")
 }
 
+// TestCloseAllSubscribers_ClosesAndClearsEverySubscription is the core of the
+// #75 fix: a hub that closes its subscriptions has nothing left for
+// GracefulStop to wait on. Measured on real binaries, this is the difference
+// between a 29.99s shutdown (one healthy agent) and 11ms.
+func TestCloseAllSubscribers_ClosesAndClearsEverySubscription(t *testing.T) {
+	r := newTestRegistry(t)
+
+	chA, unsubA := mustSubscribe(t, r, "dev-a")
+	defer unsubA()
+	chB, unsubB := mustSubscribe(t, r, "dev-b")
+	defer unsubB()
+
+	assert.Equal(t, 2, r.CloseAllSubscribers(), "must report how many it closed")
+
+	for name, ch := range map[string]<-chan *pb.Event{"dev-a": chA, "dev-b": chB} {
+		select {
+		case _, ok := <-ch:
+			assert.False(t, ok, "%s: channel must be closed, not merely empty", name)
+		case <-time.After(time.Second):
+			t.Fatalf("%s: subscription was not closed", name)
+		}
+	}
+
+	assert.Empty(t, r.ActiveSubscribers(), "the subscriber map must be cleared, not just closed")
+}
+
+// TestCloseAllSubscribers_DeliversBufferedEventsFirst pins the ordering the
+// shutdown sequence depends on. Hub.Stop broadcasts DeviceOffline for every
+// device and only then closes the subscriptions; that is safe because a receive
+// from a closed buffered channel drains the buffer before reporting !ok. If it
+// were not, peers would lose the very DeviceOffline that tells them to unmount.
+func TestCloseAllSubscribers_DeliversBufferedEventsFirst(t *testing.T) {
+	r := newTestRegistry(t)
+
+	ch, unsub := mustSubscribe(t, r, "dev-a")
+	defer unsub()
+
+	r.BroadcastAll(&pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-b", Nickname: "bob"},
+	}})
+
+	r.CloseAllSubscribers()
+
+	event, ok := <-ch
+	require.True(t, ok, "the event queued before the close must still arrive")
+	require.NotNil(t, event.GetDeviceOffline())
+	assert.Equal(t, "dev-b", event.GetDeviceOffline().DeviceId)
+
+	_, ok = <-ch
+	assert.False(t, ok, "the stream must end once the buffer is drained")
+}
+
+// TestCloseAllSubscribers_UnsubAfterwardsDoesNotPanic — Server.Subscribe always
+// runs `defer unsub()`, so every handler woken by the close calls it on the way
+// out. Clearing the map inside the same critical section is what makes that
+// call a no-op instead of a close of a closed channel.
+func TestCloseAllSubscribers_UnsubAfterwardsDoesNotPanic(t *testing.T) {
+	r := newTestRegistry(t)
+
+	_, unsub := mustSubscribe(t, r, "dev-a")
+
+	r.CloseAllSubscribers()
+
+	assert.NotPanics(t, unsub, "unsub after CloseAllSubscribers must be a no-op")
+	assert.NotPanics(t, unsub, "and must stay one when the handler is late twice over")
+}
+
+// TestCloseAllSubscribers_BroadcastAfterwardsDoesNotPanic — Broadcast and
+// BroadcastAll send under the READ lock. A heartbeat or a Leave still in flight
+// can publish while the hub is shutting down, and it must find an empty map
+// rather than a closed channel. This is the same hazard from the other side that
+// forces CloseAllSubscribers to take the WRITE lock.
+func TestCloseAllSubscribers_BroadcastAfterwardsDoesNotPanic(t *testing.T) {
+	r := newTestRegistry(t)
+
+	_, unsub := mustSubscribe(t, r, "dev-a")
+	defer unsub()
+
+	r.CloseAllSubscribers()
+
+	event := &pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-a", Nickname: "alice"},
+	}}
+	assert.NotPanics(t, func() { r.BroadcastAll(event) }, "BroadcastAll after the close")
+	assert.NotPanics(t, func() { r.Broadcast(event, "dev-b") }, "Broadcast after the close")
+}
+
+// TestCloseAllSubscribers_ConcurrentWithBroadcast is the race the write lock
+// exists for, and it only fails under -race: closing under the read lock that
+// BroadcastAll holds gives "send on closed channel", turning the #75 fix into a
+// panic on the exact path it repairs.
+func TestCloseAllSubscribers_ConcurrentWithBroadcast(t *testing.T) {
+	r := newTestRegistry(t)
+
+	for _, id := range []string{"dev-a", "dev-b", "dev-c"} {
+		_, unsub := mustSubscribe(t, r, id)
+		defer unsub()
+	}
+
+	event := &pb.Event{Payload: &pb.Event_DeviceOffline{
+		DeviceOffline: &pb.DeviceOfflineEvent{DeviceId: "dev-z", Nickname: "zoe"},
+	}}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			r.BroadcastAll(event)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		r.CloseAllSubscribers()
+	}()
+
+	assert.NotPanics(t, wg.Wait, "a broadcast racing the shutdown close must not panic")
+}
+
 // TestWriteErr_TranslatesAnyFailureForAVanishedDevice — a prune between two
 // statements of the same RPC does not always surface as ErrNotFound: with
 // foreign keys on, writing shares for a deleted device fails as a constraint

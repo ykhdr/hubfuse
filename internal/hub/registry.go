@@ -540,6 +540,45 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func(), error) 
 	return ch, unsub, nil
 }
 
+// CloseAllSubscribers ends every event subscription and reports how many it
+// closed. It is the main fix for #75.
+//
+// Subscribe is a long-lived server stream whose handler sits in a select on its
+// channel, and GracefulStop waits for every in-flight RPC. Nothing about the
+// hub's own shutdown ends that stream: not the sweep, not GracefulStop's GOAWAY
+// (the first one deliberately leaves existing streams alone). Measured, a hub
+// with a single HEALTHY agent took 29.99s to exit — three failed heartbeats on
+// the agent's side — while a hub whose agent had deregistered took 11ms. The
+// difference is precisely this: closed channels. So the hub stops waiting for
+// its clients to notice and closes the subscriptions itself; each handler reads
+// !ok, returns, and the client drops the connection on the first GOAWAY.
+//
+// The WRITE lock is not negotiable. Broadcast and BroadcastAll send under the
+// READ lock, so closing a channel under the read lock would race a concurrent
+// send and panic with "send on closed channel" — and the send racing us is the
+// sweep's own final DeviceOffline. A fix for a hang that panics the process it
+// is shutting down is worse than the hang.
+//
+// delete + close belong to the same critical section for the same reason unsub
+// compares channel identity: leaving the map populated and clearing it later
+// would let unsub (or a Subscribe replacing a reconnecting device) close an
+// already-closed channel.
+//
+// Callers must broadcast BEFORE calling this — a receive from a closed buffered
+// channel drains the buffer first and only then reports !ok, so events queued by
+// the sweep still reach their subscribers. (#75)
+func (r *Registry) CloseAllSubscribers() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	closed := len(r.subscribers)
+	for deviceID, ch := range r.subscribers {
+		delete(r.subscribers, deviceID)
+		close(ch)
+	}
+	return closed
+}
+
 // ActiveSubscribers returns the device IDs that currently have an active
 // subscription stream.
 func (r *Registry) ActiveSubscribers() []string {
