@@ -42,7 +42,6 @@ type Daemon struct {
 	config        *agentconfig.Config
 	configPath    string
 	identity      *DeviceIdentity
-	hubClient     *HubClient
 	connector     *Connector
 	mounter       *Mounter
 	sshServer     *SSHServer
@@ -81,9 +80,24 @@ type Daemon struct {
 	// replaced it in between. sessionOnce installs the cancel and clears the
 	// count under the same lock, so a new session is never dropped by the
 	// failures that ended the last one. (#72)
-	sessionMu      sync.Mutex
-	sessionCancel  context.CancelFunc
-	heartbeatFails int
+	// hubClient joins them under the same lock, and deliberately so: which
+	// connection the session runs on is a fact about the session, exactly like
+	// its cancel func and its failure count. reconnectSession may replace the
+	// connection when an attempt expired against the daemon's own deadline
+	// (see replaceHubClient), so this field is no longer written once before the
+	// goroutines start — every read goes through hub(). One mutex rather than a
+	// second one for the client: with two, the heartbeat path would take
+	// sessionMu then the client lock while the reconnect path took them the
+	// other way round, which is the textbook ABBA. hubClientClosed records that
+	// Shutdown has taken ownership, so a swap racing shutdown closes the client
+	// it just dialled instead of installing it — the one Shutdown holds is never
+	// closed underneath it. No RPC and no hub() call ever happens while this
+	// mutex is held. (#77)
+	sessionMu       sync.Mutex
+	sessionCancel   context.CancelFunc
+	heartbeatFails  int
+	hubClient       *HubClient
+	hubClientClosed bool
 
 	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
 	// it on the first successful Register and runServices asks again as a
@@ -145,6 +159,15 @@ type Daemon struct {
 	// reconciliation without a live hub. A nil value means "no transport" and
 	// runHeartbeat declines to start (test fixtures that never register). (#69)
 	heartbeatFn func(ctx context.Context) error
+
+	// dialFn is the seam that produces a REPLACEMENT hub connection. NewDaemon
+	// wires it to Connector.Dial — one lazy grpc.NewClient over cached
+	// credentials, with no retry loop of its own, because the only caller
+	// (replaceHubClient, from reconnectSession) is already inside one. A nil
+	// value means the daemon has no way to dial, and replaceHubClient then
+	// declines to replace anything rather than panicking: buildTestDaemon
+	// constructs Daemon as a literal with neither client nor connector. (#77)
+	dialFn func() (*HubClient, error)
 
 	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
 	// config-watcher's share-publish path (onConfigChange) is testable without a
@@ -247,22 +270,24 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 			defaultHeartbeatInterval, logger),
 	}
 
-	// Wire the hub-session seams to the live client. The closures read d.hubClient
-	// at call time (it is set later, by connect), so eager assignment here is safe
-	// — the codebase idiom (see NewMounter's execCommand/unmount defaults). Unit
+	// Wire the hub-session seams to the live client. The closures resolve the
+	// connection through d.hub() at call time — it is installed later by connect,
+	// and reconnectSession may replace it while the daemon runs (#77) — so eager
+	// assignment here is safe and a stale connection can never be captured. Unit
 	// tests replace these with fakes before driving the session functions.
 	d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
-		return d.hubClient.Register(ctx, shares, sshPort)
+		return d.hub().Register(ctx, shares, sshPort)
 	}
 	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
-		return d.hubClient.Subscribe(ctx)
+		return d.hub().Subscribe(ctx)
 	}
 	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
-		return d.hubClient.UpdateShares(ctx, shares)
+		return d.hub().UpdateShares(ctx, shares)
 	}
 	d.heartbeatFn = func(ctx context.Context) error {
-		return d.hubClient.Heartbeat(ctx)
+		return d.hub().Heartbeat(ctx)
 	}
+	d.dialFn = connector.Dial
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
 	// immediately — the config watcher only fires on later file-change events.
@@ -422,10 +447,21 @@ func (d *Daemon) rememberNickname(deviceID, nickname string) {
 // received no nickname) and self-heals stale nicknames after a peer is renamed.
 // It is best-effort: hub unreachability is logged but not fatal.
 func (d *Daemon) seedNicknamesFromHub(ctx context.Context) {
-	if d.hubClient == nil {
+	client := d.hub()
+	if client == nil {
 		return
 	}
-	resp, err := d.hubClient.ListDevices(ctx)
+
+	// Bound it. This runs on the startup path, before startSSH and before the
+	// first Register, on a connection that has never carried a call — and the
+	// caller's context is the daemon's, which is only cancelled at shutdown. An
+	// unanswered ListDevices here would hang Run itself: no SSH server, no hub
+	// session, no heartbeat, and no log line saying why. The result is a
+	// best-effort cache warm-up, so giving up on it costs nothing. (#77)
+	listCtx, cancel := context.WithTimeout(ctx, listDevicesTimeout)
+	defer cancel()
+
+	resp, err := client.ListDevices(listCtx)
 	if err != nil {
 		d.logger.Warn("seedNicknamesFromHub: ListDevices failed; relying on persisted cache", "error", err)
 		return
@@ -476,6 +512,111 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return d.runServices(ctx)
 }
 
+// hub returns the connection the daemon is currently using, or nil before the
+// first connect. Every caller that talks to the hub resolves it through here at
+// call time: reconnectSession can replace it mid-life (#77), so a reference
+// cached across a call boundary may be a connection that has already been
+// closed.
+func (d *Daemon) hub() *HubClient {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	return d.hubClient
+}
+
+// setHubClient installs the initial connection. Only connect uses it; later
+// changes go through swapHubClient, which has a condemned client to match.
+func (d *Daemon) setHubClient(client *HubClient) {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	d.hubClient = client
+}
+
+// swapHubClient installs fresh in place of condemned and returns the client the
+// caller must close. It reports false when the swap did not happen: either
+// Shutdown already took ownership of the connection, or the current client is
+// no longer the one the caller condemned. Both mean fresh is the caller's to
+// close and the old connection must be left alone — closing a client Shutdown
+// is about to Deregister on would turn a healthy stop into a non-zero exit
+// (the #69 contract). (#77)
+func (d *Daemon) swapHubClient(condemned, fresh *HubClient) (old *HubClient, swapped bool) {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+
+	if d.hubClientClosed || d.hubClient != condemned {
+		return nil, false
+	}
+	d.hubClient = fresh
+	return condemned, true
+}
+
+// replaceHubClient dials a new hub connection and installs it in place of
+// condemned, reporting whether the replacement actually happened. It is the one
+// lever the daemon has against a connection that is up, answers HTTP/2 PINGs,
+// and carries no calls: gRPC will not repair such a transport because nothing
+// about it looks broken, so the only way out is a different one.
+//
+// It never touches a connection other than the one it was asked to condemn. The
+// CAS in swapHubClient is what enforces that: between the failed attempt and
+// this call, Shutdown may have claimed the connection or another path may have
+// replaced it already, and the client installed by then is provably not the one
+// that failed.
+//
+// A dial that fails leaves everything as it was, deliberately. Dialling is lazy
+// (no TCP, no handshake), so the only way it fails is a credential load, and the
+// current connection — however sick — is still strictly better than none.
+func (d *Daemon) replaceHubClient(condemned *HubClient) bool {
+	if condemned == nil || d.dialFn == nil {
+		// Nothing to condemn, or no way to dial. Both are real states, not
+		// programming errors: unit fixtures build a Daemon literal with neither
+		// a client nor a connector, and a swap that panicked there would take
+		// down tests that have nothing to do with hub connections.
+		return false
+	}
+
+	fresh, err := d.dialFn()
+	if err != nil {
+		d.logger.Warn("could not dial a replacement hub connection; keeping the current one",
+			"error", err)
+		return false
+	}
+
+	old, swapped := d.swapHubClient(condemned, fresh)
+	if !swapped {
+		// Shutdown owns the connection now, or someone replaced it first.
+		// Either way the client just dialled is ours to dispose of, and the
+		// installed one must be left strictly alone.
+		if closeErr := fresh.Close(); closeErr != nil {
+			d.logger.Debug("closing an unused replacement hub connection", "error", closeErr)
+		}
+		return false
+	}
+
+	if old != nil {
+		// Closing this can fail an in-flight heartbeat with
+		// ErrClientConnClosing. That failure is counted like any other and NOT
+		// forgiven: the counter is cleared when the next session comes up
+		// (newSessionCtx), and clearing it here would only delay the heartbeat
+		// detector — the one thing that saves the daemon if the new connection
+		// wedges too.
+		if closeErr := old.Close(); closeErr != nil {
+			d.logger.Debug("closing the replaced hub connection", "error", closeErr)
+		}
+	}
+	return true
+}
+
+// takeHubClientForShutdown claims the connection for shutdown: it marks the
+// client closed so no swap can install another one behind Shutdown's back, and
+// returns the single snapshot Shutdown uses for BOTH Deregister and Close.
+// Reading the field twice would let a swap land in between and close the
+// connection the in-flight Deregister is using. (#77)
+func (d *Daemon) takeHubClientForShutdown() *HubClient {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	d.hubClientClosed = true
+	return d.hubClient
+}
+
 // connect establishes the hub connection with backoff retry.
 func (d *Daemon) connect(ctx context.Context) error {
 	d.logger.Info("connecting to hub", "addr", d.config.Hub.Address)
@@ -483,7 +624,7 @@ func (d *Daemon) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to hub: %w", err)
 	}
-	d.hubClient = hubClient
+	d.setHubClient(hubClient)
 	d.logger.Info("connected to hub")
 	return nil
 }
@@ -554,8 +695,18 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	regCtx, cancelReg := context.WithTimeout(ctx, registerTimeout)
 	shares := configSharesToProto(cfg.Shares)
 	regResp, err := d.registerFn(regCtx, shares, d.sshPort)
+	// Read the budget's own verdict BEFORE cancelling it. After cancelReg the
+	// context is always in error — Canceled when the RPC came back on its own,
+	// DeadlineExceeded when the budget really did expire — so a check made
+	// afterwards could not tell those apart and would mark every single Register
+	// failure as ours. (A context keeps its first error, so reading it here is
+	// also the only reading that needs no argument about stickiness.)
+	regBudget := regCtx.Err()
 	cancelReg()
 	if err != nil {
+		if ourBudgetExpired(ctx, regBudget, err) {
+			return nil, fmt.Errorf("register with hub: %w: %w", errSessionTimedOut, err)
+		}
 		return nil, fmt.Errorf("register with hub: %w", err)
 	}
 	d.logger.Info("registered with hub",
@@ -594,7 +745,7 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	// point find no session to end, which noteHeartbeatFailure logs. (#72)
 	sessionCtx := d.newSessionCtx(ctx)
 
-	stream, err := d.subscribeFn(sessionCtx)
+	stream, err := d.subscribeWithBudget(sessionCtx)
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
@@ -602,8 +753,139 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	return stream, nil
 }
 
-// registerTimeout bounds the Register RPC of a session setup. See sessionOnce.
-const registerTimeout = 20 * time.Second
+// subscribeWithBudget opens the event stream under a deadline on its
+// ESTABLISHMENT only. Opening a stream is not free of blocking: gRPC waits for a
+// usable transport, for stream quota, and — after a GOAWAY — retries
+// transparently in a loop. Unbounded, a session attempt could park here forever:
+// no error, no log line, no backoff, and the classifier never gets to see
+// anything, because sessionOnce simply never returns. (#77)
+//
+// The stream itself must NOT carry this deadline — it is meant to live as long
+// as the session does — so the budget is armed as a timer that cancels a child
+// of sessionCtx and is disarmed the moment the stream exists. On the success
+// path the stream therefore runs on a context that dies exactly when the session
+// does, as before.
+//
+// A timer that has already fired is not recoverable: estCtx is cancelled, so
+// whatever the call returns is a stream nobody can use. Reporting the failure
+// (rather than handing that stream back) is what keeps a dead subscription from
+// looking alive to the hub, whose #69 recovery gate treats an open subscription
+// as proof the daemon is still there.
+func (d *Daemon) subscribeWithBudget(sessionCtx context.Context) (pb.HubFuse_SubscribeClient, error) {
+	estCtx, cancelEst := context.WithCancel(sessionCtx)
+	budget := time.AfterFunc(subscribeSetupTimeout, cancelEst)
+
+	stream, err := d.subscribeFn(estCtx)
+	// Stop unconditionally and remember the verdict: the timer must be disarmed
+	// on every path, and whether it had already fired decides all of them.
+	budgetFired := !budget.Stop()
+
+	if err != nil {
+		cancelEst()
+		if budgetFired && sessionCtx.Err() == nil {
+			// Cancelling estCtx is what made the call return, so the sentinel
+			// is the honest verdict. The underlying error rides along for the
+			// log: the sentinel says who gave up, not what it looked like.
+			return nil, fmt.Errorf("%w: %w", errSessionTimedOut, err)
+		}
+		return nil, err
+	}
+
+	if budgetFired {
+		// A stream did come back, but estCtx was cancelled to make that happen,
+		// so it is already dead. Returning it would have the caller log "hub
+		// session re-established" for a session that dies on the next Recv —
+		// the exact class of log that promises something which cannot be true,
+		// and the reason this issue was hard to see in the first place.
+		cancelEst()
+		if sessionCtx.Err() == nil {
+			return nil, errSessionTimedOut
+		}
+		// The session was ended from outside (shutdown, or the heartbeat
+		// detector dropping it). That is not our budget expiring, and it must
+		// stay off the connection-replacement path.
+		return nil, sessionCtx.Err()
+	}
+
+	// Deliberately no cancelEst() on this path: estCtx is the stream's context
+	// and must outlive this function. It is a child of sessionCtx, so it is
+	// released when the session ends — which every path guarantees
+	// (newSessionCtx cancels the previous session, Shutdown cancels the
+	// daemon's).
+	return stream, nil
+}
+
+// defaultRegisterTimeout bounds the Register RPC of a session setup, and
+// subscribeSetupTimeout bounds the ESTABLISHMENT of the event stream that
+// follows it. See sessionOnce for why each exists.
+//
+// The invariant that keeps ordinary disconnects off the connection-replacement
+// path is hubKeepaliveTime + hubKeepaliveTimeout < defaultRegisterTimeout: a
+// transport nobody answers is killed by keepalive within 15s, so the call comes
+// back Unavailable before the daemon's own 20s budget can expire. Pinned by
+// TestRegisterBudgetOutlastsKeepaliveDetection.
+const (
+	defaultRegisterTimeout       = 20 * time.Second
+	defaultSubscribeSetupTimeout = 20 * time.Second
+)
+
+// These are vars, not consts, purely so tests can shorten them. The classifier's
+// whole subject is what happens when one of these budgets expires, and at the
+// production values every such test would cost 20 seconds. Nothing in production
+// writes them. (#77)
+var (
+	registerTimeout       = defaultRegisterTimeout
+	subscribeSetupTimeout = defaultSubscribeSetupTimeout
+)
+
+// errSessionTimedOut marks a session attempt that failed because the daemon's
+// OWN budget ran out, rather than because the hub answered. It is the only
+// evidence that a call went nowhere on a connection gRPC has no intention of
+// repairing, and the classifier deliberately looks at nothing else:
+//
+//   - a hub that is down answers Unavailable immediately — our budget never
+//     expires, so no sentinel;
+//   - a hub that refuses answers ErrHubRejected — a completed round-trip, which
+//     proves the connection works;
+//   - a hub that answers DeadlineExceeded itself is also a completed round-trip,
+//     and a classifier reading status codes would have condemned it;
+//   - and in the one failure mode the grpc-go source actually documents
+//     (draining after GOAWAY), every attempt's code is Unavailable while the
+//     call dies on the caller's deadline — so a code-based classifier would miss
+//     precisely the case this exists for. (#77)
+var errSessionTimedOut = errors.New("hub session attempt exceeded its own deadline")
+
+// ourBudgetExpired reports whether a failed call failed because the daemon's own
+// deadline ran out. budget is the Err of the per-call context, read before it
+// was cancelled; parent is the context the daemon is running under; callErr is
+// what the call returned.
+//
+// All three conjuncts earn their place:
+//
+//   - the budget must have expired, not merely be non-nil. A cancelled budget
+//     means the call already returned on its own;
+//   - the parent must still be live. If the daemon is shutting down, everything
+//     fails and none of it says anything about the connection;
+//   - the hub must not have refused. A refusal is a completed round-trip, and a
+//     completed round-trip is proof the connection works — even if it lands in
+//     the same instant our timer fires.
+func ourBudgetExpired(parent context.Context, budget, callErr error) bool {
+	return errors.Is(budget, context.DeadlineExceeded) &&
+		parent.Err() == nil &&
+		!errors.Is(callErr, ErrHubRejected)
+}
+
+// listDevicesTimeout bounds the one-shot nickname seed (seedNicknamesFromHub)
+// and deregisterTimeout's sibling in spirit: a startup nicety must never be able
+// to hold Run hostage. It is short because the answer is optional — the
+// persisted cache covers the miss. (#77)
+const listDevicesTimeout = 10 * time.Second
+
+// updateSharesTimeout bounds the share publish that follows a config reload. It
+// runs on the config watcher's goroutine, which has no context of its own and no
+// supervisor behind it: a call that never returns would stop the watcher from
+// ever processing another change. (#77)
+const updateSharesTimeout = 10 * time.Second
 
 // maxHeartbeatFailures is how many consecutive heartbeat failures end the hub
 // session. Three of them span the hub's own 30s liveness timeout
@@ -701,9 +983,49 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 // reconnectSession retries sessionOnce with exponential backoff
 // (minReconnectInterval → backoffMax) until it succeeds or ctx is cancelled. It
 // returns the live stream on success, or nil when ctx is cancelled (signalling
-// supervise to exit). The same hubClient is reused throughout: gRPC repairs the
-// transport under the hood, so a fresh dial is unnecessary.
+// supervise to exit).
+//
+// The connection is normally reused throughout, because gRPC repairs a broken
+// transport under the hood and a fresh dial would only throw away its progress.
+// There is one state where that is false and the daemon would otherwise wait
+// forever: the connection is up, keepalive PINGs are answered, the event stream
+// still holds its socket — and calls go nowhere. Nothing about it looks broken
+// to gRPC, so nothing is repaired, and every attempt burns the full register
+// budget and logs the same warning until the process is restarted.
+//
+// The evidence for that state is not the status code. It is whose deadline
+// expired: OUR budget, on a call the hub never answered (errSessionTimedOut, see
+// ourBudgetExpired). A hub that is merely down answers Unavailable at once and
+// never trips it; a hub that refuses answers ErrHubRejected; and in the one
+// mechanism grpc-go's own source documents for this shape (draining after
+// GOAWAY) every attempt's code is Unavailable while the call dies on the
+// caller's deadline — so reading codes would have missed exactly the case worth
+// catching.
+//
+// Exactly one replacement per episode, and only of the connection the failed
+// attempt actually used. Both limits are load-bearing:
+//
+//   - CAS, because the connection may have been replaced or claimed by Shutdown
+//     in the meantime, and the one installed by then is provably not the one
+//     that failed;
+//   - one per episode, because a network black hole produces the same sentinel.
+//     Measured: a kept channel gets it wrong once (it loses a 20s-vs-20s race by
+//     90ms) and is right forever after, at 0ms per attempt, while a replaced
+//     channel returns to IDLE and pays the full 20s connect budget again on
+//     every attempt. Swapping once takes the useful case; swapping every round
+//     would turn a laptop's wifi drop — the most common failure on this
+//     hardware — into a 20s-per-round stall and a new transport on an already
+//     sick hub each time.
+//
+// A successful session ends the episode and restores the right, which is what
+// makes "one per episode" a bound on this outage rather than on the daemon's
+// lifetime.
 func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClient {
+	// Local to this episode by construction, not daemon state: leaving the loop
+	// IS the reset, so a later outage starts with its swap right intact.
+	swapSpent := false
+	exhaustionLogged := false
+
 	delay := d.minReconnectInterval
 	if delay <= 0 {
 		// Floor the FAILURE backoff so a persistent Register failure cannot
@@ -714,6 +1036,12 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 		delay = backoffInitial
 	}
 	for {
+		// Snapshot the connection this attempt will run on. The seams resolve
+		// d.hub() at call time, so this is the client to condemn if the attempt
+		// times out — and naming it is what stops a later, healthy connection
+		// from being torn down by a verdict passed on its predecessor.
+		attempted := d.hub()
+
 		stream, err := d.sessionOnce(ctx)
 		if err == nil {
 			d.logger.Info("hub session re-established")
@@ -738,6 +1066,27 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 				"error", err,
 				"backoff", delay,
 			)
+		}
+
+		if errors.Is(err, errSessionTimedOut) {
+			switch {
+			case !swapSpent:
+				if d.replaceHubClient(attempted) {
+					swapSpent = true
+					d.logger.Warn("replaced the hub connection: the attempt expired against our own deadline, "+
+						"which means the calls went nowhere on a connection gRPC still considers healthy",
+						"backoff", delay,
+					)
+				}
+			case !exhaustionLogged:
+				// Say it once, at Error, so an operator reading the log can
+				// tell "we tried a new connection and it did not help" (a hub
+				// wedged as a process, or a black-holed network) from the noise
+				// of the retry loop.
+				exhaustionLogged = true
+				d.logger.Error("hub session attempts keep expiring against our own deadline after a connection " +
+					"replacement; the hub itself or the network path is likely at fault")
+			}
 		}
 
 		select {
@@ -1118,7 +1467,14 @@ func (d *Daemon) Shutdown() error {
 		errs = append(errs, fmt.Sprintf("unmount all: %v", err))
 	}
 
-	if d.hubClient != nil {
+	// Claim the connection once, before anything uses it: Deregister and Close
+	// must run on the SAME client. Reading the field twice would let a
+	// replacement land in between, and the Deregister in flight would come back
+	// with ErrClientConnClosing — a transport error, which aggregates below and
+	// makes `hubfuse stop` exit non-zero on a perfectly healthy stop. (#77)
+	hubClient := d.takeHubClientForShutdown()
+
+	if hubClient != nil {
 		// Bound the call like every other shutdown step: a Deregister on a
 		// half-open connection would otherwise hang past the daemonize SIGKILL
 		// deadline and take the clean shutdown with it. (#50 bounded, #69)
@@ -1129,7 +1485,7 @@ func (d *Daemon) Shutdown() error {
 		// exit time, and turning a clean shutdown into a failure would make
 		// `hubfuse stop` exit non-zero for a healthy stop. Transport errors still
 		// aggregate: those say the hub never heard us. (#69)
-		err := d.hubClient.Deregister(dctx)
+		err := hubClient.Deregister(dctx)
 		dcancel()
 		if err != nil {
 			if errors.Is(err, ErrHubRejected) {
@@ -1150,8 +1506,8 @@ func (d *Daemon) Shutdown() error {
 		}
 	}
 
-	if d.hubClient != nil {
-		if err := d.hubClient.Close(); err != nil {
+	if hubClient != nil {
+		if err := hubClient.Close(); err != nil {
 			errs = append(errs, fmt.Sprintf("close hub client: %v", err))
 		}
 	}
