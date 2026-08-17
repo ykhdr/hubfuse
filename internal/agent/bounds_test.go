@@ -57,8 +57,7 @@ func TestRegisterBudgetOutlastsKeepaliveDetection(t *testing.T) {
 // sessionOnce simply never returns. The budget turns that into an expiry the
 // daemon can act on.
 func TestSubscribeEstablishmentIsBounded(t *testing.T) {
-	t.Parallel()
-
+	// No t.Parallel(): this test depends on a package-level budget var.
 	shortenBudget(t, &subscribeSetupTimeout, 50*time.Millisecond)
 
 	var (
@@ -104,8 +103,7 @@ func TestSubscribeEstablishmentIsBounded(t *testing.T) {
 // On the success path the stream keeps the session's lifetime, not the budget's:
 // the budget bounds establishment only.
 func TestSubscribeStreamOutlivesItsEstablishmentBudget(t *testing.T) {
-	t.Parallel()
-
+	// No t.Parallel(): this test depends on a package-level budget var.
 	shortenBudget(t, &subscribeSetupTimeout, 50*time.Millisecond)
 
 	var (
@@ -142,8 +140,7 @@ func TestSubscribeStreamOutlivesItsEstablishmentBudget(t *testing.T) {
 // A genuine Subscribe failure keeps its own error: only an expiry of the
 // daemon's budget is the sentinel.
 func TestSubscribeEstablishmentFailurePreservesItsError(t *testing.T) {
-	t.Parallel()
-
+	// No t.Parallel(): this test depends on a package-level budget var.
 	sentinel := errors.New("hub said no")
 	d := &Daemon{logger: discardLogger()}
 	d.subscribeFn = func(context.Context) (pb.HubFuse_SubscribeClient, error) {

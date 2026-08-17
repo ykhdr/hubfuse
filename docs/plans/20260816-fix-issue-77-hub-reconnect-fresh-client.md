@@ -485,14 +485,14 @@ errors.Is(budgetCtx.Err(), context.DeadlineExceeded) &&
 
 ### Task 2: границы вызовов и одноразовый дозвон
 
-- [ ] бюджет на **установку** `Subscribe` через `WithCancel(sessionCtx)` + `time.AfterFunc` (стрим
+- [x] бюджет на **установку** `Subscribe` через `WithCancel(sessionCtx)` + `time.AfterFunc` (стрим
       по-прежнему живёт на контексте сессии; сироты не остаётся)
-- [ ] дедлайны для `ListDevices` и `UpdateShares`. `UpdateShares` ограничивается в `onConfigChange`
+- [x] дедлайны для `ListDevices` и `UpdateShares`. `UpdateShares` ограничивается в `onConfigChange`
       (вызывающий), а не внутри сшивки, — иначе тесты на сшивке перестали бы видеть свой контекст
-- [ ] `Connector.Dial` + ленивый кэш TLS-credentials (кэшируется только успех) + сшивка `dialFn`;
+- [x] `Connector.Dial` + ленивый кэш TLS-credentials (кэшируется только успех) + сшивка `dialFn`;
       `Connect` делегирует в `Dial`, чтобы бутстрап и восстановление делили один кэш
-- [ ] `grpc.WithDisableServiceConfig()` в `dialOptions`
-- [ ] unit-тесты: зависшая установка `Subscribe` возвращает ошибку, а не висит вечно, и не оставляет
+- [x] `grpc.WithDisableServiceConfig()` в `dialOptions`
+- [x] unit-тесты: зависшая установка `Subscribe` возвращает ошибку, а не висит вечно, и не оставляет
       подписку; `Dial` не ретраит; credentials грузятся один раз, а ошибка загрузки не кэшируется;
       инвариант `hubKeepaliveTime + hubKeepaliveTimeout < defaultRegisterTimeout`
 - ➕ проверка «состав `dialOptions` зафиксирован» **снята** (plan-review): элементы `[]DialOption` —
@@ -503,16 +503,16 @@ errors.Is(budgetCtx.Err(), context.DeadlineExceeded) &&
 
 ### Task 3: сентинел, CAS-замена, демпфирование
 
-- [ ] `errSessionTimedOut` в `sessionOnce` по исправленному предикату (см. Technical Details);
+- [x] `errSessionTimedOut` в `sessionOnce` по исправленному предикату (см. Technical Details);
       `replaceHubClient` (CAS + nil-охрана) + «одна замена на эпизод»; вызов из `reconnectSession`;
       `registerTimeout` становится тестовой ручкой (пакетная `var` при константе по умолчанию)
-- [ ] unit-тесты: истёкший собственный бюджет → замена; `Unavailable`, `ErrHubRejected`, ответ
+- [x] unit-тесты: истёкший собственный бюджет → замена; `Unavailable`, `ErrHubRejected`, ответ
       хаба `DeadlineExceeded`, отмена демона → замены нет; провал дозвона сохраняет старого
       клиента; nil-клиент и nil-сшивка дозвона не роняют демона; после замены следующий `Register`
       идёт по новому клиенту; свежая сессия переживает «хвостовой» провал heartbeat'а от закрытого
       клиента; **при бесконечных провалах замена случается ровно один раз** (демпфирование), и
       право на неё возвращается после успешной сессии
-- [ ] переписан комментарий `reconnectSession`
+- [x] переписан комментарий `reconnectSession`
 
 ### Task 4: регресс-тесты на проводе
 
