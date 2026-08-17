@@ -143,7 +143,10 @@ func startCmd() *cobra.Command {
 			go func() {
 				<-sigCh
 				cancel()
-				if err := h.Stop(); err != nil {
+				// A later task rewires this to act on settled (e.g. force-exit
+				// when the shutdown did not finish inside budget); for now only
+				// make the new two-value signature compile. (#75)
+				if _, err := h.Stop(); err != nil {
 					fmt.Fprintf(os.Stderr, "hub stop: %v\n", err)
 				}
 			}()

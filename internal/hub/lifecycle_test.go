@@ -1,6 +1,11 @@
 package hub
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync/atomic"
@@ -8,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // fakeStoppableServer is a stoppableServer whose GracefulStop/Stop timing the
@@ -118,4 +124,83 @@ func TestStopServer_ForcedStopDoesNotHelp_ReturnsHung(t *testing.T) {
 	assert.Equal(t, StopHung, outcome)
 	assert.True(t, srv.stopCalled.Load(), "Stop must still be attempted even though it will not help")
 	assert.Less(t, elapsed, grace+hardLimit+500*time.Millisecond, "must return once hardLimit expires, not block indefinitely")
+}
+
+// jsonLogEntry captures the fields logCancelable's callers care about from a
+// single slog.NewJSONHandler line.
+func jsonLogEntry(t *testing.T, line []byte) map[string]any {
+	t.Helper()
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(line, &entry), "unmarshal log line: %s", line)
+	return entry
+}
+
+// TestLogCancelable_ContextCanceled_LogsDebugNotConfiguredLevel covers the
+// #75 quiet-shutdown fix: Stop cancels the background goroutines' context, so
+// every store call still in flight at that instant returns context.Canceled.
+// If this regressed to logging at the caller's level again, every normal
+// shutdown would print an Error/Warn line indistinguishable from a real fault.
+func TestLogCancelable_ContextCanceled_LogsDebugNotConfiguredLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logCancelable(logger, slog.LevelError, "get stale devices", context.Canceled)
+
+	entry := jsonLogEntry(t, buf.Bytes())
+	assert.Equal(t, "DEBUG", entry["level"], "a cancelled context must log at Debug, not the caller-requested level")
+}
+
+// TestLogCancelable_DeadlineExceeded_LogsDebugNotConfiguredLevel covers the
+// other half of the pair the spec calls out: a context that expired on its
+// own budget is just as ordinary during shutdown as one that was cancelled
+// outright, and must be quieted the same way.
+func TestLogCancelable_DeadlineExceeded_LogsDebugNotConfiguredLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logCancelable(logger, slog.LevelWarn, "prune expired invites", context.DeadlineExceeded)
+
+	entry := jsonLogEntry(t, buf.Bytes())
+	assert.Equal(t, "DEBUG", entry["level"], "an expired deadline must log at Debug, not the caller-requested level")
+}
+
+// TestLogCancelable_WrappedCancellation_StillDetected covers the store layer
+// wrapping context.Canceled inside a %w chain (as every store method that
+// takes ctx would); errors.Is, not ==, is what has to see through that.
+func TestLogCancelable_WrappedCancellation_StillDetected(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	wrapped := fmt.Errorf("get stale devices: %w", context.Canceled)
+	logCancelable(logger, slog.LevelError, "get stale devices", wrapped)
+
+	entry := jsonLogEntry(t, buf.Bytes())
+	assert.Equal(t, "DEBUG", entry["level"], "a wrapped context.Canceled must still be recognised via errors.Is")
+}
+
+// TestLogCancelable_OrdinaryError_KeepsConfiguredLevel is the other side of
+// the fix: an error that is not a cancellation must be exactly as loud as it
+// was before — logCancelable must not blanket-quiet every failure, only the
+// shutdown-induced ones.
+func TestLogCancelable_OrdinaryError_KeepsConfiguredLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logCancelable(logger, slog.LevelError, "get stale devices", errors.New("disk I/O error"))
+
+	entry := jsonLogEntry(t, buf.Bytes())
+	assert.Equal(t, "ERROR", entry["level"], "a non-cancellation error must keep the level its caller asked for")
+}
+
+// TestLogCancelable_PreservesExtraAttrs covers checkStale's mark-offline call
+// site, the one place that logs an extra device_id attribute alongside the
+// error — the helper must not silently drop it.
+func TestLogCancelable_PreservesExtraAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	logCancelable(logger, slog.LevelError, "mark offline", errors.New("boom"), slog.String("device_id", "dev-1"))
+
+	entry := jsonLogEntry(t, buf.Bytes())
+	assert.Equal(t, "dev-1", entry["device_id"], "attrs passed to logCancelable must reach the log line")
 }

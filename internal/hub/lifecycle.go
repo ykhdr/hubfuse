@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -166,4 +167,24 @@ func ReconcileDeviceStatuses(ctx context.Context, s store.Store, logger *slog.Lo
 			slog.Int64("devices", demoted))
 	}
 	return nil
+}
+
+// logCancelable logs err at level, except when err is a context cancellation
+// or deadline expiry, in which case it logs at Debug instead.
+//
+// Stop cancels the background goroutines' context as step 2 of the shutdown
+// sequence, and every store call still in flight at that moment — a stale
+// heartbeat sweep, an invite prune, a join-token sweep — returns exactly this
+// error as a direct consequence, not as evidence of a store or connectivity
+// problem. Logging it at the caller's normal level would turn every clean
+// shutdown into an Error/Warn line indistinguishable from a real fault; every
+// other error keeps its usual level. attrs are appended after "error" so
+// call sites keep whatever extra context (e.g. device_id) they already had.
+// (#75)
+func logCancelable(logger *slog.Logger, level slog.Level, msg string, err error, attrs ...slog.Attr) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		level = slog.LevelDebug
+	}
+	all := append([]slog.Attr{slog.Any("error", err)}, attrs...)
+	logger.LogAttrs(context.Background(), level, msg, all...)
 }
