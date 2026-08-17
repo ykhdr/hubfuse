@@ -29,9 +29,19 @@ func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 	d.mu.Unlock()
 
 	if diff.SharesChanged {
-		// Push updated shares to the hub.
+		// Push updated shares to the hub, under a deadline. This runs on the
+		// fsnotify watcher's goroutine, which has no context and no supervisor:
+		// an RPC that never returns would stop the daemon reacting to any
+		// further config change for the rest of its life. Losing a publish is
+		// survivable by comparison — every reconnect re-Registers the current
+		// share list, so the hub converges on the next session either way. The
+		// deadline is bounded here, at the caller, so the seam that unit tests
+		// replace still sees exactly the context this path uses. (#77)
 		shares := configSharesToProto(new.Shares)
-		if err := d.updateSharesFn(context.Background(), shares); err != nil {
+		updCtx, cancel := context.WithTimeout(context.Background(), updateSharesTimeout)
+		err := d.updateSharesFn(updCtx, shares)
+		cancel()
+		if err != nil {
 			d.logger.Error("failed to update shares on hub", "error", err)
 		}
 		// Push ACL snapshot to the SSH server and surface any shares that

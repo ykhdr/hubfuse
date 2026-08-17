@@ -160,6 +160,15 @@ type Daemon struct {
 	// runHeartbeat declines to start (test fixtures that never register). (#69)
 	heartbeatFn func(ctx context.Context) error
 
+	// dialFn is the seam that produces a REPLACEMENT hub connection. NewDaemon
+	// wires it to Connector.Dial — one lazy grpc.NewClient over cached
+	// credentials, with no retry loop of its own, because the only caller
+	// (replaceHubClient, from reconnectSession) is already inside one. A nil
+	// value means the daemon has no way to dial, and replaceHubClient then
+	// declines to replace anything rather than panicking: buildTestDaemon
+	// constructs Daemon as a literal with neither client nor connector. (#77)
+	dialFn func() (*HubClient, error)
+
 	// updateSharesFn is the same kind of seam over HubClient.UpdateShares so the
 	// config-watcher's share-publish path (onConfigChange) is testable without a
 	// live gRPC connection. NewDaemon wires it to d.hubClient.UpdateShares; unit
@@ -278,6 +287,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 	d.heartbeatFn = func(ctx context.Context) error {
 		return d.hub().Heartbeat(ctx)
 	}
+	d.dialFn = connector.Dial
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
 	// immediately — the config watcher only fires on later file-change events.
@@ -441,7 +451,17 @@ func (d *Daemon) seedNicknamesFromHub(ctx context.Context) {
 	if client == nil {
 		return
 	}
-	resp, err := client.ListDevices(ctx)
+
+	// Bound it. This runs on the startup path, before startSSH and before the
+	// first Register, on a connection that has never carried a call — and the
+	// caller's context is the daemon's, which is only cancelled at shutdown. An
+	// unanswered ListDevices here would hang Run itself: no SSH server, no hub
+	// session, no heartbeat, and no log line saying why. The result is a
+	// best-effort cache warm-up, so giving up on it costs nothing. (#77)
+	listCtx, cancel := context.WithTimeout(ctx, listDevicesTimeout)
+	defer cancel()
+
+	resp, err := client.ListDevices(listCtx)
 	if err != nil {
 		d.logger.Warn("seedNicknamesFromHub: ListDevices failed; relying on persisted cache", "error", err)
 		return
@@ -659,7 +679,7 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	// point find no session to end, which noteHeartbeatFailure logs. (#72)
 	sessionCtx := d.newSessionCtx(ctx)
 
-	stream, err := d.subscribeFn(sessionCtx)
+	stream, err := d.subscribeWithBudget(sessionCtx)
 	if err != nil {
 		return nil, fmt.Errorf("subscribe to hub events: %w", err)
 	}
@@ -667,8 +687,104 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	return stream, nil
 }
 
-// registerTimeout bounds the Register RPC of a session setup. See sessionOnce.
-const registerTimeout = 20 * time.Second
+// subscribeWithBudget opens the event stream under a deadline on its
+// ESTABLISHMENT only. Opening a stream is not free of blocking: gRPC waits for a
+// usable transport, for stream quota, and — after a GOAWAY — retries
+// transparently in a loop. Unbounded, a session attempt could park here forever:
+// no error, no log line, no backoff, and the classifier never gets to see
+// anything, because sessionOnce simply never returns. (#77)
+//
+// The stream itself must NOT carry this deadline — it is meant to live as long
+// as the session does — so the budget is armed as a timer that cancels a child
+// of sessionCtx and is disarmed the moment the stream exists. On the success
+// path the stream therefore runs on a context that dies exactly when the session
+// does, as before.
+//
+// A timer that has already fired is not recoverable: estCtx is cancelled, so
+// whatever the call returns is a stream nobody can use. Reporting the failure
+// (rather than handing that stream back) is what keeps a dead subscription from
+// looking alive to the hub, whose #69 recovery gate treats an open subscription
+// as proof the daemon is still there.
+func (d *Daemon) subscribeWithBudget(sessionCtx context.Context) (pb.HubFuse_SubscribeClient, error) {
+	estCtx, cancelEst := context.WithCancel(sessionCtx)
+	budget := time.AfterFunc(subscribeSetupTimeout, cancelEst)
+
+	stream, err := d.subscribeFn(estCtx)
+
+	if !budget.Stop() {
+		// The budget fired. Cancelling estCtx is what makes the call return at
+		// all, so err is usually non-nil here; either way the stream is dead.
+		// The underlying error is kept for the log — the sentinel says who gave
+		// up, not what it looked like.
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errSessionTimedOut, err)
+		}
+		return nil, errSessionTimedOut
+	}
+	if err != nil {
+		cancelEst()
+		return nil, err
+	}
+
+	// Deliberately no cancelEst() on this path: estCtx is the stream's context
+	// and must outlive this function. It is a child of sessionCtx, so it is
+	// released when the session ends — which every path guarantees
+	// (newSessionCtx cancels the previous session, Shutdown cancels the
+	// daemon's).
+	return stream, nil
+}
+
+// defaultRegisterTimeout bounds the Register RPC of a session setup, and
+// subscribeSetupTimeout bounds the ESTABLISHMENT of the event stream that
+// follows it. See sessionOnce for why each exists.
+//
+// The invariant that keeps ordinary disconnects off the connection-replacement
+// path is hubKeepaliveTime + hubKeepaliveTimeout < defaultRegisterTimeout: a
+// transport nobody answers is killed by keepalive within 15s, so the call comes
+// back Unavailable before the daemon's own 20s budget can expire. Pinned by
+// TestRegisterBudgetOutlastsKeepaliveDetection.
+const (
+	defaultRegisterTimeout       = 20 * time.Second
+	defaultSubscribeSetupTimeout = 20 * time.Second
+)
+
+// These are vars, not consts, purely so tests can shorten them. The classifier's
+// whole subject is what happens when one of these budgets expires, and at the
+// production values every such test would cost 20 seconds. Nothing in production
+// writes them. (#77)
+var (
+	registerTimeout       = defaultRegisterTimeout
+	subscribeSetupTimeout = defaultSubscribeSetupTimeout
+)
+
+// errSessionTimedOut marks a session attempt that failed because the daemon's
+// OWN budget ran out, rather than because the hub answered. It is the only
+// evidence that a call went nowhere on a connection gRPC has no intention of
+// repairing, and the classifier deliberately looks at nothing else:
+//
+//   - a hub that is down answers Unavailable immediately — our budget never
+//     expires, so no sentinel;
+//   - a hub that refuses answers ErrHubRejected — a completed round-trip, which
+//     proves the connection works;
+//   - a hub that answers DeadlineExceeded itself is also a completed round-trip,
+//     and a classifier reading status codes would have condemned it;
+//   - and in the one failure mode the grpc-go source actually documents
+//     (draining after GOAWAY), every attempt's code is Unavailable while the
+//     call dies on the caller's deadline — so a code-based classifier would miss
+//     precisely the case this exists for. (#77)
+var errSessionTimedOut = errors.New("hub session attempt exceeded its own deadline")
+
+// listDevicesTimeout bounds the one-shot nickname seed (seedNicknamesFromHub)
+// and deregisterTimeout's sibling in spirit: a startup nicety must never be able
+// to hold Run hostage. It is short because the answer is optional — the
+// persisted cache covers the miss. (#77)
+const listDevicesTimeout = 10 * time.Second
+
+// updateSharesTimeout bounds the share publish that follows a config reload. It
+// runs on the config watcher's goroutine, which has no context of its own and no
+// supervisor behind it: a call that never returns would stop the watcher from
+// ever processing another change. (#77)
+const updateSharesTimeout = 10 * time.Second
 
 // maxHeartbeatFailures is how many consecutive heartbeat failures end the hub
 // session. Three of them span the hub's own 30s liveness timeout
