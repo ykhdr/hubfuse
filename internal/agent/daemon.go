@@ -42,7 +42,6 @@ type Daemon struct {
 	config        *agentconfig.Config
 	configPath    string
 	identity      *DeviceIdentity
-	hubClient     *HubClient
 	connector     *Connector
 	mounter       *Mounter
 	sshServer     *SSHServer
@@ -81,9 +80,24 @@ type Daemon struct {
 	// replaced it in between. sessionOnce installs the cancel and clears the
 	// count under the same lock, so a new session is never dropped by the
 	// failures that ended the last one. (#72)
-	sessionMu      sync.Mutex
-	sessionCancel  context.CancelFunc
-	heartbeatFails int
+	// hubClient joins them under the same lock, and deliberately so: which
+	// connection the session runs on is a fact about the session, exactly like
+	// its cancel func and its failure count. reconnectSession may replace the
+	// connection when an attempt expired against the daemon's own deadline
+	// (see replaceHubClient), so this field is no longer written once before the
+	// goroutines start — every read goes through hub(). One mutex rather than a
+	// second one for the client: with two, the heartbeat path would take
+	// sessionMu then the client lock while the reconnect path took them the
+	// other way round, which is the textbook ABBA. hubClientClosed records that
+	// Shutdown has taken ownership, so a swap racing shutdown closes the client
+	// it just dialled instead of installing it — the one Shutdown holds is never
+	// closed underneath it. No RPC and no hub() call ever happens while this
+	// mutex is held. (#77)
+	sessionMu       sync.Mutex
+	sessionCancel   context.CancelFunc
+	heartbeatFails  int
+	hubClient       *HubClient
+	hubClientClosed bool
 
 	// heartbeatOnce guards the heartbeat loop the same way: sessionOnce starts
 	// it on the first successful Register and runServices asks again as a
@@ -247,21 +261,22 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 			defaultHeartbeatInterval, logger),
 	}
 
-	// Wire the hub-session seams to the live client. The closures read d.hubClient
-	// at call time (it is set later, by connect), so eager assignment here is safe
-	// — the codebase idiom (see NewMounter's execCommand/unmount defaults). Unit
+	// Wire the hub-session seams to the live client. The closures resolve the
+	// connection through d.hub() at call time — it is installed later by connect,
+	// and reconnectSession may replace it while the daemon runs (#77) — so eager
+	// assignment here is safe and a stale connection can never be captured. Unit
 	// tests replace these with fakes before driving the session functions.
 	d.registerFn = func(ctx context.Context, shares []*pb.Share, sshPort int) (*pb.RegisterResponse, error) {
-		return d.hubClient.Register(ctx, shares, sshPort)
+		return d.hub().Register(ctx, shares, sshPort)
 	}
 	d.subscribeFn = func(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
-		return d.hubClient.Subscribe(ctx)
+		return d.hub().Subscribe(ctx)
 	}
 	d.updateSharesFn = func(ctx context.Context, shares []*pb.Share) error {
-		return d.hubClient.UpdateShares(ctx, shares)
+		return d.hub().UpdateShares(ctx, shares)
 	}
 	d.heartbeatFn = func(ctx context.Context) error {
-		return d.hubClient.Heartbeat(ctx)
+		return d.hub().Heartbeat(ctx)
 	}
 
 	// Install the initial ACL snapshot so pre-existing shares are enforced
@@ -422,10 +437,11 @@ func (d *Daemon) rememberNickname(deviceID, nickname string) {
 // received no nickname) and self-heals stale nicknames after a peer is renamed.
 // It is best-effort: hub unreachability is logged but not fatal.
 func (d *Daemon) seedNicknamesFromHub(ctx context.Context) {
-	if d.hubClient == nil {
+	client := d.hub()
+	if client == nil {
 		return
 	}
-	resp, err := d.hubClient.ListDevices(ctx)
+	resp, err := client.ListDevices(ctx)
 	if err != nil {
 		d.logger.Warn("seedNicknamesFromHub: ListDevices failed; relying on persisted cache", "error", err)
 		return
@@ -476,6 +492,55 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return d.runServices(ctx)
 }
 
+// hub returns the connection the daemon is currently using, or nil before the
+// first connect. Every caller that talks to the hub resolves it through here at
+// call time: reconnectSession can replace it mid-life (#77), so a reference
+// cached across a call boundary may be a connection that has already been
+// closed.
+func (d *Daemon) hub() *HubClient {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	return d.hubClient
+}
+
+// setHubClient installs the initial connection. Only connect uses it; later
+// changes go through swapHubClient, which has a condemned client to match.
+func (d *Daemon) setHubClient(client *HubClient) {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	d.hubClient = client
+}
+
+// swapHubClient installs fresh in place of condemned and returns the client the
+// caller must close. It reports false when the swap did not happen: either
+// Shutdown already took ownership of the connection, or the current client is
+// no longer the one the caller condemned. Both mean fresh is the caller's to
+// close and the old connection must be left alone — closing a client Shutdown
+// is about to Deregister on would turn a healthy stop into a non-zero exit
+// (the #69 contract). (#77)
+func (d *Daemon) swapHubClient(condemned, fresh *HubClient) (old *HubClient, swapped bool) {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+
+	if d.hubClientClosed || d.hubClient != condemned {
+		return nil, false
+	}
+	d.hubClient = fresh
+	return condemned, true
+}
+
+// takeHubClientForShutdown claims the connection for shutdown: it marks the
+// client closed so no swap can install another one behind Shutdown's back, and
+// returns the single snapshot Shutdown uses for BOTH Deregister and Close.
+// Reading the field twice would let a swap land in between and close the
+// connection the in-flight Deregister is using. (#77)
+func (d *Daemon) takeHubClientForShutdown() *HubClient {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	d.hubClientClosed = true
+	return d.hubClient
+}
+
 // connect establishes the hub connection with backoff retry.
 func (d *Daemon) connect(ctx context.Context) error {
 	d.logger.Info("connecting to hub", "addr", d.config.Hub.Address)
@@ -483,7 +548,7 @@ func (d *Daemon) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to hub: %w", err)
 	}
-	d.hubClient = hubClient
+	d.setHubClient(hubClient)
 	d.logger.Info("connected to hub")
 	return nil
 }
@@ -1118,7 +1183,14 @@ func (d *Daemon) Shutdown() error {
 		errs = append(errs, fmt.Sprintf("unmount all: %v", err))
 	}
 
-	if d.hubClient != nil {
+	// Claim the connection once, before anything uses it: Deregister and Close
+	// must run on the SAME client. Reading the field twice would let a
+	// replacement land in between, and the Deregister in flight would come back
+	// with ErrClientConnClosing — a transport error, which aggregates below and
+	// makes `hubfuse stop` exit non-zero on a perfectly healthy stop. (#77)
+	hubClient := d.takeHubClientForShutdown()
+
+	if hubClient != nil {
 		// Bound the call like every other shutdown step: a Deregister on a
 		// half-open connection would otherwise hang past the daemonize SIGKILL
 		// deadline and take the clean shutdown with it. (#50 bounded, #69)
@@ -1129,7 +1201,7 @@ func (d *Daemon) Shutdown() error {
 		// exit time, and turning a clean shutdown into a failure would make
 		// `hubfuse stop` exit non-zero for a healthy stop. Transport errors still
 		// aggregate: those say the hub never heard us. (#69)
-		err := d.hubClient.Deregister(dctx)
+		err := hubClient.Deregister(dctx)
 		dcancel()
 		if err != nil {
 			if errors.Is(err, ErrHubRejected) {
@@ -1150,8 +1222,8 @@ func (d *Daemon) Shutdown() error {
 		}
 	}
 
-	if d.hubClient != nil {
-		if err := d.hubClient.Close(); err != nil {
+	if hubClient != nil {
+		if err := hubClient.Close(); err != nil {
 			errs = append(errs, fmt.Sprintf("close hub client: %v", err))
 		}
 	}
