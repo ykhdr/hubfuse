@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -189,13 +190,21 @@ func (h *Hub) Start(ctx context.Context) error {
 		return nil
 	}
 	h.grpcServer = grpcServer
-	h.mu.Unlock()
 
+	// Add and OnReady stay INSIDE the lock, with Stop's own critical section as
+	// the other half of the handshake. Released any earlier, a Stop landing in
+	// the gap would find a WaitGroup nothing had Add'd to — Wait returns
+	// instantly on a zero counter — close the store, and then this function
+	// would go on to write the PID file after shutdown had finished and start
+	// two background goroutines against a closed store. The PID file is the
+	// worst of those: a stale one makes the next `hubfuse-hub start` refuse
+	// with "already running". (#75)
+	h.bgWG.Add(2)
 	if h.config.OnReady != nil {
 		h.config.OnReady()
 	}
+	h.mu.Unlock()
 
-	h.bgWG.Add(2)
 	go func() {
 		defer h.bgWG.Done()
 		h.heartbeat.Start(runCtx)
@@ -220,10 +229,27 @@ func (h *Hub) Start(ctx context.Context) error {
 	h.logger.Info("hub gRPC server starting", slog.String("addr", h.config.ListenAddr))
 
 	if err := grpcServer.Serve(lis); err != nil {
+		// Serve returns nil when a stop interrupts it, and ErrServerStopped only
+		// when it is called after the server was already stopped — which is
+		// exactly what a Stop landing between the unlock above and this call
+		// produces. That is a clean shutdown observed from an unlucky angle, not
+		// a startup failure, and reporting it as one would have systemd record a
+		// failed unit for an ordinary `hubfuse-hub stop`. (#75)
+		if errors.Is(err, grpc.ErrServerStopped) && h.stopped() {
+			return nil
+		}
 		return fmt.Errorf("gRPC serve: %w", err)
 	}
 
 	return nil
+}
+
+// stopped reports whether Stop has already run. Used to tell a shutdown apart
+// from a genuine serve failure. (#75)
+func (h *Hub) stopped() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.state == lifecycleStopped
 }
 
 // Stop performs a bounded shutdown: broadcasts DeviceOffline for all online

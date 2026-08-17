@@ -105,6 +105,51 @@ func TestStopServer_GraceExpires_ForcedStopUnblocksIt(t *testing.T) {
 	assert.Less(t, elapsed, 500*time.Millisecond, "must return promptly once the forced Stop unblocks it")
 }
 
+// TestStopServer_ExhaustedBudgetStillGivesTheForcedStopAChance covers the case
+// where everything before StopServer has already spent the shutdown budget, so
+// the caller passes a zero hard limit (splitRemaining caps grace at whatever
+// remains and hands the rest — nothing — to the forced window).
+//
+// Without a floor this is a guaranteed FALSE StopHung: time.After(0) is ready
+// immediately, while the just-spawned goroutine still has to be scheduled and
+// call Stop() before the waiter can wake. The caller turns StopHung into
+// os.Exit(1), so an ordinary SIGTERM would exit non-zero — systemd records a
+// failed unit — on a hub whose forced stop would have returned in
+// microseconds. Reachable in production whenever the sweep waits out the
+// store's busy_timeout behind a concurrent `hubfuse-hub issue-join`.
+func TestStopServer_ExhaustedBudgetStillGivesTheForcedStopAChance(t *testing.T) {
+	srv := newFakeStoppableServer(true)
+	t.Cleanup(srv.unblock)
+
+	outcome := StopServer(srv, 0, 0, testLifecycleLogger())
+
+	assert.Equal(t, StopForced, outcome,
+		"a spent budget must not be reported as hung when Stop() works fine")
+	assert.True(t, srv.stopCalled.Load(), "Stop must still be attempted")
+}
+
+// TestStopServer_ExhaustedBudgetNeverReportsHung is the assertion that
+// actually matters when the budget is gone, and it is deliberately weaker than
+// "reports graceful".
+//
+// With a zero grace, whether GracefulStop is observed at all is a question of
+// goroutine SCHEDULING, not of how fast the server is: the goroutine that calls
+// it may not have run yet when time.After(0) fires, so a clean stop can still
+// be classified as forced. That misclassification is cheap — it only means the
+// store is left open, which costs nothing on a process about to exit with its
+// WAL committed. StopHung is the expensive one: it costs an os.Exit(1). So the
+// invariant worth pinning is that an exhausted budget never manufactures a hang.
+func TestStopServer_ExhaustedBudgetNeverReportsHung(t *testing.T) {
+	srv := newFakeStoppableServer(false)
+	srv.unblock() // GracefulStop returns as soon as it is scheduled.
+	t.Cleanup(srv.unblock)
+
+	outcome := StopServer(srv, 0, 0, testLifecycleLogger())
+
+	assert.NotEqual(t, StopHung, outcome,
+		"a spent budget must not turn a server that stops fine into an exit-1 hang")
+}
+
 // TestStopServer_ForcedStopDoesNotHelp_ReturnsHung covers a peer stuck deep
 // enough (e.g. blocked in stream.Send on an exhausted flow-control window)
 // that even a forced Stop() does not free the handler within hardLimit. If

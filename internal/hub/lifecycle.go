@@ -75,6 +75,10 @@ const (
 	// stopGracefulTimeout before SIGKILL, shared with the sweep and
 	// CloseAllSubscribers that run before StopServer is even called. (#75)
 	shutdownGrace = 3 * time.Second
+
+	// minForcedWait is the floor StopServer keeps for the forced Stop() even
+	// when the caller's budget is already spent. See the comment at its use.
+	minForcedWait = 500 * time.Millisecond
 )
 
 // StopServer stops srv with a hard upper bound and reports how far it got.
@@ -103,6 +107,25 @@ func StopServer(srv stoppableServer, grace, hardLimit time.Duration, logger *slo
 	case <-time.After(grace):
 	}
 
+	// The grace timer and GracefulStop can become ready in the same instant, and
+	// select picks between two ready cases at random — so a server that finished
+	// on its own can lose the toss and be forced for nothing. This re-check
+	// costs one non-blocking receive and takes the graceful answer whenever it
+	// is actually available. It is not a guarantee: with a zero grace, whether
+	// GracefulStop has been observed at all comes down to whether its goroutine
+	// has been scheduled yet. That residue is harmless — misreading graceful as
+	// forced only leaves the store open on a process that is exiting anyway.
+	// The expensive misreading is StopHung, and the floor below is what
+	// prevents it. (#75)
+	select {
+	case <-done:
+		if logger != nil {
+			logger.Info("gRPC server stopped gracefully")
+		}
+		return StopGraceful
+	default:
+	}
+
 	// Grace expired: at least one handler is still live — with a healthy
 	// subscriber this is the ordinary case, not just a dead peer (see
 	// CloseAllSubscribers). Stop() forces every connection closed, which is
@@ -115,6 +138,20 @@ func StopServer(srv stoppableServer, grace, hardLimit time.Duration, logger *slo
 			slog.Duration("grace", grace))
 	}
 	go srv.Stop()
+
+	// A forced Stop() that is given no time at all is not a bound, it is a
+	// guaranteed false StopHung: the caller's budget can already be spent by the
+	// time we get here (the sweep alone can wait out the store's 5s
+	// busy_timeout behind a concurrent `hubfuse-hub issue-join`), leaving
+	// hardLimit at zero, and time.After(0) fires long before a just-spawned
+	// goroutine can call Stop() and let the waiter wake. StopHung costs the
+	// caller an os.Exit(1) — a failed unit in systemd's eyes — so the forced
+	// window keeps a floor even when the budget is exhausted. The floor is
+	// small enough that the total stays far inside daemonize's 10s SignalStop
+	// window, which is the limit that actually matters. (#75)
+	if hardLimit < minForcedWait {
+		hardLimit = minForcedWait
+	}
 
 	select {
 	case <-done:

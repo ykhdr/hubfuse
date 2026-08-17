@@ -196,10 +196,18 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 		// hardcoded literal, so the harness cannot drift from production's own
 		// bound while still keeping the split between grace and hard limit.
 		grace := hub.DefaultShutdownBudget / 2
-		outcome := hub.StopServer(grpcServer, grace, hub.DefaultShutdownBudget-grace, logger)
-		if outcome == hub.StopGraceful {
-			_ = s.Close()
-		}
+		_ = hub.StopServer(grpcServer, grace, hub.DefaultShutdownBudget-grace, logger)
+
+		// The harness closes the store unconditionally, where production skips
+		// it on a forced stop. The reasoning differs because the lifetimes do:
+		// production is about to exit anyway, so leaving the database open
+		// costs nothing and avoids handing a live handler
+		// "sql: database is closed". This process outlives every test in the
+		// binary, so a store left open on a forced stop leaks a connection for
+		// the rest of the run — and a harness restarted over the same DataDir
+		// (tests/integration/reconnect_test.go) would then open the database
+		// with the previous handle still holding it. (#75)
+		_ = s.Close()
 	}
 	t.Cleanup(stop)
 
