@@ -4,6 +4,7 @@
 package hubtest
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -150,6 +151,15 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
+
+	// The harness starts a hub, so it reconciles device statuses like a hub —
+	// otherwise a test restarting against the same DataDir would see online rows
+	// that production would have cleared, and the two lifecycles would diverge
+	// exactly where the tests are meant to prove they do not. (#75)
+	if err := hub.ReconcileDeviceStatuses(context.Background(), s, logger); err != nil {
+		_ = s.Close()
+		t.Fatalf("hubtest: reconcile device statuses: %v", err)
 	}
 
 	registry := hub.NewRegistry(s, caCert, caKey, logger, 0)

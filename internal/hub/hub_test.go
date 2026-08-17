@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"log/slog"
@@ -9,9 +10,12 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/ykhdr/hubfuse/internal/common"
+	"github.com/ykhdr/hubfuse/internal/hub/store"
 )
 
 func TestLoadOrGenerateCerts_AutoSANs(t *testing.T) {
@@ -71,6 +75,71 @@ func TestLoadOrGenerateCerts_ExistingCertsNotRegenerated(t *testing.T) {
 
 	assert.Zero(t, cert1.SerialNumber.Cmp(cert2.SerialNumber),
 		"server cert was regenerated: serial %v != %v", cert1.SerialNumber, cert2.SerialNumber)
+}
+
+// TestStart_ReconcilesOnlineDevicesFromAPreviousLife covers the invariant the
+// bounded shutdown leans on.
+//
+// The hub trusts its stored statuses across restarts — Register answers a
+// joining device with ListOnlineDevices — so an online row that outlived the
+// previous process is served to peers as a live endpoint to mount. Today nothing
+// clears those rows: the shutdown sweep is the only writer that ever did, and it
+// does not run after SIGKILL, OOM or a power cut, nor necessarily in full once
+// shutdown is bounded by a budget. The heartbeat monitor only notices a
+// timeout/3 later.
+//
+// A hub that has just started has no online devices by definition — none of them
+// has heartbeated yet — so this is settled before the first RPC is served. (#75)
+func TestStart_ReconcilesOnlineDevicesFromAPreviousLife(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Leave behind exactly what a SIGKILLed hub leaves: an online row.
+	seed, err := store.NewSQLiteStore(filepath.Join(dataDir, common.DBFile))
+	require.NoError(t, err, "seed store")
+	require.NoError(t, seed.CreateDevice(context.Background(), &store.Device{
+		DeviceID:      "dev-ghost",
+		Nickname:      "ghost",
+		LastIP:        "10.0.0.9",
+		SSHPort:       2222,
+		Status:        store.StatusOnline,
+		LastHeartbeat: time.Now().UTC(),
+	}), "seed device")
+	require.NoError(t, seed.Close(), "close seed store")
+
+	ready := make(chan struct{})
+	h, err := NewHub(Config{
+		ListenAddr: "127.0.0.1:0",
+		DataDir:    dataDir,
+		LogLevel:   slog.LevelError,
+		OnReady:    func() { close(ready) },
+	})
+	require.NoError(t, err, "NewHub")
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- h.Start(context.Background()) }()
+
+	select {
+	case <-ready:
+	case err := <-serveErr:
+		t.Fatalf("hub exited before it was ready: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("hub never became ready")
+	}
+
+	// Reconciliation happens before the listener is bound, so by the time the
+	// hub is ready no peer can ever have been told about the ghost.
+	online, err := h.store.ListOnlineDevices(context.Background())
+	require.NoError(t, err, "ListOnlineDevices")
+	assert.Empty(t, online, "a freshly started hub must have no online devices")
+
+	d, err := h.store.GetDevice(context.Background(), "dev-ghost")
+	require.NoError(t, err, "GetDevice")
+	assert.Equal(t, store.StatusOffline, d.Status)
+	assert.Equal(t, "10.0.0.9", d.LastIP, "the endpoint must survive so a heartbeat can recover the device")
+	assert.Equal(t, 2222, d.SSHPort)
+
+	require.NoError(t, h.Stop(), "Stop")
+	require.NoError(t, <-serveErr, "Start must return cleanly after Stop")
 }
 
 func TestDedup(t *testing.T) {

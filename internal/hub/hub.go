@@ -106,6 +106,12 @@ func NewHub(config Config) (*Hub, error) {
 // invokes OnReady (if set) once the listener is up, and blocks until the
 // gRPC server stops.
 func (h *Hub) Start(ctx context.Context) error {
+	// Before anything is served: a hub that has just started has no online
+	// devices, whatever the database says. See ReconcileDeviceStatuses. (#75)
+	if err := ReconcileDeviceStatuses(ctx, h.store, h.logger); err != nil {
+		return err
+	}
+
 	creds := credentials.NewTLS(h.tlsCfg)
 
 	h.grpcServer = grpc.NewServer(ServerOptions(creds, h.registry)...)
@@ -160,27 +166,7 @@ func (h *Hub) Stop() error {
 	// its peers. (#69)
 	h.registry.Drain()
 
-	online, err := h.store.ListOnlineDevices(ctx)
-	if err != nil {
-		h.logger.Warn("stop: list online devices", slog.Any("error", err))
-	} else {
-		for _, d := range online {
-			event := &pb.Event{
-				Payload: &pb.Event_DeviceOffline{
-					DeviceOffline: &pb.DeviceOfflineEvent{
-						DeviceId: d.DeviceID,
-						Nickname: d.Nickname,
-					},
-				},
-			}
-			h.registry.BroadcastAll(event)
-			if err := h.store.UpdateDeviceStatus(ctx, d.DeviceID, store.StatusOffline, d.LastIP, d.SSHPort); err != nil {
-				h.logger.Warn("stop: mark device offline",
-					slog.String("device_id", d.DeviceID),
-					slog.Any("error", err))
-			}
-		}
-	}
+	h.sweepOnlineDevices(ctx)
 
 	if h.grpcServer != nil {
 		h.grpcServer.GracefulStop()
@@ -191,6 +177,51 @@ func (h *Hub) Stop() error {
 	}
 
 	return nil
+}
+
+// sweepOnlineDevices marks every online device offline and tells the remaining
+// peers about it, in that order.
+//
+// The order is the whole point. The durable write goes first, so that a sweep
+// cut short by its deadline leaves "row offline, event undelivered" — the peer
+// finds out on its own liveness timeout, and the next hub start serves a correct
+// list. The reverse leaves "event delivered, row still online", which is the
+// phantom #69 was about: a device the hub announces as up, forever, because the
+// only writer that would have corrected it is gone.
+//
+// The write is one statement rather than one per device. The store is opened
+// with SetMaxOpenConns(1) and busy_timeout=5000, so a single UPDATE can wait
+// five seconds behind a concurrent `hubfuse-hub issue-join`; N of them can
+// outlast the SIGTERM window on their own, and the whole shutdown runs under one
+// budget. (#75)
+func (h *Hub) sweepOnlineDevices(ctx context.Context) {
+	online, err := h.store.ListOnlineDevices(ctx)
+	if err != nil {
+		h.logger.Warn("stop: list online devices", slog.Any("error", err))
+		return
+	}
+	if len(online) == 0 {
+		return
+	}
+
+	if _, err := h.store.MarkAllOffline(ctx); err != nil {
+		// Nothing is broadcast on this path: peers told a device is offline by a
+		// hub whose database still says otherwise would be corrected on the next
+		// start, back to a device that is not there.
+		h.logger.Warn("stop: mark devices offline", slog.Any("error", err))
+		return
+	}
+
+	for _, d := range online {
+		h.registry.BroadcastAll(&pb.Event{
+			Payload: &pb.Event_DeviceOffline{
+				DeviceOffline: &pb.DeviceOfflineEvent{
+					DeviceId: d.DeviceID,
+					Nickname: d.Nickname,
+				},
+			},
+		})
+	}
 }
 
 // loadOrGenerateCerts loads existing CA and server TLS certificates from

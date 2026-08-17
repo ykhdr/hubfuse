@@ -461,20 +461,20 @@ WHERE status='online'` до начала обслуживания. Это не �
 
 ### Task 3: массовый свип в store и реконсиляция при старте
 
-- [ ] `store.MarkAllOffline(ctx) (int64, error)` — один `UPDATE ... WHERE status='online'`
+- [x] `store.MarkAllOffline(ctx) (int64, error)` — один `UPDATE ... WHERE status='online'`
       (`sqliteStore` — единственная реализация `Store`, фейков обновлять не нужно)
-- [ ] `Hub.Stop` использует его вместо N × `UpdateDeviceStatus`, и **запись идёт ДО broadcast'а**
-- [ ] реконсиляция при старте живёт в хелпере, который зовут ОБА места сборки хаба — `Hub.Start`
+- [x] `Hub.Stop` использует его вместо N × `UpdateDeviceStatus`, и **запись идёт ДО broadcast'а**
+- [x] реконсиляция при старте живёт в хелпере, который зовут ОБА места сборки хаба — `Hub.Start`
       (до `net.Listen`/`OnReady`) и `hubtest`. `hubtest` не проходит через `Hub` вовсе
       (`hubtest.go:122-169`), поэтому вызов только в `Hub.Start` означал бы, что тесты и прод
       стартуют по-разному — та же болезнь, ради которой заведён `ServerOptions`
-- [ ] проверить, что это не ломает `tests/integration/reconnect_test.go`: он рестартует хаб на том
+- [x] проверить, что это не ломает `tests/integration/reconnect_test.go`: он рестартует хаб на том
       же `DataDir` и ждёт своё устройство в `DevicesOnline` — `Register` читает
       `ListOnlineDevices` до собственной записи статуса и добавляет `current`, если его там нет
       (`registry.go:120-162`), так что после реконсиляции тест обязан остаться зелёным
-- [ ] unit-тесты store: отмечает только online-строки, возвращает счётчик, не трогает
+- [x] unit-тесты store: отмечает только online-строки, возвращает счётчик, не трогает
       `last_ip`/`ssh_port`
-- [ ] unit-тест на настоящем `hub.NewHub`/`Start`: хаб, стартовавший поверх БД с online-строками,
+- [x] unit-тест на настоящем `hub.NewHub`/`Start`: хаб, стартовавший поверх БД с online-строками,
       не отдаёт их пирам
 
 ### Task 4: ограниченная остановка gRPC-сервера

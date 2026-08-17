@@ -229,6 +229,32 @@ func (s *sqliteStore) MarkOfflineIfStale(ctx context.Context, deviceID string, t
 	return affected > 0, nil
 }
 
+// MarkAllOffline marks every online device offline in one statement.
+//
+// The hub calls this at both ends of its life, and the single statement matters
+// at both. On shutdown the whole sequence runs under one budget, and the old
+// per-device loop made the cost proportional to the number of devices against a
+// store opened with SetMaxOpenConns(1) and busy_timeout=5000 — a single UPDATE
+// can wait five seconds if `hubfuse-hub issue-join` happens to be writing, so N
+// of them can outlast the SIGTERM window on their own. On startup it is one
+// statement before the hub serves anything at all.
+//
+// Only the status changes: last_ip and ssh_port are the endpoint the hub
+// announces when the device comes back, and a device that reconnects after a
+// restart is announced from these columns before it re-registers. (#75)
+func (s *sqliteStore) MarkAllOffline(ctx context.Context) (int64, error) {
+	const q = `UPDATE devices SET status = ? WHERE status = ?`
+	res, err := s.db.ExecContext(ctx, q, string(StatusOffline), string(StatusOnline))
+	if err != nil {
+		return 0, fmt.Errorf("mark all devices offline: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mark all devices offline: rows affected: %w", err)
+	}
+	return affected, nil
+}
+
 // MarkOnlineIfOffline promotes an offline device back to online and reports
 // whether the row actually changed. A non-empty ip replaces last_ip; an empty
 // one leaves the stored address alone.
