@@ -11,8 +11,14 @@ test: test-unit test-integration test-cli test-scenarios
 test-unit:
 	go test ./internal/...
 
+# 300s, not 180s: the old-hub compatibility test (issue #78) is timer-dominated
+# and costs ~34s on any machine — grpc-go clamps a client's keepalive interval
+# to a 10s floor (internal.KeepaliveMinPingTime), so the ~30s it takes a pre-#72
+# hub to punish an idle connection cannot be shortened. That put the package at
+# ~103s against a 180s limit, which is a margin thin enough to fail on a slow
+# runner rather than a bound.
 test-integration:
-	go test ./tests/integration/... -timeout 180s
+	go test ./tests/integration/... -timeout 300s
 
 test-cli:
 	go test ./tests/cli/...
