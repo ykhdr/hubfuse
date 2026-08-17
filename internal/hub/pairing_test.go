@@ -66,7 +66,7 @@ func TestRequestPairing_SendsEventToTarget(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	ch, unsub := r.Subscribe("dev-b")
+	ch, unsub := mustSubscribe(t, r, "dev-b")
 	defer unsub()
 
 	_, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
@@ -165,7 +165,7 @@ func TestConfirmPairing_SendsCompletedEventToInitiator(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	ch, unsub := r.Subscribe("dev-a")
+	ch, unsub := mustSubscribe(t, r, "dev-a")
 	defer unsub()
 
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")
@@ -191,10 +191,10 @@ func TestConfirmPairing_DeliversEventToBothParties(t *testing.T) {
 	ctx := context.Background()
 	setupPairingDevices(t, r)
 
-	chInitiator, unsubInitiator := r.Subscribe("dev-a")
+	chInitiator, unsubInitiator := mustSubscribe(t, r, "dev-a")
 	defer unsubInitiator()
 
-	chConfirmer, unsubConfirmer := r.Subscribe("dev-b")
+	chConfirmer, unsubConfirmer := mustSubscribe(t, r, "dev-b")
 	defer unsubConfirmer()
 
 	code, err := r.RequestPairing(ctx, "dev-a", "bob", "pk-alice")

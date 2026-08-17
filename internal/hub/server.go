@@ -197,7 +197,10 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.HubFuse_Subscribe
 		return err
 	}
 
-	ch, unsub := s.registry.Subscribe(deviceID)
+	ch, unsub, err := s.registry.Subscribe(deviceID)
+	if err != nil {
+		return err
+	}
 	defer unsub()
 
 	// Signal that the subscription is active so clients can synchronise.

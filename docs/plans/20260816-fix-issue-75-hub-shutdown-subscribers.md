@@ -435,21 +435,21 @@ WHERE status='online'` до начала обслуживания. Это не �
 1b `Subscribe`), но остаются одной задачей: гард в интерцепторе без авторитетного гарда в
 `Registry.Subscribe` — это дырявая проверка, и наоборот.
 
-- [ ] **(1a)** `Registry.Draining()`; drain-интерцепторы (unary + stream), отвечающие
+- [x] **(1a)** `Registry.Draining()`; drain-интерцепторы (unary + stream), отвечающие
       `common.ErrHubShuttingDown`
-- [ ] **(1a)** `ServerOptions` принимает `*Registry`; `grpc.UnaryInterceptor`/`StreamInterceptor`
+- [x] **(1a)** `ServerOptions` принимает `*Registry`; `grpc.UnaryInterceptor`/`StreamInterceptor`
       ЗАМЕНЯЮТСЯ на `grpc.ChainUnaryInterceptor(drain, auth)` /
       `grpc.ChainStreamInterceptor(drain, auth)` (второй `UnaryInterceptor` = паника, см.
       Technical Details); обновить `hub.go`, `hubtest.go` и `serveropts_test.go` (там и вызов
       `ServerOptions(...)`, и `assert.Len(t, opts, 5)` с перечислением в сообщении — тест
       существует именно чтобы опции не разъезжались между двумя местами сборки)
-- [ ] **(1b)** `Registry.Subscribe` → `(<-chan *pb.Event, func(), error)` с авторитетным гардом
+- [x] **(1b)** `Registry.Subscribe` → `(<-chan *pb.Event, func(), error)` с авторитетным гардом
       внутри секции вставки и no-op `unsub` на пути отказа; `server.go:200` обрабатывает ошибку
       ДО `defer unsub()`
-- [ ] **(1b)** обновить 25 мест вызова: `internal/hub/server.go:200`, `registry_test.go` (18),
+- [x] **(1b)** обновить 25 мест вызова: `internal/hub/server.go:200`, `registry_test.go` (18),
       `leave_test.go` (2), `pairing_test.go` (4), `heartbeat_test.go` (3). В тестах — через
       хелпер `mustSubscribe(t, r, id)`, а не 24 правки `, _ :=`
-- [ ] unit-тесты: RPC после `Drain` получает `Unavailable`; `Subscribe` при draining отказывает и
+- [x] unit-тесты: RPC после `Drain` получает `Unavailable`; `Subscribe` при draining отказывает и
       отдаёт не-nil `unsub`; до `Drain` всё работает как раньше
 
 ### Task 2: `CloseAllSubscribers`

@@ -503,10 +503,25 @@ func (r *Registry) Leave(ctx context.Context, deviceID string) error {
 // already has a registered channel (e.g. due to reconnect), the old channel
 // is closed and replaced. The returned function unsubscribes and closes the
 // channel.
-func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
+//
+// A draining hub refuses, returning common.ErrHubShuttingDown. The drain
+// interceptor already turns new Subscribe RPCs away, but that check is a cheap
+// early exit outside the lock: a subscription that slipped between it and the
+// insertion below would be registered AFTER CloseAllSubscribers had run, leaving
+// a channel nobody will ever close and a stream GracefulStop waits on forever.
+// The authoritative guard therefore lives in the same critical section as the
+// write it protects — the markOnlineUnlessDraining pattern from #69. (#75)
+//
+// The unsubscribe function is never nil, including on the refusal path: callers
+// defer it (see Server.Subscribe), and a nil there panics.
+func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func(), error) {
 	ch := make(chan *pb.Event, 64)
 
 	r.mu.Lock()
+	if r.draining.Load() {
+		r.mu.Unlock()
+		return nil, func() {}, common.ErrHubShuttingDown
+	}
 	if old, ok := r.subscribers[deviceID]; ok {
 		close(old)
 	}
@@ -522,7 +537,7 @@ func (r *Registry) Subscribe(deviceID string) (<-chan *pb.Event, func()) {
 		r.mu.Unlock()
 	}
 
-	return ch, unsub
+	return ch, unsub, nil
 }
 
 // ActiveSubscribers returns the device IDs that currently have an active
