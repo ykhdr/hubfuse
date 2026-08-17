@@ -184,8 +184,22 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 			return
 		}
 		stopped = true
-		grpcServer.GracefulStop()
-		_ = s.Close()
+
+		// Same sequence Hub.Stop uses (Drain, CloseAllSubscribers, StopServer,
+		// then close the store only if the server actually stopped cleanly) —
+		// bypassing it here would mean a fix living only in hub.go never gets
+		// exercised by the tests built on this harness. (#75)
+		registry.Drain()
+		registry.CloseAllSubscribers()
+
+		// Derived from the one exported shutdown constant rather than a second
+		// hardcoded literal, so the harness cannot drift from production's own
+		// bound while still keeping the split between grace and hard limit.
+		grace := hub.DefaultShutdownBudget / 2
+		outcome := hub.StopServer(grpcServer, grace, hub.DefaultShutdownBudget-grace, logger)
+		if outcome == hub.StopGraceful {
+			_ = s.Close()
+		}
 	}
 	t.Cleanup(stop)
 

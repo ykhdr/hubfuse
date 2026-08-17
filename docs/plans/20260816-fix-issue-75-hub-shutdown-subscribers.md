@@ -479,14 +479,14 @@ WHERE status='online'` до начала обслуживания. Это не �
 
 ### Task 4: ограниченная остановка gRPC-сервера
 
-- [ ] `hub.StopServer(srv, grace, logger) StopOutcome`; оба вызова из горутин. Grace и
+- [x] `hub.StopServer(srv, grace, logger) StopOutcome`; оба вызова из горутин. Grace и
       `DefaultShutdownBudget` — пакетные константы, **без** `Config.ShutdownGrace`: поле в
       `hub.Config` — это операторская ручка, которой по решению выше быть не должно, и до Task 5
       оно вдобавок ни на что не влияет
-- [ ] `srv` принимается как интерфейс `{ GracefulStop(); Stop() }`, а не `*grpc.Server` — иначе
+- [x] `srv` принимается как интерфейс `{ GracefulStop(); Stop() }`, а не `*grpc.Server` — иначе
       фейковый сервер из тестов ниже не собрать; настоящий `*grpc.Server` ему удовлетворяет
-- [ ] `hubtest` останавливается тем же путём (`Drain` → `CloseAllSubscribers` → `StopServer`)
-- [ ] unit-тесты на фейковом сервере, по одному на исход: graceful успел → `StopGraceful`, `Stop()`
+- [x] `hubtest` останавливается тем же путём (`Drain` → `CloseAllSubscribers` → `StopServer`)
+- [x] unit-тесты на фейковом сервере, по одному на исход: graceful успел → `StopGraceful`, `Stop()`
       не вызывался; graceful завис → `Stop()` вызван внутри grace, `StopForced`; не вернулся даже
       `Stop()` → функция всё равно возвращается и сообщает `StopHung`
 

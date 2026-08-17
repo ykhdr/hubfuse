@@ -154,8 +154,9 @@ func (h *Hub) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop performs a graceful shutdown: broadcasts DeviceOffline for all online
-// devices, stops the gRPC server, and closes the store.
+// Stop performs a bounded shutdown: broadcasts DeviceOffline for all online
+// devices, closes every subscriber stream, stops the gRPC server within a hard
+// time budget, and closes the store if the server stopped cleanly.
 func (h *Hub) Stop() error {
 	ctx := context.Background()
 
@@ -168,12 +169,31 @@ func (h *Hub) Stop() error {
 
 	h.sweepOnlineDevices(ctx)
 
-	if h.grpcServer != nil {
-		h.grpcServer.GracefulStop()
+	// Queued AFTER the sweep's broadcasts, not before: a receive from a closed
+	// buffered channel drains the buffer first and only then reports !ok, so
+	// every DeviceOffline the sweep just queued still reaches its subscriber
+	// before that subscriber's stream ends. (#75)
+	if closed := h.registry.CloseAllSubscribers(); closed > 0 {
+		h.logger.Info("closed subscriber streams for shutdown", slog.Int("count", closed))
 	}
 
-	if err := h.store.Close(); err != nil {
-		h.logger.Warn("stop: close store", slog.Any("error", err))
+	// A hub that never started (Stop before Start, or Start failed before
+	// grpcServer was assigned) has nothing to bound and no live handlers, so it
+	// is safe to close the store as if the graceful path had run.
+	outcome := StopGraceful
+	if h.grpcServer != nil {
+		outcome = StopServer(h.grpcServer, shutdownGrace, DefaultShutdownBudget-shutdownGrace, h.logger)
+	}
+
+	// Only StopGraceful guarantees every handler has already returned
+	// (server.go:1985-1986 waits for handlers on the graceful path only); on
+	// StopForced or StopHung a live handler would see the database close out
+	// from under it as "sql: database is closed" instead of the clean process
+	// exit it would otherwise get with its WAL already committed. (#75)
+	if outcome == StopGraceful {
+		if err := h.store.Close(); err != nil {
+			h.logger.Warn("stop: close store", slog.Any("error", err))
+		}
 	}
 
 	return nil
