@@ -108,7 +108,7 @@ func NewHub(config Config) (*Hub, error) {
 func (h *Hub) Start(ctx context.Context) error {
 	creds := credentials.NewTLS(h.tlsCfg)
 
-	h.grpcServer = grpc.NewServer(ServerOptions(creds)...)
+	h.grpcServer = grpc.NewServer(ServerOptions(creds, h.registry)...)
 
 	srv := NewServer(h.registry, h.logger)
 	pb.RegisterHubFuseServer(h.grpcServer, srv)

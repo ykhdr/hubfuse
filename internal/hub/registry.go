@@ -379,6 +379,16 @@ func (r *Registry) Drain() {
 	r.draining.Store(true)
 }
 
+// Draining reports whether Hub.Stop has begun. The gRPC interceptors read it to
+// refuse new RPCs on a hub that is going away, so a client cannot open work the
+// shutdown sequence has already accounted for — a Subscribe accepted after
+// CloseAllSubscribers would never be closed, and a Join would burn its
+// single-use token on a hub that will not be there to honour the certificate.
+// (#75)
+func (r *Registry) Draining() bool {
+	return r.draining.Load()
+}
+
 // writeErr classifies a failed device-addressed write. A device pruned between
 // two statements of the same RPC does not always surface as ErrNotFound: with
 // foreign keys enabled, inserting shares for a deleted device fails as a

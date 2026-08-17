@@ -156,7 +156,7 @@ func StartTestHubWithOptions(t *testing.T, opts Options) *Harness {
 
 	// Built from the same options as the real hub (hub.ServerOptions) so tests
 	// exercise the production transport — keepalive settings included. (#72)
-	grpcServer := grpc.NewServer(hub.ServerOptions(credentials.NewTLS(tlsCfg))...)
+	grpcServer := grpc.NewServer(hub.ServerOptions(credentials.NewTLS(tlsCfg), registry)...)
 	srv := hub.NewServer(registry, logger)
 	pb.RegisterHubFuseServer(grpcServer, srv)
 
