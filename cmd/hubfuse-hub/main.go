@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -128,31 +129,30 @@ func startCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("create hub: %w", err)
 			}
-			defer func() {
-				if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
-					fmt.Fprintf(os.Stderr, "warning: remove pid file: %v\n", err)
-				}
-			}()
+			defer removePIDFile(pidPath)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
 
-			go func() {
-				<-sigCh
-				cancel()
-				// A later task rewires this to act on settled (e.g. force-exit
-				// when the shutdown did not finish inside budget); for now only
-				// make the new two-value signature compile. (#75)
-				if _, err := h.Stop(); err != nil {
-					fmt.Fprintf(os.Stderr, "hub stop: %v\n", err)
-				}
-			}()
+			// signaled and done let RunE tell "h.Start failed on its own, no
+			// signal ever came in" (return immediately, requirement 3) apart
+			// from "a signal is driving this shutdown, wait for it to finish
+			// settling" (requirement 1) without reading sigCh a second time
+			// itself — awaitTermination owns that channel. (#75)
+			var signaled atomic.Bool
+			done := make(chan struct{})
+			go awaitTermination(sigCh, cancel, h.Stop, pidPath, &signaled, done)
 
-			if err := h.Start(ctx); err != nil {
-				return fmt.Errorf("hub start: %w", err)
+			startErr := h.Start(ctx)
+
+			waitForShutdown(done, &signaled)
+
+			if startErr != nil {
+				return fmt.Errorf("hub start: %w", startErr)
 			}
 			return nil
 		},
@@ -169,6 +169,77 @@ func startCmd() *cobra.Command {
 	cmd.Flags().StringVar(&hbTimeout, "heartbeat-timeout", hub.DefaultHeartbeatTimeout.String(), "mark a device offline after this long without a heartbeat")
 
 	return cmd
+}
+
+// removePIDFile deletes the hub's PID file, tolerating one already gone.
+// Every path that ends the process — RunE's own defer on a clean return, and
+// each explicit call site right before an os.Exit(1) below, since deferred
+// functions do not run under os.Exit — calls this exactly once, which is
+// what keeps the removal itself from ever running twice. (#75)
+func removePIDFile(pidPath string) {
+	if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "warning: remove pid file: %v\n", err)
+	}
+}
+
+// awaitTermination reads OS termination signals for the running hub and
+// drives its shutdown. It is the ONLY goroutine that can act on the outcome:
+// while stop is in flight, the main goroutine is parked inside
+// grpcServer.Serve, whose deferred <-s.done.Done() (grpc-go server.go:
+// 885-892) does not release until the stop sequence completes, so RunE
+// cannot regain control to decide anything on the settled == false path.
+//
+// signaled is stored true before stop is even called, not after it returns:
+// Start's only way of unblocking is a side effect of stop (Serve returning
+// nil once grpc's internal quit fires), so by the time RunE's h.Start(ctx)
+// call returns, this store has already happened-before that on grpc's own
+// synchronization — waitForShutdown's read is safe without extra locking.
+// (#75)
+func awaitTermination(sigCh <-chan os.Signal, cancel context.CancelFunc, stop func() (bool, error), pidPath string, signaled *atomic.Bool, done chan<- struct{}) {
+	<-sigCh
+	signaled.Store(true)
+	cancel()
+
+	shuttingDown := make(chan struct{})
+	go func() {
+		defer close(shuttingDown)
+		settled, err := stop()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hub stop: %v\n", err)
+		}
+		if !settled {
+			// The forced stop itself did not return inside its budget: the
+			// process cannot bring itself down cleanly, so leave the same
+			// way a second signal does below rather than hang forever. (#75)
+			removePIDFile(pidPath)
+			os.Exit(1)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-shuttingDown:
+		// stop settled inside its budget; done is already closed above, RunE
+		// takes it from here.
+	case <-sigCh:
+		// A second signal arrived while the first stop was still running:
+		// the operator already waited once through the budget and is asking
+		// to leave now rather than have kill -9 be the only way out. (#75)
+		removePIDFile(pidPath)
+		os.Exit(1)
+	}
+}
+
+// waitForShutdown blocks on done only when a signal was actually observed.
+// Without the guard, a hub whose h.Start failed on its own — e.g. "listen:
+// address already in use", before anyone sent a signal — would hang RunE
+// forever: awaitTermination is still parked on sigCh and will never close
+// done, because nothing is ever going to arrive on it. (#75)
+func waitForShutdown(done <-chan struct{}, signaled *atomic.Bool) {
+	if !signaled.Load() {
+		return
+	}
+	<-done
 }
 
 func stopCmd() *cobra.Command {
