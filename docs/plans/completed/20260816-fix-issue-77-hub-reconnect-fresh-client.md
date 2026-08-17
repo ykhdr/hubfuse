@@ -536,4 +536,4 @@ errors.Is(budgetCtx.Err(), context.DeadlineExceeded) &&
 - [x] CLAUDE.md: инвариант «heartbeat роняет сессию; соединение заменяется, когда истёк наш
       собственный бюджет» в разделах про `daemon.go`, `client.go`/`connector.go` и тестовые
       харнессы. Правим **только агентские абзацы** — хабовые ведёт #75
-- [ ] перенести план в `docs/plans/completed/` **в этой же ветке до PR**
+- [x] перенести план в `docs/plans/completed/` **в этой же ветке до PR**
