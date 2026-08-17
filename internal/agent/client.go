@@ -40,6 +40,16 @@ const (
 // dialOptions returns the options every hub connection is built with. Both
 // dials go through it so the pinned bootstrap connection and the long-lived
 // mTLS one cannot drift apart in how they detect a dead hub. (#72)
+//
+// WithDisableServiceConfig is a hardening measure, not a tuning knob. The
+// default scheme for grpc.NewClient is dns, and grpc-go's DNS resolver reads a
+// grpc_config TXT record for the target by default (GRPC_ENABLE_TXT_SERVICE_CONFIG
+// defaults to true). That means anyone able to answer DNS on the local network
+// could hand this client a service config — including waitForReady, which turns
+// "the hub is unreachable" from an immediate failure into a call that blocks
+// until its deadline. The daemon's own decisions (the register budget, and what
+// it concludes when that budget expires) must not be configurable by whoever
+// runs the LAN's DNS. (#77)
 func dialOptions(creds credentials.TransportCredentials) []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
@@ -48,6 +58,7 @@ func dialOptions(creds credentials.TransportCredentials) []grpc.DialOption {
 			Timeout:             hubKeepaliveTimeout,
 			PermitWithoutStream: true,
 		}),
+		grpc.WithDisableServiceConfig(),
 	}
 }
 
@@ -106,7 +117,21 @@ func DialWithMTLS(hubAddr, caCertPath, clientCertPath, clientKeyPath string, log
 		return nil, fmt.Errorf("load mTLS config: %w", err)
 	}
 
-	creds := credentials.NewTLS(tlsCfg)
+	return dialWithCreds(hubAddr, credentials.NewTLS(tlsCfg), logger)
+}
+
+// dialWithCreds builds a HubClient over already-loaded credentials. It exists so
+// the daemon can dial the hub again — see Connector.Dial — without re-reading
+// three certificate files from disk on every attempt. Beyond the pointless I/O
+// on a recovery path, re-reading is actively unsafe: `hubfuse join` writes
+// ca.crt, client.crt and client.key with three separate os.WriteFile calls, so a
+// dial landing between them would load a mismatched pair, and a repeat join can
+// mint a different device_id — which would silently change the CN, i.e. the
+// identity the hub sees, underneath a running daemon. (#77)
+//
+// grpc.NewClient is lazy: this establishes no TCP connection and performs no TLS
+// handshake, so it cannot block and has nothing to time out.
+func dialWithCreds(hubAddr string, creds credentials.TransportCredentials, logger *slog.Logger) (*HubClient, error) {
 	conn, err := grpc.NewClient(hubAddr, dialOptions(creds)...)
 	if err != nil {
 		return nil, fmt.Errorf("dial hub %q (mTLS): %w", hubAddr, err)
