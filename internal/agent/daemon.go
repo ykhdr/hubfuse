@@ -776,23 +776,35 @@ func (d *Daemon) subscribeWithBudget(sessionCtx context.Context) (pb.HubFuse_Sub
 	budget := time.AfterFunc(subscribeSetupTimeout, cancelEst)
 
 	stream, err := d.subscribeFn(estCtx)
+	// Stop unconditionally and remember the verdict: the timer must be disarmed
+	// on every path, and whether it had already fired decides all of them.
+	budgetFired := !budget.Stop()
 
-	if !budget.Stop() && sessionCtx.Err() == nil {
-		// The budget fired while the session was otherwise fine. Cancelling
-		// estCtx is what makes the call return at all, so err is usually
-		// non-nil here; either way the stream is dead. The underlying error is
-		// kept for the log — the sentinel says who gave up, not what it looked
-		// like. (A session ended from outside instead — shutdown, or a
-		// heartbeat detector dropping it — is not our budget expiring, and the
-		// second conjunct keeps it off the replacement path.)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", errSessionTimedOut, err)
-		}
-		return nil, errSessionTimedOut
-	}
 	if err != nil {
 		cancelEst()
+		if budgetFired && sessionCtx.Err() == nil {
+			// Cancelling estCtx is what made the call return, so the sentinel
+			// is the honest verdict. The underlying error rides along for the
+			// log: the sentinel says who gave up, not what it looked like.
+			return nil, fmt.Errorf("%w: %w", errSessionTimedOut, err)
+		}
 		return nil, err
+	}
+
+	if budgetFired {
+		// A stream did come back, but estCtx was cancelled to make that happen,
+		// so it is already dead. Returning it would have the caller log "hub
+		// session re-established" for a session that dies on the next Recv —
+		// the exact class of log that promises something which cannot be true,
+		// and the reason this issue was hard to see in the first place.
+		cancelEst()
+		if sessionCtx.Err() == nil {
+			return nil, errSessionTimedOut
+		}
+		// The session was ended from outside (shutdown, or the heartbeat
+		// detector dropping it). That is not our budget expiring, and it must
+		// stay off the connection-replacement path.
+		return nil, sessionCtx.Err()
 	}
 
 	// Deliberately no cancelEst() on this path: estCtx is the stream's context
