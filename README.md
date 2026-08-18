@@ -104,6 +104,28 @@ go install github.com/ykhdr/hubfuse/cmd/hubfuse@latest
 go install github.com/ykhdr/hubfuse/cmd/hubfuse-hub@latest
 ```
 
+**Upgrade the hub before the agents.** From v0.1.3 the agent keeps its hub
+connection alive with a gRPC keepalive ping every 10 seconds, and a hub from
+v0.1.2 or earlier rejects that cadence with `GOAWAY too_many_pings` and closes
+the connection.
+
+A *running* agent is not affected: its heartbeat keeps the connection busy
+enough that no ping is ever sent, and an agent talking to an old hub survives
+indefinitely. What is affected is any connection that goes quiet for ~30
+seconds — most visibly `hubfuse join`, which holds a connection open while it
+waits for you to type a nickname. Each rejection also permanently doubles that
+connection's keepalive interval, which weakens the agent's ability to notice a
+hub that has gone away without closing the socket.
+
+If it happens, the agent says so once, at error level, naming the hub as too
+old. Upgrading the hub is the fix; agents do not need to be downgraded or
+restarted in any particular order afterwards.
+
+One related setting: leave `HUBFUSE_HEARTBEAT_INTERVAL` alone unless you have a
+reason. Anything at or above 30 seconds exceeds the hub's own liveness timeout,
+so the hub marks the device offline and peers unmount its shares — against any
+hub version, not just old ones.
+
 ### Prebuilt binaries
 
 If you don't have Go, prebuilt binaries are published on the project's
