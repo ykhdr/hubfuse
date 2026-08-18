@@ -859,10 +859,21 @@ var (
 //     proves the connection works;
 //   - a hub that answers DeadlineExceeded itself is also a completed round-trip,
 //     and a classifier reading status codes would have condemned it;
-//   - and in the one failure mode the grpc-go source actually documents
-//     (draining after GOAWAY), every attempt's code is Unavailable while the
-//     call dies on the caller's deadline — so a code-based classifier would miss
-//     precisely the case this exists for. (#77)
+//   - and in the failure mode the grpc-go source documents (a transport left
+//     draining after a GOAWAY, still being called), every attempt's code is
+//     Unavailable while the call dies on the caller's deadline — so a
+//     code-based classifier would miss precisely the case this exists for. (#77)
+//
+// One clarification, because the sentence above invites the wrong inference and
+// measurement settled it (issue #78): a GOAWAY does not by itself put a session
+// on this path. In the clean punishment cycle — an old hub answering the
+// agent's keepalive with GOAWAY too_many_pings — the hub closes the connection
+// about a second later, so calls fail FAST with Unavailable, our budget never
+// expires, and no replacement is triggered (measured: zero replacement dials).
+// The shape this sentinel is for is the transport that keeps its socket and
+// answers PINGs while calls go nowhere, which is a different thing that happens
+// to share a status code. That is the whole reason the classifier reads whose
+// deadline fired rather than the code — do not "simplify" it back to codes.
 var errSessionTimedOut = errors.New("hub session attempt exceeded its own deadline")
 
 // ourBudgetExpired reports whether a failed call failed because the daemon's own

@@ -14,11 +14,29 @@ import (
 //
 // The enforcement policy is the load-bearing half. grpc-go's default punishes a
 // client that pings more often than once every 5 minutes with
-// GOAWAY too_many_pings, which would turn the agent's 10s keepalive
-// (agent.hubKeepaliveTime) into a disconnect loop. MinTime is set to half that
-// interval so ordinary jitter cannot trip it, and PermitWithoutStream must
-// match the agent: between hub sessions there is no open stream, and that is
-// exactly when the connection still needs checking.
+// GOAWAY too_many_pings, and the agent pings every 10s
+// (agent.hubKeepaliveTime). MinTime is set to half that interval so ordinary
+// jitter cannot trip it, and PermitWithoutStream must match the agent: between
+// hub sessions there is no open stream, and that is exactly when the connection
+// still needs checking.
+//
+// What removing this option would actually cost is narrower than it looks, and
+// was measured rather than reasoned (issue #78). A hub without it does NOT trap
+// a running agent in a disconnect loop: 5 minutes of a real daemon against a
+// real default-policy hub produced one session, zero reconnects and zero pings.
+// The punishment needs THREE pings with no server write in between, and the
+// agent's 10s heartbeat prevents that twice over — grpc-go's client skips a
+// ping whenever the transport has been read from within the interval, and this
+// server zeroes its own strike counter on every response it writes
+// (setResetPingStrikes, http2_server.go). Both suppressors need the same thing:
+// a live heartbeat.
+//
+// That is a reason to keep this option, not to drop it. It is what protects the
+// connections nothing is heartbeating on — an idle one is punished at ~30s,
+// measured — and every punishment monotonically doubles that client's keepalive
+// interval (clientconn.go adjustParams), silently eroding the dead-transport
+// detection #72 exists to provide. tests/integration/oldhub_test.go pins the
+// whole shape against a fixture that keeps grpc-go's default here.
 const (
 	serverKeepaliveTime    = 15 * time.Second
 	serverKeepaliveTimeout = 5 * time.Second

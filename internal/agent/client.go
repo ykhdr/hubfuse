@@ -33,6 +33,18 @@ import (
 // connection still needs checking. The hub's EnforcementPolicy.MinTime must
 // stay below hubKeepaliveTime or the hub answers these pings with
 // GOAWAY too_many_pings (see hub.ServerOptions).
+//
+// Against a hub too old to carry that policy the consequence is smaller than it
+// sounds, and it was measured (issue #78). The punishment needs three pings
+// with no response written in between, and a running daemon never gets there:
+// grpc-go skips the ping entirely whenever the transport was read from within
+// hubKeepaliveTime, and the 10s heartbeat guarantees a read that often. Five
+// minutes against a real pre-#72 hub produced zero pings and zero disconnects.
+// So the two intervals are coupled in a way neither file states on its own:
+// this value is a ceiling on the heartbeat cadence, not just a liveness knob.
+// Raise defaultHeartbeatInterval past three of these and an old hub starts
+// killing the connection every ~30s — see heartbeat.go, which warns about
+// exactly that, and bounds_test.go, which pins the ordering.
 const (
 	hubKeepaliveTime    = 10 * time.Second
 	hubKeepaliveTimeout = 5 * time.Second
