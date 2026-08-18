@@ -136,6 +136,14 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "23.2"
+          # Without a token the action resolves the protoc download through the
+          # GitHub API unauthenticated, and the rate limit for that is per source
+          # IP — which Actions runners share. It then fails the job with
+          # "unable to get latest version" before running any of our code, so a
+          # busy hour or a GitHub incident turns this into a red pipeline that
+          # says nothing about the commit. The token raises the limit to the
+          # per-repository one.
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Go protoc plugins
         run: |
