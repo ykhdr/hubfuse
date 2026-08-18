@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ykhdr/hubfuse/internal/common"
@@ -69,6 +70,29 @@ func dialOptions(creds credentials.TransportCredentials) []grpc.DialOption {
 // refuses (typically because it already pruned the device) does not turn a
 // clean shutdown into a failure. (#69)
 var ErrHubRejected = errors.New("hub rejected the request")
+
+// isKeepalivePunished reports whether err is the transport dying because a hub
+// answered this agent's keepalive PINGs with GOAWAY too_many_pings — the
+// failure mode hubKeepaliveTime's comment warns about: a hub older than #72
+// runs grpc-go's default EnforcementPolicy (MinTime: 5m) and treats a 10s
+// ping cadence as abuse.
+//
+// The match is a plain substring test on err.Error() against "too_many_pings",
+// and deliberately not a typed check. grpc-go formats the GOAWAY frame's debug
+// data into the Unavailable status delivered to every stream on the dying
+// transport (internal/transport/http2_client.go:1417-1419 builds
+// goAwayDebugMessage, :1052-1053 embeds it), so "too_many_pings" survives
+// intact inside err.Error() through any %w wrapping this package or its
+// caller adds. The typed reason (GetGoAwayReason) lives on grpc-go's
+// unexported internal/transport types and is not reachable from here. And the
+// text itself is not grpc-go's to begin with — it is the debug string the
+// SERVER writes into the GOAWAY frame (google.golang.org/grpc's
+// internal/transport/http2_server.go:913 hardcodes "too_many_pings"), so it is
+// frozen in every already-deployed old hub regardless of which grpc-go version
+// this agent is built against; only the wrapper wording around it could change.
+func isKeepalivePunished(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "too_many_pings")
+}
 
 // HubClient wraps a gRPC connection to the hub.
 type HubClient struct {

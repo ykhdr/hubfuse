@@ -1101,6 +1101,59 @@ func TestReadStream_ExitsOnRecvError(t *testing.T) {
 	assert.GreaterOrEqual(t, calls, 2, "readStream should consume the event then exit on the next Recv error")
 }
 
+// keepalivePunishedErrStream returns a fake stream whose Recv always fails
+// with the verbatim error grpc-go delivers when a hub answers this agent's
+// keepalive PINGs with GOAWAY too_many_pings (issue #78).
+func keepalivePunishedErrStream() *fakeSubscribeStream {
+	return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		return nil, errors.New(`rpc error: code = Unavailable desc = closing transport due to: ` +
+			`connection error: desc = "error reading from server: EOF", received prior goaway: ` +
+			`code: ENHANCE_YOUR_CALM, debug data: "too_many_pings"`)
+	}}
+}
+
+// TestReadStream_LogsKeepalivePunishmentOnce verifies three things about the
+// #78 diagnostic:
+//
+//  1. an ORDINARY stream death (errStream, no "too_many_pings") never emits
+//     the keepalive-punishment Error — and, load-bearingly, does not consume
+//     keepalivePunishedOnce either. The check that decides whether to log must
+//     sit outside Once.Do, or the first ordinary error would burn the gate
+//     silently and a later genuine punishment would never be reported; this is
+//     the case that distinguishes a correct "classify, then Once.Do" from a
+//     buggy "Once.Do the classify".
+//  2. a punished death DOES emit it, at Error, naming the action ("upgrade the
+//     hub").
+//  3. a second punished death on the same Daemon does not repeat it — one
+//     Error for the daemon's lifetime.
+func TestReadStream_LogsKeepalivePunishmentOnce(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	buf := &syncBuffer{}
+	d.logger = captureLogger(buf)
+
+	// (1) An ordinary error first: must not log the punishment message, and
+	// must not spend the once-gate.
+	d.readStream(context.Background(), errStream())
+	logged := buf.String()
+	assert.Contains(t, logged, "level=WARN", "an ordinary stream death still logs the generic Warn")
+	assert.NotContains(t, logged, "upgrade the hub",
+		"an ordinary stream error must not be mistaken for a keepalive punishment")
+
+	// (2) A punished error: must log the Error exactly once, naming the action.
+	d.readStream(context.Background(), keepalivePunishedErrStream())
+	logged = buf.String()
+	assert.Contains(t, logged, "level=ERROR", "a keepalive punishment must be reported at Error")
+	assert.Equal(t, 1, strings.Count(logged, "upgrade the hub"),
+		"the punishment diagnostic must name the fix (upgrade the hub) exactly once so far")
+
+	// (3) A second punished error on the same Daemon: the gate must hold.
+	d.readStream(context.Background(), keepalivePunishedErrStream())
+	logged = buf.String()
+	assert.Equal(t, 1, strings.Count(logged, "upgrade the hub"),
+		"the punishment diagnostic must fire exactly once for the daemon's lifetime, not once per session")
+}
+
 // TestSessionOnce_OnReadyFiresExactlyOnce verifies that across multiple
 // sessionOnce calls (modelling the first session plus reconnects) the onReady
 // hook is invoked exactly once. The HubClient seam is overridden with fakes so
