@@ -1867,16 +1867,29 @@ func TestHeartbeatIntervalFromEnv(t *testing.T) {
 	const def = 10 * time.Second
 
 	tests := []struct {
-		name     string
-		raw      string
-		want     time.Duration
+		name string
+		raw  string
+		want time.Duration
+		// wantWarn: the value is rejected (malformed or non-positive), falls
+		// back to def, and warns. Unchanged from before this test grew a third
+		// case below — do not read wantDangerWarn as a variant of this.
 		wantWarn bool
+		// wantDangerWarn: the value is ACCEPTED and returned unchanged (this
+		// knob has no clamp), but it is at or past heartbeatDangerCadence, so
+		// it warns anyway. heartbeatIntervalFromEnv's wantWarn branch could not
+		// express this — a warn there always implied a fallback to def — so
+		// this is a new field, not a repurposing of the old one. (#78)
+		wantDangerWarn bool
 	}{
 		{name: "empty keeps default", raw: "", want: def},
 		{name: "valid override", raw: "250ms", want: 250 * time.Millisecond},
 		{name: "zero falls back", raw: "0s", want: def, wantWarn: true},
 		{name: "negative falls back", raw: "-5s", want: def, wantWarn: true},
 		{name: "garbage falls back", raw: "soon", want: def, wantWarn: true},
+		// def is 10s here, matching production hubKeepaliveTime, so
+		// heartbeatDangerCadence (3*hubKeepaliveTime) is 30s in this test too.
+		{name: "dangerous but accepted", raw: "45s", want: 45 * time.Second, wantDangerWarn: true},
+		{name: "just under the danger threshold, no warn", raw: "25s", want: 25 * time.Second},
 	}
 
 	for _, tt := range tests {
@@ -1884,10 +1897,26 @@ func TestHeartbeatIntervalFromEnv(t *testing.T) {
 			var buf bytes.Buffer
 			got := heartbeatIntervalFromEnv(tt.raw, def, captureLogger(&buf))
 			assert.Equal(t, tt.want, got)
-			if tt.wantWarn {
+			switch {
+			case tt.wantWarn:
 				assert.Contains(t, buf.String(), "HUBFUSE_HEARTBEAT_INTERVAL",
 					"a rejected value must be reported — a silently disabled heartbeat means guaranteed offline")
-			} else {
+			case tt.wantDangerWarn:
+				// Pins the message content, not just its presence: the warning
+				// must actually say the hub will mark the device offline (the
+				// consequence true against every hub), and it must say so
+				// before it mentions the pre-#72 GOAWAY path (the consequence
+				// true only against an old hub) — getting that order backwards
+				// is what would send an operator to upgrade their hub and leave
+				// them with the identical broken cadence.
+				out := buf.String()
+				assert.Contains(t, out, "mark this device offline",
+					"an accepted-but-dangerous cadence must warn that the hub will mark the device offline")
+				assert.Contains(t, out, "too_many_pings",
+					"the warning must also name the pre-#72 GOAWAY consequence")
+				assert.Less(t, strings.Index(out, "mark this device offline"), strings.Index(out, "too_many_pings"),
+					"the hub-agnostic consequence must be reported before the pre-#72-only one")
+			default:
 				assert.Empty(t, buf.String(), "an accepted value must not warn")
 			}
 		})
