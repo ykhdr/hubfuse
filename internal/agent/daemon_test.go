@@ -1833,6 +1833,228 @@ func TestRunHeartbeat_SuccessResetsFailureCount(t *testing.T) {
 		"the test must have run long enough to trip a counter that never resets")
 }
 
+// ─── Heartbeat failure log gate (#73) ─────────────────────────────────────────
+
+// startHeartbeatLoop runs d.runHeartbeat on ctx in its own goroutine and returns
+// a stop function that cancels ctx and BLOCKS until the loop has returned.
+//
+// The blocking wait is what makes the log-gate assertions below countable rather
+// than racy. The gate's whole subject is HOW MANY lines an outage produces, and
+// runHeartbeat writes every one of them from its own goroutine: a test that only
+// cancelled and then read the buffer could catch a tick still being written, so
+// two reads of the same "final" state would disagree and the count it asserted
+// on would be whichever one it happened to take. Waiting for the goroutine to
+// return makes "the buffer can no longer grow" an observed fact instead of an
+// assumption about scheduling. (#73)
+func startHeartbeatLoop(t *testing.T, d *Daemon, ctx context.Context, cancel context.CancelFunc) func() {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.runHeartbeat(ctx)
+	}()
+	return func() {
+		t.Helper()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the heartbeat loop did not return after its context was cancelled")
+		}
+	}
+}
+
+// TestRunHeartbeat_RepeatedErrorWarnsOnceAndStillDropsTheSession is the
+// load-bearing test of the #73 gate, because the two properties it pins pull in
+// opposite directions and each one alone can be satisfied by a broken gate.
+//
+// The LOG half: an outage whose error text does not change must produce exactly
+// ONE "heartbeat failed" WARN, however many ticks it lasts. Measured on master
+// before the gate, a five-minute outage wrote 53 log lines, 30 of them this WARN
+// and 24 of those byte-identical — 57% of the log of an outage was one repeated
+// sentence, and the share grows with the outage because the reconnect loop
+// decays to a line a minute while this one never did.
+//
+// The LIVENESS half, and the reason it belongs in this same test: suppression
+// must touch the LOG and nothing else. The obvious way to write this gate — spot
+// the repeat and `continue` — passes a log-only assertion while quietly skipping
+// noteHeartbeatFailure, and the daemon then never ends a session no matter how
+// long the hub stays silent. That is #72's application-level detector disabled by
+// #73's fix, and split across two tests it is invisible in both.
+func TestRunHeartbeat_RepeatedErrorWarnsOnceAndStillDropsTheSession(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	// syncBuffer, not bytes.Buffer: the loop under test writes from its own
+	// goroutine while the assertions read. Debug level, not captureLogger's
+	// WARN, because the gate is made of three levels and a WARN-only sink cannot
+	// tell "suppressed to Debug" from "dropped on the floor".
+	buf := &syncBuffer{}
+	d.logger = debugCaptureLogger(buf)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sessionCtx := d.newSessionCtx(ctx)
+
+	var calls atomic.Int32
+	// 25ms, not the 5ms the neighbouring tests use: this test also asserts that
+	// the session drops on the tick it always did, and the margin it compares
+	// against is measured in ticks. A cadence that short would make an ordinary
+	// scheduling hiccup on a loaded runner look like a delayed drop.
+	d.heartbeatInterval = 25 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		calls.Add(1)
+		// A fresh error VALUE per call carrying identical TEXT. The gate compares
+		// err.Error(), so returning one shared sentinel would prove less than the
+		// production case, where every tick really does build its own error.
+		return errors.New("hub is not answering")
+	}
+
+	stop := startHeartbeatLoop(t, d, ctx, cancel)
+	defer stop()
+
+	var beatsAtDrop int32
+	select {
+	case <-sessionCtx.Done():
+		beatsAtDrop = calls.Load()
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the session was never dropped despite continuous heartbeat failures; log:\n%s", buf.String())
+	}
+
+	assert.GreaterOrEqual(t, beatsAtDrop, int32(maxHeartbeatFailures),
+		"the session must survive fewer failures than the threshold")
+	assert.LessOrEqual(t, beatsAtDrop, int32(maxHeartbeatFailures)+2,
+		"suppressing the log must not delay the drop: every swallowed repeat still has to count")
+
+	// Beat well past the threshold before counting, so "exactly one WARN" is a
+	// property of the gate and not of a loop that had barely started.
+	require.Eventually(t, func() bool { return calls.Load() >= 4*int32(maxHeartbeatFailures) },
+		3*time.Second, 5*time.Millisecond,
+		"the loop must keep beating after the session it dropped")
+
+	stop()
+	logged := buf.String()
+
+	assert.Equal(t, 1, strings.Count(logged, `msg="heartbeat failed"`),
+		"an outage that repeats one error text must warn exactly once; log:\n%s", logged)
+	assert.Contains(t, logged, "heartbeat still failing with the same error",
+		"the swallowed repeats must stay reachable at Debug, not vanish; log:\n%s", logged)
+}
+
+// TestRunHeartbeat_ChangedErrorTextWarnsAgainAndCarriesTheSuppressedCount — the
+// gate keys on the error TEXT rather than on "an outage is in progress", because
+// the text changing is the only thing in this loop that carries new information.
+// A real outage walks through a stable sequence (keepalive ACK timeout →
+// DeadlineExceeded waiting for the connection → Canceled, client closing → TLS
+// handshake deadline, then repeat), and a gate keyed on the outage instead would
+// print the first of those and hide every step after it — turning "quieter" into
+// "less diagnosable", which is the opposite of what #73 asks for.
+//
+// The suppressed count riding onto the next visible line is the other half:
+// without it the only evidence of how long the previous error had been repeating
+// is the Debug lines, and the daemon's console runs at Info with no log file by
+// default, so nothing else records them.
+func TestRunHeartbeat_ChangedErrorTextWarnsAgainAndCarriesTheSuppressedCount(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	buf := &syncBuffer{}
+	d.logger = debugCaptureLogger(buf)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// One printed WARN plus three swallowed repeats, so the count that has to
+	// reach the next visible line is a number no other field could coincide with.
+	const firstErrBeats = 4
+
+	var calls atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		if calls.Add(1) <= firstErrBeats {
+			return errors.New("keepalive ping failed to receive ACK within timeout")
+		}
+		return errors.New("authentication handshake failed: context deadline exceeded")
+	}
+
+	stop := startHeartbeatLoop(t, d, ctx, cancel)
+	defer stop()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(buf.String(), "authentication handshake failed")
+	}, 3*time.Second, 5*time.Millisecond, "the second error must reach the log at all")
+
+	// Run on past the switch so the SECOND text has repeats of its own to
+	// swallow. Without this, "exactly two WARNs" could just mean the test stopped
+	// before a third one had a chance to be written.
+	require.Eventually(t, func() bool { return calls.Load() >= 3*firstErrBeats },
+		3*time.Second, 5*time.Millisecond)
+
+	stop()
+	logged := buf.String()
+
+	assert.Equal(t, 2, strings.Count(logged, `msg="heartbeat failed"`),
+		"each new error text warns once and only once; log:\n%s", logged)
+	assert.Equal(t, 1, strings.Count(logged, fmt.Sprintf("suppressed_repeats=%d", firstErrBeats-1)),
+		"the repeats swallowed under the old error must be carried onto the line that replaces it; log:\n%s", logged)
+}
+
+// TestRunHeartbeat_RecoveryLogsOnceAndResetsTheGate — a hub coming back used to
+// be entirely silent: failures simply stopped, which is not something a log
+// reader can observe. One Info line closes the outage, and it reports the total
+// including the swallowed repeats, since that total is now the only place the
+// length of the outage is written down at Info.
+//
+// The reset is the half that would rot quietly. If the gate remembered the last
+// printed text across a recovery, the NEXT outage — the same wifi dropping the
+// same way, which is how these actually recur — would open with no WARN at all,
+// and the gate would have converted a noisy log into a missing one.
+func TestRunHeartbeat_RecoveryLogsOnceAndResetsTheGate(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	buf := &syncBuffer{}
+	d.logger = debugCaptureLogger(buf)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// One printed WARN plus two swallowed repeats: the recovery line must report
+	// all three, not the one that was printed.
+	const outageBeats = 3
+
+	var calls atomic.Int32
+	d.heartbeatInterval = 5 * time.Millisecond
+	d.heartbeatFn = func(context.Context) error {
+		switch n := calls.Add(1); {
+		case n <= outageBeats:
+			return errors.New("hub is not answering")
+		case n == outageBeats+1:
+			return nil // the hub is back
+		default:
+			// Deliberately the SAME text as the first outage: that is the case a
+			// gate which forgot to reset gets wrong, and the case real life
+			// produces most often.
+			return errors.New("hub is not answering")
+		}
+	}
+
+	stop := startHeartbeatLoop(t, d, ctx, cancel)
+	defer stop()
+
+	require.Eventually(t, func() bool {
+		return strings.Count(buf.String(), `msg="heartbeat failed"`) >= 2
+	}, 3*time.Second, 5*time.Millisecond,
+		"the outage that follows a recovery must warn again even with an unchanged error text")
+
+	stop()
+	logged := buf.String()
+
+	assert.Equal(t, 1, strings.Count(logged, `msg="heartbeat recovered"`),
+		"a recovery is one line, not one per subsequent healthy beat; log:\n%s", logged)
+	assert.Contains(t, logged, fmt.Sprintf("after_failures=%d", outageBeats),
+		"the recovery line must count the swallowed repeats too, not just the printed one; log:\n%s", logged)
+	assert.Equal(t, 2, strings.Count(logged, `msg="heartbeat failed"`),
+		"exactly one WARN per outage: one before the recovery, one after; log:\n%s", logged)
+}
+
 // TestNewSessionCtx_CancelsPreviousAndClearsFailures — the supervisor starts a
 // new session on every reconnect; the old context must not be left dangling,
 // and the failures that ended the old session must not immediately end the new
@@ -1962,6 +2184,18 @@ agent {
 // goroutines must pass a syncBuffer, not a bare bytes.Buffer.
 func captureLogger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// debugCaptureLogger is captureLogger with the floor dropped to Debug, for the
+// heartbeat log-gate tests (#73). They cannot use the WARN-filtered one: the
+// gate is built out of three levels — WARN for a new error, Debug for a repeat,
+// Info for the recovery — and through a WARN-only sink "suppressed to Debug" and
+// "dropped on the floor" look identical, which is exactly the difference those
+// tests exist to tell apart. It is a separate helper rather than a level
+// parameter on captureLogger because every other caller wants the WARN filter
+// and would otherwise have to say so.
+func debugCaptureLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 // syncBuffer is a bytes.Buffer safe for a logger written from several
