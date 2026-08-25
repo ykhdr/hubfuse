@@ -115,6 +115,22 @@ type Daemon struct {
 	// a struct literal with no constructor call.
 	keepalivePunishedOnce sync.Once
 
+	// goos is the platform the macOS-specific diagnostics are judged against.
+	// A seam, not a setting: NewDaemon leaves it empty and osName() falls back
+	// to runtime.GOOS, while a test sets it to "darwin" so the branch is
+	// exercised on the Linux machines that actually run this suite. Hiding it
+	// behind a build tag instead would leave that branch untested everywhere
+	// except a developer's own Mac. (#74)
+	goos string
+
+	// localNetworkDeniedOnce gates the one-time Error naming macOS as the
+	// reason every dial fails (see isLocalNetworkDenial). Once per process, not
+	// once per episode: the condition persists until a human approves the
+	// binary, and the instruction for doing so never changes, so repeating it
+	// on every outage would be noise. Zero value works — buildTestDaemon builds
+	// Daemon as a struct literal. (#74)
+	localNetworkDeniedOnce sync.Once
+
 	// heartbeatInterval is the cadence of the heartbeat loop. NewDaemon sets
 	// defaultHeartbeatInterval, overridable via HUBFUSE_HEARTBEAT_INTERVAL (a
 	// test handle for scenario tests that shorten the hub's liveness timeout).
@@ -1019,6 +1035,29 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 	}
 }
 
+// hubAddress returns the hub address from the live config, or "" if the daemon
+// was assembled without one (test fixtures build Daemon as a literal). Read
+// under the same lock every other config reader takes, because the config
+// watcher replaces d.config wholesale on reload. (#74)
+// osName returns the platform this daemon should reason about, defaulting to
+// the real one. See the goos field. (#74)
+func (d *Daemon) osName() string {
+	if d.goos == "" {
+		return runtime.GOOS
+	}
+	return d.goos
+}
+
+func (d *Daemon) hubAddress() string {
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Hub.Address
+}
+
 // reconnectSession retries sessionOnce with exponential backoff
 // (minReconnectInterval → backoffMax) until it succeeds or ctx is cancelled. It
 // returns the live stream on success, or nil when ctx is cancelled (signalling
@@ -1064,6 +1103,11 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 	// IS the reset, so a later outage starts with its swap right intact.
 	swapSpent := false
 	exhaustionLogged := false
+	// Consecutive dial failures that look like macOS having revoked this
+	// binary's local-network access. Episode-local for the same reason
+	// swapSpent is: a streak only means anything unbroken, and leaving the loop
+	// IS the reset. (#74)
+	denialStreak := 0
 
 	delay := d.minReconnectInterval
 	if delay <= 0 {
@@ -1105,6 +1149,22 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 				"error", err,
 				"backoff", delay,
 			)
+		}
+
+		// A dial that keeps failing with EHOSTUNREACH against a LAN address on
+		// darwin is the one failure here whose cause the daemon can name and
+		// whose fix an operator can act on. Everything else in this loop
+		// reports what happened; this reports why, once, because the answer
+		// does not change until a human acts on it. (#74)
+		if isLocalNetworkDenial(d.osName(), d.hubAddress(), err) {
+			denialStreak++
+			if denialStreak >= localNetworkFailureStreak {
+				d.localNetworkDeniedOnce.Do(func() {
+					d.logger.Error(localNetworkDenialMessage())
+				})
+			}
+		} else {
+			denialStreak = 0
 		}
 
 		if errors.Is(err, errSessionTimedOut) {
