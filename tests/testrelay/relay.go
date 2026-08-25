@@ -19,12 +19,25 @@ import (
 // client keeps an ESTABLISHED socket that will never carry an answer again.
 // Connections accepted AFTER Break() are forwarded normally, which is what lets
 // a test observe recovery as well as the failure.
+//
+// BreakAll() extends that silence to connections accepted later. The pair mirrors
+// testwedge's Wedge()/WedgeAll(), and for the same reason: one fixture bounds a
+// failure the daemon can dial its way out of, the other one it cannot.
 type Relay struct {
 	Addr string
 
 	listener net.Listener
 	mu       sync.Mutex
 	pairs    []*connPair
+	// all silences every connection the relay accepts from now on (BreakAll).
+	// It is guarded by mu rather than being an atomic, so that the accept loop
+	// can read it in the SAME critical section that appends the new pair: with
+	// two separate synchronisations a connection accepted between BreakAll's
+	// store and the append would be dead by neither route — BreakAll's loop
+	// would not have seen it yet, and the accept loop would have read the flag
+	// before it was set. That connection would then carry traffic normally,
+	// which is precisely the state BreakAll exists to make unreachable.
+	all bool
 }
 
 // connPair is one accepted connection and its upstream counterpart. dead marks
@@ -63,6 +76,9 @@ func Start(t *testing.T, target string) *Relay {
 
 			pair := &connPair{client: client, upstream: upstream}
 			r.mu.Lock()
+			// Decide this pair's fate under the same lock that records it — see
+			// Relay.all for why the two cannot be split.
+			pair.dead.Store(r.all)
 			r.pairs = append(r.pairs, pair)
 			r.mu.Unlock()
 
@@ -79,6 +95,32 @@ func Start(t *testing.T, target string) *Relay {
 // forwarded as usual, which is what lets a test observe recovery too.
 func (r *Relay) Break() {
 	r.mu.Lock()
+	for _, pair := range r.pairs {
+		pair.dead.Store(true)
+	}
+	r.mu.Unlock()
+}
+
+// BreakAll silences every connection, present and future: nothing the relay
+// accepts from here on carries a byte either way, and no socket is ever closed.
+//
+// The difference from Break is NOT the state of the socket. Both leave the
+// sockets open and both keep reading and discarding, so the client's writes
+// never block under either — filling a TCP send buffer takes on the order of
+// 10^5-10^6 unread bytes (tcp_wmem autotuning), and a HubFuse agent sends a
+// few-hundred-byte heartbeat every 10s plus 9-byte keepalive PINGs. From the
+// client's side the two fixtures are indistinguishable.
+//
+// The difference is the DURATION of the failure. Break deliberately serves
+// connections opened after it, because its own tests (#72) need to observe the
+// daemon RECOVERING: keepalive tears the silent transport down after ~15s and
+// the next dial has to succeed. A test that instead needs the daemon held in the
+// failure — the idle-under-outage regression of #73, which measures CPU over a
+// 30s window — would see that recovery end its measurement halfway through.
+// BreakAll is that test's fixture, and is otherwise identical.
+func (r *Relay) BreakAll() {
+	r.mu.Lock()
+	r.all = true
 	for _, pair := range r.pairs {
 		pair.dead.Store(true)
 	}

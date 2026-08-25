@@ -148,6 +148,33 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 		rpcTimeout = minHeartbeatRPCTimeout
 	}
 
+	// Log-gate state for the failure path (issue #73). These are LOCALS, not
+	// Daemon fields: startHeartbeat runs this loop under a sync.Once for the
+	// daemon's entire lifetime, so exactly one goroutine ever reads or writes
+	// them, and a mutex here would guard against a writer that cannot exist.
+	// That is also why this does not reuse noteReconcileFailure's shape — that
+	// one needs a map and a mutex because it is keyed per mount and called from
+	// both the sweep and Mount; here neither is true.
+	var (
+		// lastLoggedErr is the text of the last failure printed at WARN. Empty
+		// means no outage is in progress, so the next failure always prints —
+		// including one whose text matches an outage that has since recovered.
+		lastLoggedErr string
+		// failures counts consecutive failures in the CURRENT outage, printed
+		// and suppressed alike. Deliberately not d.heartbeatFails: that one is
+		// reset whenever a new session comes up (newSessionCtx), which happens
+		// several times inside a single outage, so it cannot report how long
+		// the outage has actually been running.
+		failures int
+		// suppressed counts failures swallowed at Debug since the last WARN, so
+		// the next visible line can say how many repeats it stands for. Without
+		// it the gate would silently discard the only evidence of how long the
+		// same error had been repeating: the suppressed lines go to Debug, and
+		// the daemon's console runs at Info with no log file by default, so
+		// nothing else records them.
+		suppressed int
+	)
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -166,11 +193,50 @@ func (d *Daemon) runHeartbeat(ctx context.Context) {
 			err := d.heartbeatFn(beatCtx)
 			cancel()
 			if err == nil {
+				if failures > 0 {
+					// Recovery used to be completely silent: the only sign the
+					// hub had come back was failures ceasing, which is not
+					// something a log reader can see. (#73)
+					d.logger.Info("heartbeat recovered",
+						"after_failures", failures,
+						"suppressed_repeats", suppressed,
+					)
+					lastLoggedErr, failures, suppressed = "", 0, 0
+				}
 				d.clearHeartbeatFailures()
 				continue
 			}
 
-			d.logger.Warn("heartbeat failed", "error", err)
+			// Report the first failure of an outage and every CHANGE of its
+			// error, and drop the repeats to Debug — the same gate
+			// noteReconcileFailure applies to the mount loop, and what issue
+			// #73 asks for ("log at most once per state transition"). Measured
+			// before this gate: a five-minute outage produced 53 log lines, 30
+			// of them this WARN, 24 of those byte-identical; the reconnect loop
+			// meanwhile decayed correctly to one line a minute (backoffMax).
+			//
+			// Going quiet is safe precisely because of that decay: the
+			// supervisor keeps writing on its own backoff for as long as the
+			// outage lasts, so the log never falls silent — only the repeat
+			// does. An error whose text changes every tick (one embedding a
+			// duration, say) simply never suppresses, which is exactly today's
+			// behaviour and no worse.
+			failures++
+			if msg := err.Error(); msg != lastLoggedErr {
+				if suppressed > 0 {
+					d.logger.Warn("heartbeat failed", "error", err, "suppressed_repeats", suppressed)
+				} else {
+					d.logger.Warn("heartbeat failed", "error", err)
+				}
+				lastLoggedErr = msg
+				suppressed = 0
+			} else {
+				suppressed++
+				d.logger.Debug("heartbeat still failing with the same error",
+					"error", err,
+					"consecutive_failures", failures,
+				)
+			}
 
 			// Consecutive failures are the application-level evidence that this
 			// session is over. gRPC keepalive covers a transport nobody

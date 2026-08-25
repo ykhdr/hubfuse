@@ -523,6 +523,28 @@ func (a *Agent) MountMarker(dst string) string {
 	return filepath.Join(a.StubMountDir, sanitizeForMarker(dst)+".json")
 }
 
+// DaemonLog returns everything the daemon has written to stdout/stderr so far.
+// Unlike WaitForDaemonLog it makes no claim about what is in there — use it when
+// the assertion is about a COUNT of lines rather than the arrival of one, as the
+// #73 log-gate acceptance does.
+func (a *Agent) DaemonLog() string { return a.logBuf.String() }
+
+// DaemonPID reports the process id of this agent's running daemon.
+//
+// It is the process itself, not a re-exec'd child: scenarios launch
+// `hubfuse start` without --daemon, so no spawnAgentDaemon fork happens and the
+// pid the helper holds is the one doing the work. That matters for the #73 idle
+// regression, which reads this process's own /proc/<pid>/stat — pointed at a
+// parent that had forked and exited, it would measure zero CPU for a daemon
+// spinning on two cores and call it a pass.
+func (a *Agent) DaemonPID(t *testing.T) int {
+	t.Helper()
+	if a.daemonCmd == nil || a.daemonCmd.Process == nil {
+		t.Fatalf("DaemonPID: %s has no running daemon", a.Nickname)
+	}
+	return a.daemonCmd.Process.Pid
+}
+
 // WaitForDaemonLog polls this agent's captured daemon stdout/stderr until it
 // contains substr, failing the test after timeout. Use it to sequence a
 // scenario on the daemon's own progress rather than on external side effects.

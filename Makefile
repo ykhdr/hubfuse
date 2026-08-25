@@ -8,8 +8,14 @@ build:
 
 test: test-unit test-integration test-cli test-scenarios
 
+# ./tests/testrelay/... rides along with the unit tests rather than getting a CI
+# job of its own: it is a fixture package, no CI job covers ./tests/testrelay,
+# and a fixture whose own tests never run is a fixture nobody notices breaking.
+# The regressions built on it assert an ABSENCE (issue #73: the daemon stays idle
+# while the hub is unreachable), which a relay that had quietly stopped silencing
+# anything would satisfy too — green, and measuring the opposite of what it says.
 test-unit:
-	go test ./internal/...
+	go test ./internal/... ./tests/testrelay/...
 
 # 300s, not 180s: the old-hub compatibility test (issue #78) is timer-dominated
 # and costs ~34s on any machine — grpc-go clamps a client's keepalive interval
@@ -23,8 +29,14 @@ test-integration:
 test-cli:
 	go test ./tests/cli/...
 
+# 300s, not 180s, for the same reason test-integration moved: the idle-under-
+# outage regression (issue #73) is timer-dominated and costs ~55s — a 30s
+# measurement window that cannot be shortened without shrinking the sample, plus
+# the ~20s the daemon needs to notice the outage on its production 10s heartbeat
+# cadence. That put the package around 140s against a 180s limit, which is a thin
+# margin rather than a bound, and thin margins fail on slow runners.
 test-scenarios:
-	go test ./tests/scenarios/... -timeout 180s
+	go test ./tests/scenarios/... -timeout 300s
 
 test-race:
 	go test -race ./internal/agent/... -timeout 300s
