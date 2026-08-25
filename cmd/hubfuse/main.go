@@ -71,6 +71,7 @@ func rootCmd() *cobra.Command {
 		renameCmd(),
 		shareCmd,
 		mountCmd,
+		installAgentCmd(),
 		versionCmd(),
 	)
 	return cmd
