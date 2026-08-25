@@ -531,6 +531,9 @@ func (a *Agent) MountMarker(dst string) string {
 // the stub marker alone appears up to one verify poll-interval EARLIER, and
 // killing the stub inside that window aborts the still-in-flight mount (no
 // activeMounts entry, nothing to heal) instead of creating a dead mount.
+// DaemonLog returns everything the daemon has written to stdout/stderr so far.
+func (a *Agent) DaemonLog() string { return a.logBuf.String() }
+
 func (a *Agent) WaitForDaemonLog(t *testing.T, substr string, timeout time.Duration) {
 	t.Helper()
 	a.WaitForDaemonLogCount(t, substr, 1, timeout)
