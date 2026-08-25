@@ -29,8 +29,14 @@ test-integration:
 test-cli:
 	go test ./tests/cli/...
 
+# 300s, not 180s, for the same reason test-integration moved: the idle-under-
+# outage regression (issue #73) is timer-dominated and costs ~55s — a 30s
+# measurement window that cannot be shortened without shrinking the sample, plus
+# the ~20s the daemon needs to notice the outage on its production 10s heartbeat
+# cadence. That put the package around 140s against a 180s limit, which is a thin
+# margin rather than a bound, and thin margins fail on slow runners.
 test-scenarios:
-	go test ./tests/scenarios/... -timeout 180s
+	go test ./tests/scenarios/... -timeout 300s
 
 test-race:
 	go test -race ./internal/agent/... -timeout 300s
