@@ -45,7 +45,7 @@ type AgentConfig struct {
 type ShareConfig struct {
 	Path           string
 	Alias          string
-	Permissions    string   // "ro" | "rw"
+	Permissions    string // "ro" | "rw"
 	AllowedDevices []string
 }
 

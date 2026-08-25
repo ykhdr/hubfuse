@@ -139,7 +139,7 @@ func TestIntegration_Pairing_FullFlow(t *testing.T) {
 	// B confirms pairing.
 	confirmResp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
 		InviteCode: inviteCode,
-		PublicKey: pubKeyB,
+		PublicKey:  pubKeyB,
 	})
 	if err != nil {
 		t.Fatalf("ConfirmPairing: %v", err)
@@ -203,7 +203,7 @@ func TestIntegration_Pairing_WrongInviteCode(t *testing.T) {
 	// B tries to confirm with an incorrect code.
 	resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
 		InviteCode: "HUB-BAD-CODE",
-		PublicKey: "pk-b",
+		PublicKey:  "pk-b",
 	})
 	if err != nil {
 		t.Fatalf("ConfirmPairing transport error: %v", err)
@@ -241,7 +241,7 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
 			InviteCode: "HUB-BAD-XYZ",
-			PublicKey: "pk-b",
+			PublicKey:  "pk-b",
 		})
 		if err != nil {
 			t.Fatalf("ConfirmPairing attempt %d transport error: %v", i, err)
@@ -267,7 +267,7 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	// first ConfirmPairing success. After success the invite is gone, so subsequent calls fail.
 	resp, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
 		InviteCode: code,
-		PublicKey: "pk-b",
+		PublicKey:  "pk-b",
 	})
 	if err != nil {
 		t.Fatalf("ConfirmPairing transport error: %v", err)
@@ -279,7 +279,7 @@ func TestIntegration_Pairing_MaxAttempts(t *testing.T) {
 	// Second attempt must fail since the invite was deleted.
 	resp2, err := clientB.ConfirmPairing(context.Background(), &pb.ConfirmPairingRequest{
 		InviteCode: code,
-		PublicKey: "pk-b",
+		PublicKey:  "pk-b",
 	})
 	if err != nil {
 		t.Fatalf("second ConfirmPairing transport error: %v", err)
