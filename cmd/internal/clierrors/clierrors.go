@@ -206,6 +206,35 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		}
 		return msg, true
 	case codes.Unavailable:
+		// Transport failures are checked FIRST, because codes.Unavailable
+		// carries two unrelated meanings here and only the content tells them
+		// apart: the hub's own service returns it for "that peer device is
+		// offline" (see statusFromMessage), and grpc-go returns it for "this
+		// client could not reach the hub at all".
+		//
+		// Asking extractNickname first got the second case badly wrong. grpc-go
+		// wraps a dial failure as
+		//
+		//	connection error: desc = "transport: Error while dialing: dial tcp
+		//	192.168.31.158:9090: connect: no route to host"
+		//
+		// and quotedDoubleRe happily takes the first quoted run it finds, so an
+		// operator whose hub was unreachable was told
+		//
+		//	error: device "transport: Error while dialing: … no route to host" is offline
+		//
+		// — a transport error presented as the name of a device that does not
+		// exist. The HubAddr branch below, which knows how to say this properly,
+		// could never be reached, because extractNickname always matched first.
+		// Observed on a macOS agent whose local-network access had been revoked
+		// (issue #74), where it sent the reader looking for a peer instead of at
+		// the hub connection.
+		if isTransportFailure(msg) {
+			if ctx.HubAddr != "" {
+				return fmt.Sprintf("cannot reach hub at %s: %s", ctx.HubAddr, msg), true
+			}
+			return "cannot reach the hub: " + msg, true
+		}
 		if nick := extractNickname(msg); nick != "" {
 			return fmt.Sprintf("device %q is offline", nick), true
 		}
@@ -263,6 +292,41 @@ func translateStatus(err error, ctx Context) (string, bool) {
 		}
 		return msg, true
 	}
+}
+
+// transportFailureMarkers are phrases only grpc-go's own transport layer
+// produces. None of them can occur in the hub's application-level messages,
+// which are written in internal/hub/server.go and talk about devices,
+// nicknames and shares — so a message carrying one of these is about reaching
+// the hub, never about a peer.
+//
+// Matching on text rather than on a typed error is forced: by the time an error
+// reaches this package it is a grpc status whose Message() is a formatted
+// string, and the underlying net.OpError (with its syscall.Errno) has not
+// survived. The list is deliberately short and specific for that reason —
+// every entry is a fixed grpc-go phrasing, not a guess at what a failure might
+// look like. (#74)
+var transportFailureMarkers = []string{
+	"connection error:",         // dial and handshake failures
+	"transport:",                // the transport layer naming itself
+	"keepalive ping failed",     // a connection that stopped answering (#72)
+	"error reading from server", // the peer went away mid-stream
+	"last connection error:",    // reported by the pick path after retries
+	"name resolver error",       // the address could not be resolved at all
+}
+
+// isTransportFailure reports whether msg describes a failure to reach the hub
+// rather than an application-level answer from it. See the codes.Unavailable
+// branch in translateStatus for why this has to be decided before any attempt
+// to read a nickname out of the message. (#74)
+func isTransportFailure(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, marker := range transportFailureMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractNickname(msg string) string {
