@@ -70,11 +70,14 @@ const (
 	// aDeathDeadline bounds how long the test waits for connection A's stream
 	// to die. Measured twice independently against a real old-policy hub, the
 	// GOAWAY lands at ~30.07s after the last RPC (three ping-strike cycles at
-	// the clamped 10s floor). 50s leaves roughly 20s of margin above that
-	// measurement for a slow CI box, while still bounding the test — raising
-	// it further would turn "the fixture stopped punishing" into a silent
-	// hang instead of a loud failure. In the common case the test returns as
-	// soon as A's death is observed (around 30s), not after the full 50s.
+	// the clamped 10s floor); this test observes it at 31.00s ±2ms across five
+	// consecutive runs, the extra second being B's and C's setup, which happens
+	// after A's last RPC but before the shared clock starts (see `start`).
+	// 50s leaves roughly 19s of margin above that measurement for a slow CI
+	// box, while still bounding the test — raising it further would turn "the
+	// fixture stopped punishing" into a silent hang instead of a loud failure.
+	// In the common case the test returns as soon as A's death is observed
+	// (around 31s), not after the full 50s.
 	aDeathDeadline = 50 * time.Second
 )
 
@@ -225,8 +228,11 @@ func heartbeatLoop(ctx context.Context, client *agent.HubClient, interval time.D
 //
 // Runtime cost: this test normally finishes in ~30-35s (however long A
 // actually takes to die) and is bounded at aDeathDeadline plus a few seconds
-// of setup/teardown, comfortably inside tests/integration's shared 180s
-// budget.
+// of setup/teardown. That cost is why the Makefile raised the integration
+// package's shared budget from 180s to 300s in this same branch — see the
+// comment on `test-integration`: this window is timer-dominated and cannot be
+// shortened, because grpc-go clamps the client's keepalive interval to a 10s
+// floor.
 //
 // All three streams are read from their own goroutine, and every assertion
 // below is made on the OBSERVED STREAM OUTCOME per connection — never on
@@ -242,9 +248,14 @@ func TestIntegration_OldHubToleratesHeartbeatingAgent(t *testing.T) {
 	connB, streamB := setupOldHubConnection(t, h, oldHubAddr, "oldhub-cadence10-dev", "oldhub-cadence10", 2223)
 	connC, streamC := setupOldHubConnection(t, h, oldHubAddr, "oldhub-cadence25-dev", "oldhub-cadence25", 2224)
 
-	// All three connections are registered and subscribed — the clock for
-	// "last RPC" starts now, matching the measured reference (elapsed from
-	// the last RPC to GOAWAY, not from process start).
+	// All three connections are registered and subscribed — the shared clock
+	// starts now, which is the closest single reference point to the measured
+	// one (elapsed from a connection's last RPC to its GOAWAY, not from
+	// process start). It is not exact for A: A's last RPC was its Subscribe,
+	// which precedes B's and C's setup, so every elapsed figure reported for A
+	// is that setup cost too high. That is why it reads ~31s here against the
+	// ~30.07s reference, and why aDeathDeadline is a bound with a full 19s of
+	// margin rather than an equality check.
 	start := time.Now()
 
 	deadA := watchStreamDeath(streamA, start)
@@ -265,7 +276,7 @@ func TestIntegration_OldHubToleratesHeartbeatingAgent(t *testing.T) {
 	// box nor pads out the common case.
 	select {
 	case dA := <-deadA:
-		t.Logf("connection A (silent) stream died at %s elapsed since last RPC: %v", dA.at.Round(time.Millisecond), dA.err)
+		t.Logf("connection A (silent) stream died at %s elapsed since the shared clock started: %v", dA.at.Round(time.Millisecond), dA.err)
 
 		// Pin the reason, not just the death. Two things ride on this string.
 		//
@@ -289,8 +300,9 @@ func TestIntegration_OldHubToleratesHeartbeatingAgent(t *testing.T) {
 			"connection A must die of the keepalive punishment specifically, and the reason must "+
 				"remain visible in the error an application can see")
 	case <-time.After(aDeathDeadline):
-		t.Fatalf("connection A (silent) stream did not die within %s of the last RPC — "+
-			"the old-hub fixture stopped punishing an idle connection (measured reference ~30.07s); "+
+		t.Fatalf("connection A (silent) stream did not die within %s of the shared clock starting — "+
+			"the old-hub fixture stopped punishing an idle connection (observed here at ~31.0s, "+
+			"measured reference ~30.07s from the last RPC); "+
 			"this positive control failing means the regression assertions below would be meaningless even if they passed",
 			aDeathDeadline)
 	}
