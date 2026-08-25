@@ -126,6 +126,40 @@ reason. Anything at or above 30 seconds exceeds the hub's own liveness timeout,
 so the hub marks the device offline and peers unmount its shares — against any
 hub version, not just old ones.
 
+### Running the agent on macOS
+
+macOS gates access to the local network **per binary**, and grants it only
+through a GUI prompt. That has two consequences a HubFuse user will hit:
+
+- A daemon started over SSH can never be shown the prompt. It registers with the
+  hub, works for roughly forty seconds, and is then cut off: every dial fails
+  with `connect: no route to host` while `ping` to the same hub keeps working.
+- The approval is bound to that exact binary. Rebuilding or reinstalling
+  `hubfuse` changes its identity, and you have to approve the new one.
+
+The supported way to run it is as a LaunchAgent in your logged-in GUI session,
+where the prompt can actually appear:
+
+```bash
+hubfuse install-agent                                  # writes the plist
+launchctl bootstrap gui/$(id -u) \
+    ~/Library/LaunchAgents/com.github.ykhdr.hubfuse.plist
+```
+
+Run the `launchctl` line **from a terminal on the Mac itself**, not over SSH,
+and approve the local-network prompt when it appears. If you miss it, the
+setting is under System Settings → Privacy & Security → Local Network.
+
+From v0.1.4 the agent detects this state and says so once, at error level,
+instead of logging a dial failure every retry forever. It only does so when the
+hub address is actually on the local network — `no route to host` to a routable
+address is an ordinary routing problem and is reported as one.
+
+One more macOS detail, unrelated to permissions: binaries that are not
+code-signed are killed on launch by macOS 26 (`Killed: 9`, with no output). A
+binary you built yourself locally is signed by the toolchain; one copied from
+elsewhere may not be, and `codesign -f -s - ./hubfuse` fixes it.
+
 ### Prebuilt binaries
 
 If you don't have Go, prebuilt binaries are published on the project's
