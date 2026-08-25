@@ -23,3 +23,19 @@ linters:
       - linters:
           - staticcheck
         text: "SA9003:"
+
+issues:
+  # Default is 3, and when it truncates it prints no "N more" marker at all:
+  # the four unformatted files of issue #79 were reported as three, with
+  # nothing to say one was withheld. A check that silently under-reports is
+  # the same failure mode as a check that silently checks nothing.
+  max-same-issues: 0
+
+# Formatters are a separate top-level section in golangci-lint v2 — putting
+# `gofmt` under `linters.enable` is not a no-op but a hard config error
+# ("gofmt is a formatter"). `golangci-lint run`, which is what
+# golangci-lint-action invokes, reports what is enabled here and exits
+# non-zero on it, so this needs no extra CI step (issue #79).
+formatters:
+  enable:
+    - gofmt

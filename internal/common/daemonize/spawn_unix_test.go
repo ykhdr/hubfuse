@@ -59,7 +59,10 @@ func TestMain(m *testing.M) {
 		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 		// Drain incoming signals so they don't terminate the process,
 		// but stay alive on a deadline as a safety net for a runaway test.
-		go func() { for range sigCh {} }()
+		go func() {
+			for range sigCh {
+			}
+		}()
 		time.Sleep(60 * time.Second)
 		os.Exit(0)
 	}
