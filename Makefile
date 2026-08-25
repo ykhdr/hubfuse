@@ -32,6 +32,13 @@ test-race:
 vet:
 	go vet ./...
 
+# `lint` has been in .PHONY since the beginning with no recipe behind it, so
+# `make lint` silently did nothing. This is the invocation the CI Lint job
+# runs (golangci-lint-action calls `golangci-lint run` with no args); needs
+# golangci-lint v2 — the v2 config file is rejected outright by a v1 binary.
+lint:
+	golangci-lint run
+
 clean:
 	rm -f hubfuse-hub hubfuse
 
