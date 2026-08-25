@@ -239,8 +239,33 @@ keepalive и не объявляет macOS-поведение багом HubFuse
 - [x] `CLAUDE.md`: буллет про clierrors и про классификатор, с номером issue
 
 ### Task 5: приёмка
-- [ ] `make build && make vet && make test` целиком зелёные
-- [ ] перенести этот план в `docs/plans/completed/` **в этой же ветке до PR**
+- [x] `make build && make vet && make test` целиком зелёные
+- [x] перенести этот план в `docs/plans/completed/` **в этой же ветке до PR**
+
+## Приёмка (2026-08-26)
+
+| Команда | Результат |
+|---|---|
+| `make build`, `make vet`, `gofmt -l ./cmd ./internal ./tests` | ok, пусто |
+| `make test-unit` | ok (`internal/agent` 34.8 с, `internal/hub` 37.1 с) |
+| `make test-integration` | ok, 105.5 с |
+| `make test-cli` | ok, 2.0 с |
+| `make test-scenarios` | ok, 83.4 с |
+| `go test -race ./internal/agent/...` | ok, 36.5 с |
+| новые тесты `-count=5` | 5/5 (`clierrors`, `cmd/hubfuse`, классификатор + обе ветки reconnect) |
+
+**Доказано, что тесты падают без фикса, а не просто зелены.** Для Task 1 порядок в
+`translateStatus` был временно возвращён к прежнему, и оба новых `Format`-теста упали ровно с тем
+сообщением, ради которого заводились:
+`error: device "transport: Error while dialing: … no route to host" is offline`.
+
+**⚠️ Не доведено: приёмка нового диагностического сообщения на самом маке.** Бинарь этой ветки
+собран, подписан и запущен на маке в 16:53Z; через несколько минут мак перестал принимать SSH
+(ICMP и mDNS отвечают с задержкой 300-1300 мс — это спящая машина с прокси Bonjour, а не живой
+хост). Логика покрыта юнит-тестами (включая дословную ошибку с мака и обе ветки reconnect'а), но
+строку Error в реальном логе демона увидеть не удалось. Это остаётся в Post-Completion вместе с
+одобрением GUI-промпта, которое всё равно требует человека у экрана. На маке остался
+`/tmp/hf74` и `/tmp/hf74.log` — убрать при следующем доступе.
 
 ## Post-Completion
 
