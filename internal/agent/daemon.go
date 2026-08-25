@@ -105,6 +105,16 @@ type Daemon struct {
 	// lifetime. See startHeartbeat. (#69)
 	heartbeatOnce sync.Once
 
+	// keepalivePunishedOnce gates the one-time Error log for a hub that answers
+	// this agent's keepalive PINGs with GOAWAY too_many_pings (see
+	// isKeepalivePunished). The punishment is per-connection but the daemon
+	// reconnects against the same too-old hub repeatedly, so an ungated log
+	// would repeat every session and say nothing new after the first time; one
+	// Error for the whole process lifetime is enough to point an operator at
+	// the fix (issue #78). Zero value works — buildTestDaemon builds Daemon as
+	// a struct literal with no constructor call.
+	keepalivePunishedOnce sync.Once
+
 	// heartbeatInterval is the cadence of the heartbeat loop. NewDaemon sets
 	// defaultHeartbeatInterval, overridable via HUBFUSE_HEARTBEAT_INTERVAL (a
 	// test handle for scenario tests that shorten the hub's liveness timeout).
@@ -849,10 +859,21 @@ var (
 //     proves the connection works;
 //   - a hub that answers DeadlineExceeded itself is also a completed round-trip,
 //     and a classifier reading status codes would have condemned it;
-//   - and in the one failure mode the grpc-go source actually documents
-//     (draining after GOAWAY), every attempt's code is Unavailable while the
-//     call dies on the caller's deadline — so a code-based classifier would miss
-//     precisely the case this exists for. (#77)
+//   - and in the failure mode the grpc-go source documents (a transport left
+//     draining after a GOAWAY, still being called), every attempt's code is
+//     Unavailable while the call dies on the caller's deadline — so a
+//     code-based classifier would miss precisely the case this exists for. (#77)
+//
+// One clarification, because the sentence above invites the wrong inference and
+// measurement settled it (issue #78): a GOAWAY does not by itself put a session
+// on this path. In the clean punishment cycle — an old hub answering the
+// agent's keepalive with GOAWAY too_many_pings — the hub closes the connection
+// about a second later, so calls fail FAST with Unavailable, our budget never
+// expires, and no replacement is triggered (measured: zero replacement dials).
+// The shape this sentinel is for is the transport that keeps its socket and
+// answers PINGs while calls go nowhere, which is a different thing that happens
+// to share a status code. That is the whole reason the classifier reads whose
+// deadline fired rather than the code — do not "simplify" it back to codes.
 var errSessionTimedOut = errors.New("hub session attempt exceeded its own deadline")
 
 // ourBudgetExpired reports whether a failed call failed because the daemon's own
@@ -963,7 +984,11 @@ func (d *Daemon) clearHeartbeatFailures() {
 // readStream consumes events from the hub subscription until Recv returns an
 // error or ctx is cancelled. A Recv error after ctx cancellation is the normal
 // shutdown path (no warning); otherwise the hub session has died and the caller
-// (supervise) reconnects.
+// (supervise) reconnects. If the death is specifically a hub answering this
+// agent's keepalive with GOAWAY too_many_pings, that also gets one Error log
+// for the daemon's lifetime (see keepalivePunishedOnce) — the generic Warn
+// above says a session died, not why, and this is the one case where the why
+// is both diagnosable from here and actionable by an operator (issue #78).
 func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClient) {
 	for {
 		event, err := stream.Recv()
@@ -973,6 +998,20 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 				return
 			default:
 				d.logger.Warn("event stream error", "error", err)
+				if isKeepalivePunished(err) {
+					// The classifier, not the Once, decides whether this error
+					// qualifies — Once.Do must not wrap the check itself, or the
+					// first ORDINARY stream error would consume the gate and a
+					// later genuine punishment would never be reported. (#78)
+					d.keepalivePunishedOnce.Do(func() {
+						d.logger.Error("hub rejected this agent's keepalive with GOAWAY too_many_pings: " +
+							"the hub predates the keepalive enforcement policy this agent requires — " +
+							"upgrade the hub (hubs are upgraded before agents); until then gRPC doubles " +
+							"this connection's keepalive interval on every such rejection (grpc-go " +
+							"clientconn.go:1302-1313, monotonic, per-ClientConn), which weakens this " +
+							"agent's own detection of a dead hub connection (issue #72)")
+					})
+				}
 				return
 			}
 		}

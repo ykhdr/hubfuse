@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -10,10 +11,56 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/ykhdr/hubfuse/proto"
 )
+
+// ─── isKeepalivePunished ────────────────────────────────────────────────────────
+
+// TestIsKeepalivePunished pins the classifier to a plain substring match on
+// err.Error(). The first case is the verbatim text measured from a live
+// Subscribe stream's Recv against a hub running grpc-go's default
+// EnforcementPolicy (MinTime: 5m) — see isKeepalivePunished's comment for why
+// a substring match, rather than a typed check, is the correct one here.
+func TestIsKeepalivePunished(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "verbatim GOAWAY too_many_pings error from a punished transport",
+			err: errors.New(`rpc error: code = Unavailable desc = closing transport due to: ` +
+				`connection error: desc = "error reading from server: EOF", received prior goaway: ` +
+				`code: ENHANCE_YOUR_CALM, debug data: "too_many_pings"`),
+			want: true,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "ordinary Unavailable error unrelated to keepalive enforcement",
+			err:  status.Error(codes.Unavailable, "transport is closing"),
+			want: false,
+		},
+		{
+			name: "context cancellation",
+			err:  context.Canceled,
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isKeepalivePunished(tc.err))
+		})
+	}
+}
 
 // ─── A hub that answers, over a real connection ───────────────────────────────
 

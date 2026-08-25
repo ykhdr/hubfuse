@@ -1101,6 +1101,59 @@ func TestReadStream_ExitsOnRecvError(t *testing.T) {
 	assert.GreaterOrEqual(t, calls, 2, "readStream should consume the event then exit on the next Recv error")
 }
 
+// keepalivePunishedErrStream returns a fake stream whose Recv always fails
+// with the verbatim error grpc-go delivers when a hub answers this agent's
+// keepalive PINGs with GOAWAY too_many_pings (issue #78).
+func keepalivePunishedErrStream() *fakeSubscribeStream {
+	return &fakeSubscribeStream{recv: func() (*pb.Event, error) {
+		return nil, errors.New(`rpc error: code = Unavailable desc = closing transport due to: ` +
+			`connection error: desc = "error reading from server: EOF", received prior goaway: ` +
+			`code: ENHANCE_YOUR_CALM, debug data: "too_many_pings"`)
+	}}
+}
+
+// TestReadStream_LogsKeepalivePunishmentOnce verifies three things about the
+// #78 diagnostic:
+//
+//  1. an ORDINARY stream death (errStream, no "too_many_pings") never emits
+//     the keepalive-punishment Error — and, load-bearingly, does not consume
+//     keepalivePunishedOnce either. The check that decides whether to log must
+//     sit outside Once.Do, or the first ordinary error would burn the gate
+//     silently and a later genuine punishment would never be reported; this is
+//     the case that distinguishes a correct "classify, then Once.Do" from a
+//     buggy "Once.Do the classify".
+//  2. a punished death DOES emit it, at Error, naming the action ("upgrade the
+//     hub").
+//  3. a second punished death on the same Daemon does not repeat it — one
+//     Error for the daemon's lifetime.
+func TestReadStream_LogsKeepalivePunishmentOnce(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+
+	buf := &syncBuffer{}
+	d.logger = captureLogger(buf)
+
+	// (1) An ordinary error first: must not log the punishment message, and
+	// must not spend the once-gate.
+	d.readStream(context.Background(), errStream())
+	logged := buf.String()
+	assert.Contains(t, logged, "level=WARN", "an ordinary stream death still logs the generic Warn")
+	assert.NotContains(t, logged, "upgrade the hub",
+		"an ordinary stream error must not be mistaken for a keepalive punishment")
+
+	// (2) A punished error: must log the Error exactly once, naming the action.
+	d.readStream(context.Background(), keepalivePunishedErrStream())
+	logged = buf.String()
+	assert.Contains(t, logged, "level=ERROR", "a keepalive punishment must be reported at Error")
+	assert.Equal(t, 1, strings.Count(logged, "upgrade the hub"),
+		"the punishment diagnostic must name the fix (upgrade the hub) exactly once so far")
+
+	// (3) A second punished error on the same Daemon: the gate must hold.
+	d.readStream(context.Background(), keepalivePunishedErrStream())
+	logged = buf.String()
+	assert.Equal(t, 1, strings.Count(logged, "upgrade the hub"),
+		"the punishment diagnostic must fire exactly once for the daemon's lifetime, not once per session")
+}
+
 // TestSessionOnce_OnReadyFiresExactlyOnce verifies that across multiple
 // sessionOnce calls (modelling the first session plus reconnects) the onReady
 // hook is invoked exactly once. The HubClient seam is overridden with fakes so
@@ -1814,16 +1867,29 @@ func TestHeartbeatIntervalFromEnv(t *testing.T) {
 	const def = 10 * time.Second
 
 	tests := []struct {
-		name     string
-		raw      string
-		want     time.Duration
+		name string
+		raw  string
+		want time.Duration
+		// wantWarn: the value is rejected (malformed or non-positive), falls
+		// back to def, and warns. Unchanged from before this test grew a third
+		// case below — do not read wantDangerWarn as a variant of this.
 		wantWarn bool
+		// wantDangerWarn: the value is ACCEPTED and returned unchanged (this
+		// knob has no clamp), but it is at or past heartbeatDangerCadence, so
+		// it warns anyway. heartbeatIntervalFromEnv's wantWarn branch could not
+		// express this — a warn there always implied a fallback to def — so
+		// this is a new field, not a repurposing of the old one. (#78)
+		wantDangerWarn bool
 	}{
 		{name: "empty keeps default", raw: "", want: def},
 		{name: "valid override", raw: "250ms", want: 250 * time.Millisecond},
 		{name: "zero falls back", raw: "0s", want: def, wantWarn: true},
 		{name: "negative falls back", raw: "-5s", want: def, wantWarn: true},
 		{name: "garbage falls back", raw: "soon", want: def, wantWarn: true},
+		// def is 10s here, matching production hubKeepaliveTime, so
+		// heartbeatDangerCadence (3*hubKeepaliveTime) is 30s in this test too.
+		{name: "dangerous but accepted", raw: "45s", want: 45 * time.Second, wantDangerWarn: true},
+		{name: "just under the danger threshold, no warn", raw: "25s", want: 25 * time.Second},
 	}
 
 	for _, tt := range tests {
@@ -1831,10 +1897,26 @@ func TestHeartbeatIntervalFromEnv(t *testing.T) {
 			var buf bytes.Buffer
 			got := heartbeatIntervalFromEnv(tt.raw, def, captureLogger(&buf))
 			assert.Equal(t, tt.want, got)
-			if tt.wantWarn {
+			switch {
+			case tt.wantWarn:
 				assert.Contains(t, buf.String(), "HUBFUSE_HEARTBEAT_INTERVAL",
 					"a rejected value must be reported — a silently disabled heartbeat means guaranteed offline")
-			} else {
+			case tt.wantDangerWarn:
+				// Pins the message content, not just its presence: the warning
+				// must actually say the hub will mark the device offline (the
+				// consequence true against every hub), and it must say so
+				// before it mentions the pre-#72 GOAWAY path (the consequence
+				// true only against an old hub) — getting that order backwards
+				// is what would send an operator to upgrade their hub and leave
+				// them with the identical broken cadence.
+				out := buf.String()
+				assert.Contains(t, out, "mark this device offline",
+					"an accepted-but-dangerous cadence must warn that the hub will mark the device offline")
+				assert.Contains(t, out, "too_many_pings",
+					"the warning must also name the pre-#72 GOAWAY consequence")
+				assert.Less(t, strings.Index(out, "mark this device offline"), strings.Index(out, "too_many_pings"),
+					"the hub-agnostic consequence must be reported before the pre-#72-only one")
+			default:
 				assert.Empty(t, buf.String(), "an accepted value must not warn")
 			}
 		})

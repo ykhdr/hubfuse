@@ -50,6 +50,54 @@ func TestRegisterBudgetOutlastsKeepaliveDetection(t *testing.T) {
 		"the same ordering must hold for the subscribe-establishment budget")
 }
 
+// ─── Heartbeat cadence vs. a pre-#72 hub's keepalive enforcement ──────────────
+
+// TestHeartbeatCadenceCompatibleWithPreIssue72Hub pins an otherwise unwritten
+// relationship between two constants living in two different files:
+// defaultHeartbeatInterval (heartbeat.go) and hubKeepaliveTime (client.go).
+//
+// A hub older than issue #72 runs grpc-go's default keepalive enforcement
+// policy (MinTime: 5m) and answers a client that pings more often than that
+// with GOAWAY too_many_pings. Two independent mechanisms are what keep a
+// running agent's 10s ping cadence from ever triggering that punishment —
+// both documented at length in hubKeepaliveTime's comment in client.go, and
+// both measured end-to-end in tests/integration/oldhub_test.go, which brings
+// up a real grpc-go server running the old enforcement policy:
+//
+//   - grpc-go's client SKIPS a keepalive ping entirely whenever the transport
+//     has had a read within the last hubKeepaliveTime. A response to the
+//     agent's own heartbeat RPC is such a read, so
+//     defaultHeartbeatInterval <= hubKeepaliveTime keeps a ping from being
+//     emitted in the first place — the strong property, and the reason a
+//     live agent produced zero pings and zero disconnects across five
+//     measured minutes against a real pre-#72 hub.
+//   - Even granting a ping fires anyway, the hub's ping-strike counter is
+//     reset to zero on every response it WRITES (setResetPingStrikes), and
+//     GOAWAY only fires once strikes exceed 2 (maxPingStrikes — three
+//     strikes). So the weaker, more fundamental bound is
+//     defaultHeartbeatInterval < 3*hubKeepaliveTime: a heartbeat response
+//     lands before a third consecutive strike can ever accumulate.
+//
+// Both suppressors depend on the same thing — a live heartbeat — which is why
+// this test asserts both bounds rather than treating either as sufficient on
+// its own. The measured punishment threshold sits at ~30s (3 * the client's
+// 10s-floored ping interval): an idle connection is punished at ~30.07s
+// (measured twice), while a 25s cadence survives — see boundaryCadence and
+// aDeathDeadline in tests/integration/oldhub_test.go, the integration-level
+// proof this test exists alongside as the unit-level pin.
+func TestHeartbeatCadenceCompatibleWithPreIssue72Hub(t *testing.T) {
+	t.Parallel()
+
+	assert.LessOrEqual(t, defaultHeartbeatInterval, hubKeepaliveTime,
+		"the heartbeat must land often enough that grpc-go's client never emits a keepalive "+
+			"ping to begin with — a ping is skipped whenever the transport was read from within "+
+			"the last hubKeepaliveTime, and a heartbeat response is such a read")
+	assert.Less(t, defaultHeartbeatInterval, 3*hubKeepaliveTime,
+		"even granting a keepalive ping does fire, a heartbeat response must still land before "+
+			"a third consecutive ping-strike accumulates — the hub resets its strike counter on "+
+			"every response it writes, and GOAWAY only fires once strikes exceed 2")
+}
+
 // ─── Subscribe establishment ──────────────────────────────────────────────────
 
 // An unbounded Subscribe establishment parks the session attempt forever: no
