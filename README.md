@@ -235,6 +235,22 @@ Changes to `shares` and `mounts` in `config.kdl` are hot-reloaded — no restart
 needed. Settings in the `agent` block (`ssh-port`, `mount-tool`) are read once at
 startup and require a daemon restart to take effect.
 
+`ssh-port` must be free when the daemon starts. If something else is already
+listening there — most often a leftover `hubfuse` process — `hubfuse start`
+fails immediately and says so:
+
+```
+start SSH server: listen on port 2222: listen tcp :2222: bind: address already in use
+```
+
+The daemon deliberately does not continue in that state. Without its own SSH
+server it has nothing to serve, and registering anyway would hand every peer a
+port owned by another process — peers would then mount from whatever answers
+there rather than getting a clean failure. Free the port (`hubfuse stop`, or
+`lsof -i :2222`) or pick another one, then start again. The same rule applies
+while the daemon runs: if the SSH server stops serving, the daemon leaves the
+hub and exits instead of staying online behind a port it no longer holds.
+
 ### Mount tool
 
 `agent { mount-tool "..." }` selects the mount backend for this device

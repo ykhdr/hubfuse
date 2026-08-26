@@ -25,6 +25,14 @@ func FreePort(t *testing.T) int {
 
 // WaitForPort polls until something is listening on 127.0.0.1:port, or the
 // deadline elapses.
+//
+// SOMETHING — read that literally before reusing this. It proves a listener
+// exists, never whose it is. Issue #90's reproduction had it dial a squatter
+// holding the agent's SSH port and report the agent as up, while the daemon's
+// own bind had failed. It is used unqualified for the hub (StartHub), where the
+// port is freshly chosen and no impostor can exist; anything started on a port
+// a test deliberately contests must also confirm the process's own output, the
+// way launchDaemon does.
 func WaitForPort(t *testing.T, port int, deadline time.Duration) {
 	t.Helper()
 	end := time.Now().Add(deadline)

@@ -65,6 +65,20 @@ type Daemon struct {
 	// without a lock: it is written once, before any goroutine starts. (#61)
 	sshPort int
 
+	// sshDied carries the death of the embedded SSH server's accept loop from
+	// the goroutine startSSH leaves running to runServices, which is the one
+	// place that can act on it. Buffered with room for exactly one: the loop can
+	// die between startSSH and runServices, and an unbuffered send would then
+	// either lose the news or park that goroutine forever — one is enough,
+	// because the first death is the one that ends the daemon.
+	//
+	// The zero value (a nil channel) is safe in both directions and deliberately
+	// relied on: the send is a select with a default, which a nil channel takes,
+	// and a receive on a nil channel inside runServices' select simply never
+	// fires. buildTestDaemon builds Daemon as a struct literal, so a field that
+	// needed a constructor to be safe would be a trap. (#90)
+	sshDied chan error
+
 	onReady func()
 
 	// readyOnce guards onReady so it fires exactly once for the daemon's
@@ -286,6 +300,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		dataDir:       dir,
 		sshPort:       sshPort,
 		onReady:       opts.OnReady,
+		sshDied:       make(chan error, 1),
 
 		minReconnectInterval: backoffInitial,
 		mountMonitorInterval: mountMonitorIntervalFromEnv(
@@ -505,8 +520,20 @@ func (d *Daemon) seedNicknamesFromHub(ctx context.Context) {
 }
 
 // Run is the main daemon loop. It connects to the hub, starts all subsystems,
-// and blocks until ctx is cancelled.
+// and blocks until ctx is cancelled — or until the embedded SSH server dies,
+// which runServices treats as the end of the daemon (#90).
 func (d *Daemon) Run(ctx context.Context) error {
+	// Everything Run starts hangs off a context Run itself can cancel. The
+	// caller's context ends the daemon on a signal; this one lets the daemon end
+	// itself, which the SSH-death path in runServices needs: it has to stop
+	// supervise before Shutdown deregisters, or supervise's next Register lands
+	// after the Deregister and puts the device back online — the exact ghost
+	// this issue is about. defer cancel() also stops every background goroutine
+	// on the ordinary exit paths below, which the caller's context used to be
+	// solely responsible for. (#90)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	if err := d.connect(ctx); err != nil {
 		return err
 	}
@@ -535,7 +562,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
-	return d.runServices(ctx)
+	return d.runServices(ctx, cancel)
 }
 
 // hub returns the connection the daemon is currently using, or nil before the
@@ -655,7 +682,28 @@ func (d *Daemon) connect(ctx context.Context) error {
 	return nil
 }
 
-// startSSH generates SSH keys if absent and starts the embedded SSH server.
+// startSSH generates SSH keys if absent, BINDS the embedded SSH server's port
+// synchronously, and only then hands the accept loop to a goroutine.
+//
+// The bind is synchronous because everything downstream of it is a promise
+// about that port. This function used to launch Start in a goroutine and return
+// nil unconditionally, so a bind failure was one Error line and nothing else:
+// Run went on to registerAndSubscribe, the hub accepted the registration, and
+// every peer was handed d.sshPort — a port this process does not own. The
+// device read `online` in `hubfuse devices`, peers mounted from it, and nothing
+// anywhere said the share could never be served. Worse than a dead mount: if
+// something else IS listening there, the peer's SSHFS does not fail, it reaches
+// the wrong process. Reproduced in 0.71s on a squatted port. (#90)
+//
+// A daemon that cannot bind has nothing to serve, so this returns the error and
+// Run aborts — the #69 precedent, and the reason no PID file is left behind
+// (onReady fires inside sessionOnce, which is never reached). See SSHServer.Listen
+// for why there is no retry: the transient bind failure that would justify one
+// does not exist in this codebase, and that was measured rather than assumed.
+//
+// The accept loop still runs in a goroutine — it blocks for the daemon's whole
+// life — but its death is no longer swallowed: it goes to sshDied, and
+// runServices takes the daemon down with it. (#90)
 func (d *Daemon) startSSH(ctx context.Context) error {
 	keysDir := filepath.Join(d.dataDir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
@@ -666,13 +714,30 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 		}
 	}
 
+	if err := d.sshServer.Listen(); err != nil {
+		return fmt.Errorf("start SSH server: %w", err)
+	}
+
 	go func() {
-		if err := d.sshServer.Start(ctx); err != nil {
+		if err := d.sshServer.Serve(ctx); err != nil {
 			d.logger.Error("SSH server stopped", "error", err)
+			d.noteSSHDeath(err)
 		}
 	}()
 
 	return nil
+}
+
+// noteSSHDeath reports the death of the accept loop to runServices without ever
+// blocking. Non-blocking on purpose, twice over: the loop's goroutine must be
+// free to exit whether or not anyone is listening yet (nothing receives before
+// runServices), and a second death after the first has already been recorded
+// adds nothing — the daemon is on its way down either way. (#90)
+func (d *Daemon) noteSSHDeath(err error) {
+	select {
+	case d.sshDied <- err:
+	default:
+	}
 }
 
 // registerAndSubscribe runs the first hub session synchronously (so a hub that
@@ -1262,12 +1327,36 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 }
 
 // runServices starts the mount-health monitor (#67) and the config watcher,
-// then blocks until ctx is cancelled before shutting down. The heartbeat loop
-// is normally already running — sessionOnce starts it as soon as the hub
-// accepts the registration, well before this point (#69) — and startHeartbeat
-// is idempotent, so asking again here costs nothing and keeps this the single
-// place that guarantees every background service is up.
-func (d *Daemon) runServices(ctx context.Context) error {
+// then blocks until ctx is cancelled — or until the embedded SSH server dies —
+// before shutting down. The heartbeat loop is normally already running —
+// sessionOnce starts it as soon as the hub accepts the registration, well
+// before this point (#69) — and startHeartbeat is idempotent, so asking again
+// here costs nothing and keeps this the single place that guarantees every
+// background service is up.
+//
+// Waiting on sshDied alongside ctx is what makes the SSH server's liveness part
+// of what the daemon REPORTS rather than something it merely logs. A daemon
+// whose accept loop has died still holds a hub session, still heartbeats, and
+// still has d.sshPort in every peer's device list — the same defect issue #90
+// opens with, only reached after a successful start instead of before one.
+//
+// The response is a deliberate exit rather than a new "registered but
+// unavailable" state, and that choice is the plan's, not an accident. The hub
+// has no third status: DeviceInfo.status is written by the hub (online/offline)
+// and no proto field lets an agent say "my shares cannot be served". Withholding
+// the shares instead (registering with an empty list, which really would make
+// peers unmount via SharesUpdated) would park the daemon in an online-serving-
+// nothing state that no CLI surface explains, and would need the withhold-and-
+// republish invariant repeated in every place shares are published. Shutdown
+// already delivers the same peer-visible outcome through the mechanism that
+// exists: Deregister → the hub broadcasts offline → peers unmount. (#90)
+//
+// stopAll cancels the context every one of those goroutines hangs off — it is
+// Run's own canceller, passed in rather than kept as Daemon state because
+// runServices is the only place that needs it and a field would invite a second
+// writer. A nil stopAll is a no-op, which is what a unit-built Daemon driving
+// only the ctx.Done path has.
+func (d *Daemon) runServices(ctx context.Context, stopAll context.CancelFunc) error {
 	d.startHeartbeat(ctx)
 	go d.runMountMonitor(ctx)
 
@@ -1283,10 +1372,36 @@ func (d *Daemon) runServices(ctx context.Context) error {
 		}()
 	}
 
-	<-ctx.Done()
-	d.logger.Info("daemon shutting down")
+	select {
+	case <-ctx.Done():
+		d.logger.Info("daemon shutting down")
+		return d.Shutdown()
 
-	return d.Shutdown()
+	case sshErr := <-d.sshDied:
+		d.logger.Error("the embedded SSH server is gone; this device can no longer serve its shares, so it is "+
+			"leaving the hub rather than staying online behind a port it does not hold",
+			"error", sshErr,
+			"ssh_port", d.sshPort,
+		)
+		// Cancel BEFORE Shutdown, and the ordering is load-bearing: supervise is
+		// alive at this moment and reconnects on its own backoff, so a Register
+		// it starts here would land after Shutdown's Deregister and put the
+		// device straight back online — exactly the phantom being fixed. The
+		// cancel ends supervise, the heartbeat loop and the mount monitor; only
+		// then does Shutdown deregister, and its own steps carry independent
+		// deadlines so a cancelled ctx cannot truncate them. (#90)
+		if stopAll != nil {
+			stopAll()
+		}
+
+		if err := d.Shutdown(); err != nil {
+			// The SSH death is the diagnosis; a shutdown hiccup on the way out
+			// is a detail. Log it and return the cause, so the exit status and
+			// the last line agree on why this daemon stopped.
+			d.logger.Warn("shutdown after SSH server death reported errors", "error", err)
+		}
+		return fmt.Errorf("ssh server stopped serving on port %d: %w", d.sshPort, sshErr)
+	}
 }
 
 // defaultMountMonitorInterval is the default cadence of the mount-health
