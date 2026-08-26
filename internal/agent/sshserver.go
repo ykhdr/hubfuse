@@ -220,11 +220,11 @@ func (s *SSHServer) Serve(ctx context.Context) error {
 	ln := s.listener
 	s.mu.RUnlock()
 	if ln == nil {
-		return fmt.Errorf("serve ssh: listener not bound; call Listen first")
+		return errors.New("serve ssh: listener not bound; call Listen first")
 	}
 
 	// The watcher is bounded by THIS call, not by ctx. Serve can now return
-	// without ctx ever being cancelled (the fatal-accept path above), and a
+	// without ctx ever being cancelled (the fatal-accept path below), and a
 	// watcher parked on <-ctx.Done() would then outlive the loop it was closing
 	// for — holding the listener for the daemon's whole life. (#90)
 	done := make(chan struct{})
