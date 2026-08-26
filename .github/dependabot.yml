@@ -1,0 +1,40 @@
+# Nothing was watching dependencies here, and it showed: by the time anyone
+# looked there were 15 open advisories against the default branch, 7 of them
+# critical, all in golang.org/x/crypto — the SSH server the agent exposes on the
+# LAN. Alerts alone do not open pull requests; this file is what does. (#89)
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps arrive as one PR so a quiet week does not cost
+      # five reviews. Majors stay separate: they are the ones that need reading.
+      go-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # google.golang.org/grpc is deliberately excluded from the grouped PR and
+      # left to security updates and explicit majors. Issues #72, #77 and #78
+      # pinned transport behaviour against specific grpc-go releases, and
+      # tests/integration/oldhub_test.go asserts on a grpc-go error string on
+      # purpose, so that a release which stops surfacing the GOAWAY debug data
+      # breaks the build instead of silently disabling the agent's own detection
+      # of it. A bump here has to be read, not merely made green — see #89 for
+      # what that check looks like.
+      - dependency-name: google.golang.org/grpc
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
