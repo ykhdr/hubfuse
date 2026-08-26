@@ -166,6 +166,30 @@ If you don't have Go, prebuilt binaries are published on the project's
 [GitHub Releases](https://github.com/ykhdr/hubfuse/releases) page as `tar.gz`
 archives (one per binary, per OS/arch) alongside a `checksums.txt`.
 
+**On macOS, a binary downloaded through a browser is blocked on first run.**
+macOS shows a dialog saying it "could not verify that hubfuse is free of
+malware", and offers only to move it to the Trash. The release binaries are not
+notarized by Apple, and browsers mark everything they download with a quarantine
+attribute that makes macOS enforce that.
+
+Verify the archives you downloaded against `checksums.txt`, then extract them
+and clear the attribute from the binaries:
+
+```bash
+shasum -a 256 -c checksums.txt --ignore-missing   # run where the .tar.gz files are
+tar xzf hubfuse_*_darwin_arm64.tar.gz
+xattr -d com.apple.quarantine ./hubfuse           # only if macOS refuses to run it
+```
+
+Alternatively, try to run it once and then allow it under System Settings →
+Privacy & Security, where macOS offers an "Open Anyway" button after the first
+refusal.
+
+Whether the extracted binary inherits the attribute depends on how you unpack
+it — Finder propagates quarantine to the extracted files, `tar` in a terminal
+usually does not — so the `xattr` line is only needed if macOS actually blocks
+it. None of this applies to a binary built locally with `go install`.
+
 ### Version
 
 Both binaries report their version. The `version` subcommand prints a detailed
