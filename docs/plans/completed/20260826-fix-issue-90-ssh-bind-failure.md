@@ -252,17 +252,17 @@ func (s *SSHServer) Start(ctx context.Context) error  // Listen + Serve (сов�
 - Modify: `internal/agent/sshserver.go`
 - Modify: `internal/agent/sshserver_test.go`
 
-- [ ] выделить `Listen() error` — bind и сохранение `s.listener`; `Start` становится `Listen` + `Serve`
-- [ ] выделить `Serve(ctx) error` — accept-петля; ctx-вотчер завязать на время жизни `Serve`
+- [x] выделить `Listen() error` — bind и сохранение `s.listener`; `Start` становится `Listen` + `Serve`
+- [x] выделить `Serve(ctx) error` — accept-петля; ctx-вотчер завязать на время жизни `Serve`
       (`done`-канал), чтобы горутина не оставалась висеть, когда `Serve` вышел не по отмене
-- [ ] добавить `stopping` под `s.mu`, выставлять в `Stop()` до `ln.Close()`
-- [ ] добавить `isTransientAcceptError` и ретрай с backoff 5 мс → 1 с в `Serve`
-- [ ] тест: `Listen()` на занятом порту возвращает ошибку с номером порта
-- [ ] тест: `Serve` без `Listen` возвращает ошибку, а не паникует
-- [ ] тест: фейковый `net.Listener` отдаёт `EMFILE` N раз — `Serve` не вышел, петля продолжилась
-- [ ] тест: фейковый `net.Listener` отдаёт нетранзиторную ошибку — `Serve` вернул именно её
-- [ ] тест: `Stop()` во время `Serve` → `Serve` возвращает `nil` (намеренное закрытие)
-- [ ] `go test ./internal/agent/... -run SSHServer -count=5 -race` — зелено до Task 2
+- [x] добавить `stopping` под `s.mu`, выставлять в `Stop()` до `ln.Close()`
+- [x] добавить `isTransientAcceptError` и ретрай с backoff 5 мс → 1 с в `Serve`
+- [x] тест: `Listen()` на занятом порту возвращает ошибку с номером порта
+- [x] тест: `Serve` без `Listen` возвращает ошибку, а не паникует
+- [x] тест: фейковый `net.Listener` отдаёт `EMFILE` N раз — `Serve` не вышел, петля продолжилась
+- [x] тест: фейковый `net.Listener` отдаёт нетранзиторную ошибку — `Serve` вернул именно её
+- [x] тест: `Stop()` во время `Serve` → `Serve` возвращает `nil` (намеренное закрытие)
+- [x] `go test ./internal/agent/... -run SSHServer -count=5 -race` — зелено до Task 2
 
 ### Task 2: startSSH связывает порт синхронно, отказ доходит до Run
 
@@ -270,36 +270,43 @@ func (s *SSHServer) Start(ctx context.Context) error  // Listen + Serve (сов�
 - Modify: `internal/agent/daemon.go`
 - Modify: `internal/agent/daemon_test.go`
 
-- [ ] `startSSH` зовёт `Listen()` синхронно и возвращает ошибку; `Serve` уходит в горутину
-- [ ] горутина `Serve` кладёт ненулевую ошибку в `d.sshDied` (неблокирующе)
-- [ ] добавить поле `sshDied` в `Daemon`, создавать в `NewDaemon`, задокументировать нулевое значение
-- [ ] комментарий у `startSSH`: почему bind синхронный и почему ретраев нет (со ссылкой на измерение)
-- [ ] тест: `startSSH` на занятом порту возвращает ошибку
-- [ ] тест: `Run` при провале bind не доходит до `registerFn` (seam), возвращает ошибку bind
-- [ ] `go test ./internal/agent/... -count=5 -race` — зелено до Task 3
+- [x] `startSSH` зовёт `Listen()` синхронно и возвращает ошибку; `Serve` уходит в горутину
+- [x] горутина `Serve` кладёт ненулевую ошибку в `d.sshDied` (неблокирующе)
+- [x] добавить поле `sshDied` в `Daemon`, создавать в `NewDaemon`, задокументировать нулевое значение
+- [x] комментарий у `startSSH`: почему bind синхронный и почему ретраев нет (со ссылкой на измерение)
+- [x] тест: `startSSH` на занятом порту возвращает ошибку
+- [x] ⚠️ тест «`Run` не доходит до `registerFn`» **перенесён в сценарный** (Task 5). `Run`
+      открывается `d.connector.Connect`, которому нужны живые TLS-материалы и достижимый хаб;
+      подделывать это значило бы проверять подделку. Утверждение «Register не был достигнут»
+      делает сценарный тест, где хаб настоящий и его можно спросить
+- [x] ➕ тест: закрытый снаружи слушатель доходит до демона через `sshDied` (весь путь целиком)
+- [x] ➕ тест: `noteSSHDeath` не блокируется ни на полном, ни на nil-канале
+- [x] `go test ./internal/agent/... -count=5 -race` — зелено до Task 3
 
 ### Task 3: смерть SSH-сервера снимает демон с хаба
 
 **Files:**
 - Modify: `internal/agent/daemon.go`
-- Modify: `internal/agent/daemon_test.go`
+- Create: `internal/agent/runservices_test.go`
 
-- [ ] `Run` оборачивает ctx в `context.WithCancel` с `defer cancel()`
-- [ ] `runServices` селектит `ctx.Done()` и `d.sshDied`; в ветке `sshDied` — Error-лог, `cancel()`,
+- [x] `Run` оборачивает ctx в `context.WithCancel` с `defer cancel()`; canceller передаётся в
+      `runServices` параметром (⚠️ первая попытка протащила его через `context.Value` — отвергнуто
+      как непрозрачное: явный параметр не заводит нового состояния и виден в сигнатуре)
+- [x] `runServices` селектит `ctx.Done()` и `d.sshDied`; в ветке `sshDied` — Error-лог, `cancel()`,
       `Shutdown()`, возврат ошибки
-- [ ] комментарий: почему `cancel()` идёт ДО `Shutdown()` (гонка `supervise`-Register с Deregister)
-- [ ] тест: ошибка в `sshDied` → `runServices` возвращает её и не висит
-- [ ] тест: обычный путь (`ctx.Done()`) не изменился — `runServices` возвращает результат `Shutdown`
-- [ ] `go test ./internal/agent/... -count=5 -race` — зелено до Task 4
+- [x] комментарий: почему `cancel()` идёт ДО `Shutdown()` (гонка `supervise`-Register с Deregister)
+- [x] тест: ошибка в `sshDied` → `runServices` возвращает её и не висит
+- [x] тест: обычный путь (`ctx.Done()`) не изменился — `runServices` возвращает результат `Shutdown`
+- [x] `go test ./internal/agent/... -count=5 -race` — зелено до Task 4
 
 ### Task 4: сценарный харнесс перестаёт принимать сквоттера за агента
 
 **Files:**
 - Modify: `tests/scenarios/helpers/agent.go`
 
-- [ ] `launchDaemon` после `WaitForPort` ждёт строку демона `ssh server listening`
-- [ ] комментарий: почему одного `WaitForPort` мало (сквоттер отвечает на дозвон, но не пишет в лог)
-- [ ] `go test ./tests/scenarios/ -run TestSmoke -count=1` — существующие сценарии не сломаны
+- [x] `launchDaemon` после `WaitForPort` ждёт строку демона `ssh server listening`
+- [x] комментарий: почему одного `WaitForPort` мало (сквоттер отвечает на дозвон, но не пишет в лог)
+- [x] `go test ./tests/scenarios/ -run TestSmoke -count=1` — существующие сценарии не сломаны
 
 ### Task 5: сценарная регрессия
 
@@ -307,13 +314,13 @@ func (s *SSHServer) Start(ctx context.Context) error  // Listen + Serve (сов�
 - Create: `tests/scenarios/sshbind_test.go`
 - Delete: `tests/scenarios/zz_repro90_test.go` (временный воспроизводитель)
 
-- [ ] тест: сквоттер на порту агента → `StartDaemonExpectFailure`, в выводе причина bind,
+- [x] тест: сквоттер на порту агента → `StartDaemonExpectFailure`, в выводе причина bind,
       нет строки `registered with hub`
-- [ ] тот же тест: сосед никогда не видит устройство `online`
-- [ ] негативный контроль: без сквоттера тот же агент стартует и становится `online`
-- [ ] удалить временный `zz_repro90_test.go`
-- [ ] `go test ./tests/scenarios/ -run TestSSHBind -count=5` — зелено
-- [ ] откатить фикс, убедиться, что тест краснеет, записать вывод в «Приёмку»
+- [x] тот же тест: сосед никогда не видит устройство `online`
+- [x] негативный контроль: без сквоттера тот же агент стартует и становится `online`
+- [x] удалить временный `zz_repro90_test.go`
+- [x] `go test ./tests/scenarios/ -run TestSSHBind -count=5` — зелено
+- [x] откатить фикс, убедиться, что тест краснеет, записать вывод в «Приёмку»
 
 ### Task 6: документация
 
@@ -321,20 +328,68 @@ func (s *SSHServer) Start(ctx context.Context) error  // Listen + Serve (сов�
 - Modify: `CLAUDE.md`
 - Modify: `README.md` (если есть раздел про порты/траблшутинг)
 
-- [ ] описать в `CLAUDE.md` (секция agent internals) правило «нет слушателя — нет демона» и
+- [x] описать в `CLAUDE.md` (секция agent internals) правило «нет слушателя — нет демона» и
       классификацию accept-ошибок
-- [ ] проверить, нужно ли упоминание в README (занятый ssh-port как причина отказа старта)
+- [x] проверить, нужно ли упоминание в README (занятый ssh-port как причина отказа старта)
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] все требования Overview выполнены; issue #90 закрывается по существу
-- [ ] `make build && make vet && make test && make test-race`
-- [ ] `gofmt -l ./cmd ./internal ./tests` — пусто
-- [ ] `make lint` — golangci-lint локально версии 1.59.1, а конфиг требует v2; полагаемся на CI
+- [x] все требования Overview выполнены; issue #90 закрывается по существу
+- [x] `make build && make vet && make test && make test-race`
+- [x] `gofmt -l ./cmd ./internal ./tests` — пусто
+- [x] `make lint` — golangci-lint локально версии 1.59.1, а конфиг требует v2; полагаемся на CI
 
 ### Task 8: [Final] перенос плана
 
-- [ ] перенести этот план в `docs/plans/completed/` **в этой же ветке, до мержа**
+- [x] перенести этот план в `docs/plans/completed/` **в этой же ветке, до мержа**
+
+## Приёмка (2026-08-26)
+
+### Регрессия действительно краснеет без фикса
+
+Требование задачи: убедиться откатом. Откачен ровно синхронный bind в `startSSH` (возврат к
+`go d.sshServer.Start(ctx)` с проглоченной ошибкой), остальное оставлено на месте. Наблюдаемый вывод:
+
+```
+=== RUN   TestSSHBindFailureAbortsStartup
+    sshbind_test.go:44: StartDaemonExpectFailure: bob's daemon was still running after 30s; output:
+        11:02:48 [INFO]  connecting to hub addr=127.0.0.1:46859
+        11:02:48 [INFO]  connected to hub
+        11:02:48 [ERROR] SSH server stopped error=listen on port 45707: listen tcp :45707: bind: address already in use
+        11:02:48 [INFO]  registered with hub online_devices=2
+    workdir.go:37: --- agent:alice log ---
+        11:02:48 [INFO]  registered with hub online_devices=1
+        11:02:48 [WARN]  ssh handshake failed remote=127.0.0.1:34722 error=EOF
+        11:02:48 [INFO]  device came online device_id=e36fd4e3-… nickname=bob ip=127.0.0.1
+--- FAIL: TestSSHBindFailureAbortsStartup (30.72s)
+```
+
+Здесь виден весь дефект целиком, включая ту его часть, которую issue называет отдельно: alice не
+просто увидела bob как `online` — она пошла на его порт и получила `ssh handshake failed … EOF` от
+сквоттера. С фиксом тест зелёный, 5/5 прогонов.
+
+### Проверки
+
+| проверка | результат |
+|---|---|
+| `make build` | ok |
+| `make vet` | ok |
+| `make test` (unit + integration) | ok |
+| `make test-race` | ok |
+| `gofmt -l ./cmd ./internal ./tests` | пусто |
+| `go test ./internal/agent/ -run 'TestSSHServer\|TestStartSSH\|TestNoteSSHDeath\|TestRunServices' -count=5 -race` | ok |
+| `go test ./tests/scenarios/ -run TestSSHBind -count=5` | ok |
+| `make lint` | **не запускался локально**: установлен golangci-lint 1.59.1, а `.golangci.yml` в формате v2. Полагаемся на CI |
+
+### Что сознательно не сделано
+
+- `WaitForPort` не тронут — вылечен только его вызов в `launchDaemon`. Хаб пользуется тем же
+  хелпером, и там самозванцу взяться неоткуда.
+- Ретрая bind нет — см. измерение в Overview.
+- Ничего не добавлено в proto: третьего статуса устройства не появилось.
+- Сценария на смерть accept-петли **у живого демона** нет: закрыть чужой слушающий сокет снаружи
+  процесса нечем. Этот путь покрыт unit-тестом `TestStartSSH_ListenerDeathReachesTheDaemon`,
+  который проходит его целиком — от закрытия слушателя до канала `sshDied`.
 
 ## Post-Completion
 
