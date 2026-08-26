@@ -65,6 +65,20 @@ type Daemon struct {
 	// without a lock: it is written once, before any goroutine starts. (#61)
 	sshPort int
 
+	// sshDied carries the death of the embedded SSH server's accept loop from
+	// the goroutine startSSH leaves running to runServices, which is the one
+	// place that can act on it. Buffered with room for exactly one: the loop can
+	// die between startSSH and runServices, and an unbuffered send would then
+	// either lose the news or park that goroutine forever — one is enough,
+	// because the first death is the one that ends the daemon.
+	//
+	// The zero value (a nil channel) is safe in both directions and deliberately
+	// relied on: the send is a select with a default, which a nil channel takes,
+	// and a receive on a nil channel inside runServices' select simply never
+	// fires. buildTestDaemon builds Daemon as a struct literal, so a field that
+	// needed a constructor to be safe would be a trap. (#90)
+	sshDied chan error
+
 	onReady func()
 
 	// readyOnce guards onReady so it fires exactly once for the daemon's
@@ -286,6 +300,7 @@ func NewDaemon(cfgPath string, logger *slog.Logger, opts DaemonOptions) (*Daemon
 		dataDir:       dir,
 		sshPort:       sshPort,
 		onReady:       opts.OnReady,
+		sshDied:       make(chan error, 1),
 
 		minReconnectInterval: backoffInitial,
 		mountMonitorInterval: mountMonitorIntervalFromEnv(
@@ -655,7 +670,28 @@ func (d *Daemon) connect(ctx context.Context) error {
 	return nil
 }
 
-// startSSH generates SSH keys if absent and starts the embedded SSH server.
+// startSSH generates SSH keys if absent, BINDS the embedded SSH server's port
+// synchronously, and only then hands the accept loop to a goroutine.
+//
+// The bind is synchronous because everything downstream of it is a promise
+// about that port. This function used to launch Start in a goroutine and return
+// nil unconditionally, so a bind failure was one Error line and nothing else:
+// Run went on to registerAndSubscribe, the hub accepted the registration, and
+// every peer was handed d.sshPort — a port this process does not own. The
+// device read `online` in `hubfuse devices`, peers mounted from it, and nothing
+// anywhere said the share could never be served. Worse than a dead mount: if
+// something else IS listening there, the peer's SSHFS does not fail, it reaches
+// the wrong process. Reproduced in 0.71s on a squatted port. (#90)
+//
+// A daemon that cannot bind has nothing to serve, so this returns the error and
+// Run aborts — the #69 precedent, and the reason no PID file is left behind
+// (onReady fires inside sessionOnce, which is never reached). See SSHServer.Listen
+// for why there is no retry: the transient bind failure that would justify one
+// does not exist in this codebase, and that was measured rather than assumed.
+//
+// The accept loop still runs in a goroutine — it blocks for the daemon's whole
+// life — but its death is no longer swallowed: it goes to sshDied, and
+// runServices takes the daemon down with it. (#90)
 func (d *Daemon) startSSH(ctx context.Context) error {
 	keysDir := filepath.Join(d.dataDir, "keys")
 	keyPath := filepath.Join(keysDir, privateKeyFile)
@@ -666,13 +702,30 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 		}
 	}
 
+	if err := d.sshServer.Listen(); err != nil {
+		return fmt.Errorf("start SSH server: %w", err)
+	}
+
 	go func() {
-		if err := d.sshServer.Start(ctx); err != nil {
+		if err := d.sshServer.Serve(ctx); err != nil {
 			d.logger.Error("SSH server stopped", "error", err)
+			d.noteSSHDeath(err)
 		}
 	}()
 
 	return nil
+}
+
+// noteSSHDeath reports the death of the accept loop to runServices without ever
+// blocking. Non-blocking on purpose, twice over: the loop's goroutine must be
+// free to exit whether or not anyone is listening yet (nothing receives before
+// runServices), and a second death after the first has already been recorded
+// adds nothing — the daemon is on its way down either way. (#90)
+func (d *Daemon) noteSSHDeath(err error) {
+	select {
+	case d.sshDied <- err:
+	default:
+	}
 }
 
 // registerAndSubscribe runs the first hub session synchronously (so a hub that
