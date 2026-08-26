@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,14 +47,50 @@ func dialSFTPAs(t *testing.T, dialer *helpers.Agent, peer *helpers.Agent) *sftp.
 	return sftpClient
 }
 
+// shareVisibleTimeout bounds the wait in waitForShare.
+//
+// The chain being waited on is long and entirely asynchronous: `hubfuse share
+// add` rewrites config.kdl, fsnotify delivers the change, the daemon reloads,
+// and only then does the SSH server's alias→path map carry the new share. On an
+// idle machine that settles well inside a second; on a shared CI runner it does
+// not always fit in ten, which is how this timed out on a PR that touched
+// nothing but whitespace (issue #85). Thirty seconds costs nothing when the
+// wait succeeds — it returns as soon as the alias appears — and it is far below
+// the package's own timeout, so a genuine hang still fails as this assertion
+// rather than as a package-wide panic.
+const shareVisibleTimeout = 30 * time.Second
+
 // waitForShare blocks until alias appears in the peer's synthetic SFTP root.
 // "share add" only rewrites config.kdl; the daemon applies it asynchronously
 // when the config watcher fires, so a listing taken immediately after pairing
 // can race the reload and come back empty.
+//
+// The failure message reports the last thing actually observed, because a bare
+// timeout cannot distinguish the two failures that reach it: a slow runner
+// (the listing worked and simply did not contain the alias yet) from a broken
+// reload or a dead SFTP session (the listing itself errored). Those need
+// opposite responses, and without this a maintainer can only tell them apart by
+// re-running CI — which is exactly what issue #85 cost.
 func waitForShare(t *testing.T, client *sftp.Client, alias string) {
 	t.Helper()
+
+	var (
+		mu       sync.Mutex
+		lastErr  error
+		lastSeen []string
+	)
+
 	require.Eventuallyf(t, func() bool {
 		entries, err := client.ReadDir("/")
+
+		mu.Lock()
+		lastErr = err
+		lastSeen = nil
+		for _, e := range entries {
+			lastSeen = append(lastSeen, e.Name())
+		}
+		mu.Unlock()
+
 		if err != nil {
 			return false
 		}
@@ -62,8 +100,43 @@ func waitForShare(t *testing.T, client *sftp.Client, alias string) {
 			}
 		}
 		return false
-	}, 10*time.Second, 100*time.Millisecond,
-		"share %q never appeared in the SFTP root listing", alias)
+	}, shareVisibleTimeout, 100*time.Millisecond,
+		"share %q never appeared in the SFTP root listing within %s; last listing: %v, last error: %v",
+		alias, shareVisibleTimeout, &deferredStrings{mu: &mu, v: &lastSeen}, &deferredError{mu: &mu, v: &lastErr})
+}
+
+// deferredStrings and deferredError defer reading the observation until the
+// message is actually formatted, which happens on the polling goroutine's peer
+// after Eventually has given up. Passing lastSeen/lastErr directly would
+// evaluate them at CALL time — before a single poll has run — so the message
+// would always report an empty listing and a nil error, which is worse than no
+// message at all: it would look like evidence.
+type deferredStrings struct {
+	mu *sync.Mutex
+	v  *[]string
+}
+
+func (d *deferredStrings) String() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(*d.v) == 0 {
+		return "(empty)"
+	}
+	return strings.Join(*d.v, ", ")
+}
+
+type deferredError struct {
+	mu *sync.Mutex
+	v  *error
+}
+
+func (d *deferredError) String() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if *d.v == nil {
+		return "none"
+	}
+	return (*d.v).Error()
 }
 
 // TestACL_ReadOnlyRejectsWrites — a share declared ro accepts reads and
