@@ -682,6 +682,14 @@ func (d *Daemon) startSSH(ctx context.Context) error {
 func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
 	stream, err := d.sessionOnce(ctx)
 	if err != nil {
+		// The startup path needs this diagnostic more than the reconnect loop
+		// does, because a binary macOS has already refused is refused
+		// INSTANTLY: the daemon never reaches the reconnect loop at all, it
+		// fails its first registration and exits. Measured on the test bed, the
+		// installed binary died at t=0 while a freshly-signed copy of the same
+		// bytes registered and ran. Hooking this only into reconnectSession
+		// would have left the most common case of issue #74 silent. (#74)
+		d.noteLocalNetworkDenial(err, localNetworkEvidenceStartup)
 		return err
 	}
 
@@ -1039,6 +1047,22 @@ func (d *Daemon) readStream(ctx context.Context, stream pb.HubFuse_SubscribeClie
 // was assembled without one (test fixtures build Daemon as a literal). Read
 // under the same lock every other config reader takes, because the config
 // watcher replaces d.config wholesale on reload. (#74)
+// noteLocalNetworkDenial logs the macOS local-network diagnostic if err is one,
+// at most once for the daemon's lifetime. Both call sites classify through here
+// so neither can drift from the other, and so the once-gate is shared: a daemon
+// that fails at startup, is restarted by launchd and fails again is a NEW
+// process each time, which is the right granularity — the instruction is worth
+// repeating to someone reading a fresh log, and not worth repeating inside one
+// run where nothing changes. (#74)
+func (d *Daemon) noteLocalNetworkDenial(err error, evidence string) {
+	if !isLocalNetworkDenial(d.osName(), d.hubAddress(), err) {
+		return
+	}
+	d.localNetworkDeniedOnce.Do(func() {
+		d.logger.Error(localNetworkDenialMessage(evidence))
+	})
+}
+
 // osName returns the platform this daemon should reason about, defaulting to
 // the real one. See the goos field. (#74)
 func (d *Daemon) osName() string {
@@ -1159,9 +1183,7 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 		if isLocalNetworkDenial(d.osName(), d.hubAddress(), err) {
 			denialStreak++
 			if denialStreak >= localNetworkFailureStreak {
-				d.localNetworkDeniedOnce.Do(func() {
-					d.logger.Error(localNetworkDenialMessage())
-				})
+				d.noteLocalNetworkDenial(err, localNetworkEvidenceStreak)
 			}
 		} else {
 			denialStreak = 0

@@ -100,15 +100,45 @@ func isLocalNetworkAddress(addr string) bool {
 }
 
 // localNetworkDenialMessage is the one thing the daemon can usefully say when
-// it detects this. It is a function so the test can assert that the parts an
-// operator cannot work out for themselves are present: that the block is per
-// binary, that an SSH-started daemon can never be approved, and where to go.
-func localNetworkDenialMessage() string {
+// it detects this. evidence states what was actually observed, because the two
+// call sites have genuinely different amounts of it and the message must not
+// overstate either: the reconnect loop has watched a streak of failures, while
+// the startup path has seen exactly one and is about to exit on it.
+//
+// It is a function so the test can assert that the parts an operator cannot
+// work out for themselves are present regardless of which site called it: that
+// the block is per binary, that an SSH-started daemon can never be approved,
+// and where to go.
+func localNetworkDenialMessage(evidence string) string {
 	return "this binary appears to have been denied local-network access by macOS: " +
-		"every dial to the hub is failing with \"no route to host\" while the host itself is on the LAN. " +
+		evidence + ". " +
 		"macOS grants that access per binary and only through a GUI prompt, so a daemon started over SSH " +
 		"can never be approved and is cut off shortly after it starts. " +
 		"Fix: run \"hubfuse install-agent\" and bootstrap it from a terminal on the Mac itself, " +
 		"or approve hubfuse under System Settings > Privacy & Security > Local Network. " +
 		"Note that replacing or rebuilding the binary changes its identity and voids the approval"
 }
+
+// Evidence clauses for the two places this is detected. They are separate
+// constants rather than inline strings so the difference between them stays
+// visible: one is a sustained observation, the other a single one.
+const (
+	// localNetworkEvidenceStreak is the reconnect loop's case: several dials in
+	// a row, over at least the length of its backoff.
+	localNetworkEvidenceStreak = "every dial to the hub is failing with \"no route to host\" " +
+		"while the host itself is on the LAN"
+
+	// localNetworkEvidenceStartup is the FIRST session's case, and the one a
+	// user hits most: a binary that has already been refused is refused
+	// instantly, so the daemon never reaches the reconnect loop at all — it
+	// fails its initial registration and exits. Measured on the test bed: the
+	// installed path failed at t=0 and the process was gone, while a
+	// freshly-signed copy of the same bytes registered and ran.
+	//
+	// The wording hedges deliberately. One EHOSTUNREACH at startup is also what
+	// a LaunchAgent launched before the network is up would see, and that case
+	// resolves itself on the next launch; saying "every dial" here would be a
+	// claim this call site has not earned.
+	localNetworkEvidenceStartup = "the hub address is on the LAN, but the very first dial to it " +
+		"failed with \"no route to host\""
+)

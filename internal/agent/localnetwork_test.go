@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -143,13 +144,68 @@ func TestIsLocalNetworkAddress(t *testing.T) {
 // error would reveal: the block is per binary, an SSH-started daemon can never
 // be approved, and a rebuild voids the approval.
 func TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed(t *testing.T) {
-	msg := strings.ToLower(localNetworkDenialMessage())
+	for _, evidence := range []string{localNetworkEvidenceStreak, localNetworkEvidenceStartup} {
+		assertDenialMessageIsActionable(t, localNetworkDenialMessage(evidence))
+	}
+}
+
+func assertDenialMessageIsActionable(t *testing.T, raw string) {
+	t.Helper()
+	msg := strings.ToLower(raw)
 
 	assert.Contains(t, msg, "per binary")
 	assert.Contains(t, msg, "ssh")
 	assert.Contains(t, msg, "install-agent", "the message must name the command that fixes it")
 	assert.Contains(t, msg, "local network", "and the settings pane, for anyone who missed the prompt")
 	assert.Contains(t, msg, "voids the approval", "an upgrade re-denies the binary; that must be said")
+}
+
+// TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup covers the case a
+// user hits most and the one the first version of this fix missed entirely: a
+// binary macOS has ALREADY refused is refused instantly, so the daemon fails
+// its very first registration and exits without ever entering the reconnect
+// loop. Observed on the test bed — the installed binary died at t=0 while a
+// freshly-signed copy of the same bytes registered and ran.
+func TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.goos = "darwin"
+	d.config.Hub.Address = "192.168.31.158:9090"
+
+	buf := &syncBuffer{}
+	d.logger = captureLogger(buf)
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return nil, macDenialError
+	}
+
+	err := d.registerAndSubscribe(context.Background())
+
+	require.Error(t, err, "the daemon must still fail — the diagnostic explains the failure, it does not absorb it")
+	logged := buf.String()
+	assert.Contains(t, logged, "install-agent",
+		"a daemon that dies on its first registration is exactly who needs to be told why")
+	assert.Contains(t, logged, "very first dial",
+		"and the message must say what was actually observed: one failure, not a streak")
+}
+
+// TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure is the negative
+// control for the startup hook. A hub that is simply down at boot is the most
+// common startup failure there is, and it must not be dressed up as a macOS
+// permission problem.
+func TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure(t *testing.T) {
+	d, _ := buildTestDaemon(t)
+	d.goos = "darwin"
+	d.config.Hub.Address = "192.168.31.158:9090"
+
+	buf := &syncBuffer{}
+	d.logger = captureLogger(buf)
+	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	err := d.registerAndSubscribe(context.Background())
+
+	require.Error(t, err)
+	assert.NotContains(t, buf.String(), "install-agent")
 }
 
 // TestReconnectSession_NamesLocalNetworkDenialOnceAfterAStreak drives the real

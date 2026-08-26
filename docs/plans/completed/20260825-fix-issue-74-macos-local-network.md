@@ -259,7 +259,36 @@ keepalive и не объявляет macOS-поведение багом HubFuse
 сообщением, ради которого заводились:
 `error: device "transport: Error while dialing: … no route to host" is offline`.
 
-**⚠️ Не доведено: приёмка нового диагностического сообщения на самом маке.** Бинарь этой ветки
+**Приёмка на маке доведена — и она поймала дыру в самом фиксе.** Первый прогон бинаря этой ветки
+на маке показал, что Task 1 работает вживую: вместо
+`error: device "transport: Error while dialing: … no route to host" is offline` демон печатает
+`error: cannot reach the hub: … connect: no route to host`. Но он же показал, что диагностика #74
+НЕ появляется: демон с уже запрещённой идентичностью получает отказ на t=0, падает на первой же
+регистрации и выходит — до цикла переподключения, куда классификатор был подключён, дело не
+доходит вовсе. То есть самый частый случай issue оставался молчаливым.
+
+Хук добавлен и в стартовый путь (`registerAndSubscribe`), с отдельной формулировкой улики: там
+наблюдение ровно одно, и заявлять «every dial is failing» эта точка права не имеет. Проверено на
+маке дословно:
+
+```
+08:34:34 [ERROR] this binary appears to have been denied local-network access by macOS: the hub
+address is on the LAN, but the very first dial to it failed with "no route to host". macOS grants
+that access per binary and only through a GUI prompt, so a daemon started over SSH can never be
+approved and is cut off shortly after it starts. Fix: run "hubfuse install-agent" and bootstrap it
+from a terminal on the Mac itself, or approve hubfuse under System Settings > Privacy & Security >
+Local Network. Note that replacing or rebuilding the binary changes its identity and voids the approval
+```
+
+Побочное наблюдение оттуда же: `codesign -f -s -` на тех же байтах даёт тот же CDHash, поэтому
+переподписать бинарь «на месте» НЕ возвращает доступ — идентичность та же, решение то же. Доступ
+вернула только копия под другим содержимым/подписью. Это подтверждает формулировку в README про
+«replacing or rebuilding the binary changes its identity» с обратной стороны.
+
+**⚠️ Что по-прежнему требует человека:** одобрение самого GUI-промпта и проверка, что LaunchAgent
+переживает перезагрузку. Автотестом это не покрывается.
+
+**⚠️ (устарело, оставлено для истории) Не доведено: приёмка нового диагностического сообщения.** Бинарь этой ветки
 собран, подписан и запущен на маке в 16:53Z; через несколько минут мак перестал принимать SSH
 (ICMP и mDNS отвечают с задержкой 300-1300 мс — это спящая машина с прокси Bonjour, а не живой
 хост). Логика покрыта юнит-тестами (включая дословную ошибку с мака и обе ветки reconnect'а), но
