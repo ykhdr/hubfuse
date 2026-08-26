@@ -163,7 +163,14 @@ func runInstallAgent(out interface{ Write([]byte) (int, error) }, goos string, f
 		return fmt.Errorf("write %s: %w", plistPath, err)
 	}
 
-	fmt.Fprint(out, installAgentNextSteps(plistPath, execPath))
+	// The plist is already on disk at this point, so a write failure here does
+	// not mean the install failed — but it does mean the operator never saw the
+	// two steps they cannot guess (bootstrap from a GUI session; approve the
+	// prompt), and silently succeeding into a blank terminal would leave them
+	// with a plist that never gets loaded.
+	if _, err := fmt.Fprint(out, installAgentNextSteps(plistPath, execPath)); err != nil {
+		return fmt.Errorf("wrote %s, but could not print the next steps: %w", plistPath, err)
+	}
 	return nil
 }
 
