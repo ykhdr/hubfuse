@@ -337,12 +337,27 @@ func (a *Agent) AddMount(t *testing.T, src, dst string) {
 
 // launchDaemon is the daemon-process core shared by StartDaemon and
 // RestartDaemon: it prepares the run (see prepareDaemonRun), starts
-// `hubfuse start` with the stub-sshfs PATH override, and returns once the SSH
-// server port is confirmed listening. It does NOT touch exports.
+// `hubfuse start` with the stub-sshfs PATH override, and returns once THIS
+// daemon's SSH server is confirmed listening. It does NOT touch exports.
+//
+// "This daemon's" is the whole point of the log wait below. WaitForPort proves
+// only that something answers a TCP dial on that port, and issue #90's
+// reproduction showed what that is worth: with a squatter holding the port, the
+// daemon's bind failed, WaitForPort dialled the SQUATTER, and the harness
+// reported the agent as up. A squatter can answer a dial; it cannot write a
+// line into this daemon's stdout. So the port check stays (it is the cheap one,
+// and it catches a daemon that is merely slow) and the log line is what makes
+// the claim specific. WaitForPort itself is deliberately left alone — the hub
+// uses it too, and there no impostor can exist. (#90)
 func (a *Agent) launchDaemon(t *testing.T) {
 	t.Helper()
 
 	daemonEnv := a.prepareDaemonRun(t)
+
+	// The log buffer survives across restarts, so count what is already there
+	// and wait for one MORE below. Waiting for "at least one" would be satisfied
+	// by the previous run's line and would make RestartDaemon's check vacuous.
+	sshListeningSeen := strings.Count(a.logBuf.String(), sshListeningLine)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, AgentBinaryPath, "start")
@@ -361,9 +376,16 @@ func (a *Agent) launchDaemon(t *testing.T) {
 
 	t.Cleanup(func() { a.Stop(t) })
 
-	// Wait until the SSH server is accepting connections.
+	// Wait until the SSH server is accepting connections, and until it is OUR
+	// SSH server that said so.
 	WaitForPort(t, a.SSHPort, 5*time.Second)
+	a.WaitForDaemonLogCount(t, sshListeningLine, sshListeningSeen+1, 5*time.Second)
 }
+
+// sshListeningLine is what the agent's embedded SSH server logs once it has the
+// port. It is the harness's proof that the listener on a.SSHPort belongs to
+// this daemon rather than to whatever else happens to be there. (#90)
+const sshListeningLine = "ssh server listening"
 
 // Stop signals the daemon to exit and waits up to 5s for it to do so.
 // Idempotent — safe to call multiple times.
