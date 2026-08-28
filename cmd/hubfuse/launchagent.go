@@ -189,7 +189,10 @@ func installAgentNextSteps(plistPath, execPath string) string {
 	b.WriteString("cut off from the LAN a few seconds after it starts, and every dial to the hub\n")
 	b.WriteString("would fail with \"no route to host\".\n\n")
 	b.WriteString("If you miss the prompt: System Settings > Privacy & Security > Local Network.\n\n")
-	b.WriteString("Note: the approval is tied to this exact binary. Replacing or rebuilding\n")
-	b.WriteString("hubfuse changes its identity, and you will have to approve it again.\n")
+	b.WriteString("Note: the decision is tied to this PATH, not to the file's contents.\n")
+	b.WriteString("Replacing the binary here does not get you a fresh prompt — measured: a path\n")
+	b.WriteString("macOS had already refused stayed refused after the binary at it was rebuilt\n")
+	b.WriteString("and re-signed, with no prompt and no grace period. If hubfuse was refused\n")
+	b.WriteString("once, clear it under System Settings rather than reinstalling.\n")
 	return b.String()
 }

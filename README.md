@@ -128,14 +128,19 @@ hub version, not just old ones.
 
 ### Running the agent on macOS
 
-macOS gates access to the local network **per binary**, and grants it only
+macOS gates access to the local network per installed binary, and grants it only
 through a GUI prompt. That has two consequences a HubFuse user will hit:
 
 - A daemon started over SSH can never be shown the prompt. It registers with the
   hub, works for roughly forty seconds, and is then cut off: every dial fails
   with `connect: no route to host` while `ping` to the same hub keeps working.
-- The approval is bound to that exact binary. Rebuilding or reinstalling
-  `hubfuse` changes its identity, and you have to approve the new one.
+- The decision is bound to the binary's **path**, not to its contents. Rebuilding
+  or reinstalling `hubfuse` in place does not get you a fresh prompt: measured on
+  macOS 26.4, a path that had already been refused stayed refused after the file
+  at it was rebuilt and re-signed — denied immediately, with no prompt and no
+  grace period, while the same bytes at a new path were allowed to run. If
+  hubfuse has been refused once, clear it under System Settings rather than
+  reinstalling and hoping to be asked again.
 
 The supported way to run it is as a LaunchAgent in your logged-in GUI session,
 where the prompt can actually appear:
