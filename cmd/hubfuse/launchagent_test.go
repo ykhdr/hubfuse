@@ -106,6 +106,16 @@ func TestInstallAgentNextSteps_SaysWhatCannotBeGuessed(t *testing.T) {
 		"the SSH trap is the whole reason this command exists")
 	assert.Contains(t, got, "Local Network",
 		"the settings pane must be named for anyone who missed the prompt")
-	assert.Contains(t, strings.ToLower(got), "approve it again",
-		"an upgrade changes the binary's identity and voids the approval")
+	// Measured on macOS 26.4 AFTER this text first shipped, and it said the
+	// opposite: the decision follows the PATH, not the file. The same bytes,
+	// signed the same way, were refused instantly at a path macOS had already
+	// refused and got the full grace window at a fresh path. So reinstalling
+	// over a refused path does NOT get you a second prompt, and telling an
+	// operator to rebuild would send them in a circle.
+	assert.Contains(t, strings.ToLower(got), "path",
+		"the message must say the decision is keyed to the path")
+	assert.Contains(t, strings.ToLower(got), "system settings",
+		"and point at the only thing that actually clears a refusal")
+	assert.NotContains(t, strings.ToLower(got), "approve it again",
+		"a rebuild does not produce a fresh prompt — that claim was measured false")
 }

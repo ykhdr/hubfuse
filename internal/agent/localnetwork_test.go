@@ -142,7 +142,7 @@ func TestIsLocalNetworkAddress(t *testing.T) {
 // TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed pins the three facts
 // that took a live reproduction to establish and that no amount of reading the
 // error would reveal: the block is per binary, an SSH-started daemon can never
-// be approved, and a rebuild voids the approval.
+// be approved, and that the decision follows the path so a rebuild is not a way out.
 func TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed(t *testing.T) {
 	for _, evidence := range []string{localNetworkEvidenceStreak, localNetworkEvidenceStartup} {
 		assertDenialMessageIsActionable(t, localNetworkDenialMessage(evidence))
@@ -157,7 +157,11 @@ func assertDenialMessageIsActionable(t *testing.T, raw string) {
 	assert.Contains(t, msg, "ssh")
 	assert.Contains(t, msg, "install-agent", "the message must name the command that fixes it")
 	assert.Contains(t, msg, "local network", "and the settings pane, for anyone who missed the prompt")
-	assert.Contains(t, msg, "voids the approval", "an upgrade re-denies the binary; that must be said")
+	// See launchagent_test.go: the "a rebuild voids the approval" claim this
+	// used to pin was measured false after it shipped. The decision follows the
+	// path, so the actionable instruction is to clear it, not to reinstall.
+	assert.Contains(t, msg, "path")
+	assert.Contains(t, msg, "rebuilding hubfuse in place does not produce a fresh prompt")
 }
 
 // TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup covers the case a

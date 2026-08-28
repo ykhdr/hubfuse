@@ -2,3 +2,7 @@
 /hubfuse-hub
 /hubfuse
 /dist/
+
+# Claude Code scratch space: agent worktrees and local settings, not project content.
+# Without this a `git add -A` sweeps whole embedded repositories into a commit.
+.claude/

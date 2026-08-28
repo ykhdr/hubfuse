@@ -116,7 +116,8 @@ func localNetworkDenialMessage(evidence string) string {
 		"can never be approved and is cut off shortly after it starts. " +
 		"Fix: run \"hubfuse install-agent\" and bootstrap it from a terminal on the Mac itself, " +
 		"or approve hubfuse under System Settings > Privacy & Security > Local Network. " +
-		"Note that replacing or rebuilding the binary changes its identity and voids the approval"
+		"Note that this decision follows the PATH, not the file: rebuilding hubfuse in place does " +
+		"not produce a fresh prompt, so clear it under Local Network rather than reinstalling"
 }
 
 // Evidence clauses for the two places this is detected. They are separate
