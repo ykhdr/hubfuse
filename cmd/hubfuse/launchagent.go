@@ -21,19 +21,24 @@ const launchAgentLabel = "com.github.ykhdr.hubfuse"
 
 // launchAgentTemplate is the plist install-agent writes.
 //
-// Two fields are load-bearing and neither is a style choice:
+// Three fields are load-bearing and none is a style choice:
 //
 //   - ProgramArguments carries the ABSOLUTE path of the binary, taken from
-//     os.Executable rather than from $PATH. macOS grants local-network access
-//     per binary identity (issue #74), so a plist pointing at a different copy
-//     of hubfuse gets a different — and unapproved — identity, and the daemon
-//     is cut off exactly as before. Measured on the test bed: the same bytes,
-//     re-signed, behaved the opposite way from the installed path.
-//   - RunAtLoad plus KeepAlive is what puts the daemon inside the user's GUI
-//     session and keeps it there. That session is the whole point: the
-//     local-network prompt is a GUI prompt, and a daemon started over SSH can
-//     never be shown one, which is why an SSH-launched agent is cut off with no
-//     way to grant it anything.
+//     os.Executable rather than from $PATH. The reason is no longer a claim
+//     about how macOS keys its local-network decision — that claim was retracted
+//     (#74) — but the ordinary one: a LaunchAgent has no useful $PATH, and a
+//     relative name would resolve to whatever launchd happens to find, or to
+//     nothing.
+//   - KeepAlive is SuccessfulExit=false, NOT true. With `true`, launchd
+//     relaunches the daemon whatever it exited for, including a clean SIGTERM —
+//     so `hubfuse stop` was a no-op against a LaunchAgent-managed daemon, and an
+//     unrecoverable failure became an unbounded restart loop (#98). The agent
+//     now retries a hubless start in-process instead of exiting, so the only
+//     exits left are a deliberate stop (zero — do not restart) and a real
+//     failure (non-zero — do restart).
+//   - ThrottleInterval bounds what remains. launchd's default floor is 10s;
+//     30 makes a genuine crash loop cost two launches a minute rather than six,
+//     which is what kept #98's log growing without bound.
 //
 // ProcessType Interactive keeps macOS from throttling it as a background batch
 // job; the agent has to answer the hub's heartbeat on a fixed cadence.
@@ -51,7 +56,12 @@ const launchAgentTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>StandardOutPath</key>
@@ -106,12 +116,15 @@ func installAgentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install-agent",
 		Short: "Install a macOS LaunchAgent so the daemon runs in your GUI session",
-		Long: "Writes a LaunchAgent plist to ~/Library/LaunchAgents so the daemon runs inside " +
-			"your logged-in GUI session.\n\n" +
-			"On macOS, access to the local network is granted per binary and only through a GUI " +
-			"prompt. A daemon started over SSH can never be shown that prompt, so it is cut off " +
-			"from the LAN shortly after it starts and every dial to the hub then fails with " +
-			"\"no route to host\". Running it as a LaunchAgent is what makes the prompt reachable.",
+		Long: "Writes a LaunchAgent plist to ~/Library/LaunchAgents so the daemon starts with " +
+			"your login session and is restarted if it fails.\n\n" +
+			"On macOS, access to the local network is policed by NECP: a denied connection to a " +
+			"LAN address fails with \"no route to host\" while the internet keeps working. Apple's " +
+			"TN3179 lists which processes are exempt — a launchd daemon, any process running as " +
+			"root, and command-line tools run from Terminal or over SSH including their children — " +
+			"and states that the exemption does NOT extend to launchd agents. So this plist does " +
+			"not grant anything; it makes the daemon start with your session and survive. If macOS " +
+			"shows a Local Network prompt for hubfuse, allow it.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInstallAgent(cmd.OutOrStdout(), runtime.GOOS, force)
@@ -174,25 +187,36 @@ func runInstallAgent(out interface{ Write([]byte) (int, error) }, goos string, f
 	return nil
 }
 
-// installAgentNextSteps is the text printed after a successful write. It is a
-// function so a test can assert that the two things an operator cannot guess
-// are actually said: that bootstrapping must happen from a GUI session, and
-// that upgrading the binary invalidates the approval.
+// installAgentNextSteps is the text printed after the plist is written.
+//
+// It is deliberately short on promises. An earlier version told the operator to
+// bootstrap from a terminal rather than over SSH, to approve a System Settings
+// entry, and that a rebuild would not produce a fresh prompt. The first was
+// beside the point once the daemon started retrying, the second names an entry
+// that cannot exist for a binary with no bundle identifier, and the third was
+// never isolated from launch context. All three shipped and all three are
+// retracted (#74). What is left is what an operator can act on: the command to
+// load it, that the daemon now recovers on its own, and Apple's own documented
+// machine-wide escape hatch, attributed rather than asserted.
 func installAgentNextSteps(plistPath, execPath string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "wrote %s\n", plistPath)
 	fmt.Fprintf(&b, "  program: %s\n\n", execPath)
-	b.WriteString("Next, FROM A TERMINAL ON THE MAC ITSELF (not over SSH):\n\n")
+	b.WriteString("Load it with:\n\n")
 	fmt.Fprintf(&b, "  launchctl bootstrap gui/$(id -u) %s\n\n", plistPath)
-	b.WriteString("macOS will ask once whether hubfuse may access devices on your local network.\n")
-	b.WriteString("Approve it. Over SSH there is no way to show that prompt, so the agent would be\n")
-	b.WriteString("cut off from the LAN a few seconds after it starts, and every dial to the hub\n")
-	b.WriteString("would fail with \"no route to host\".\n\n")
-	b.WriteString("If you miss the prompt: System Settings > Privacy & Security > Local Network.\n\n")
-	b.WriteString("Note: the decision is tied to this PATH, not to the file's contents.\n")
-	b.WriteString("Replacing the binary here does not get you a fresh prompt — measured: a path\n")
-	b.WriteString("macOS had already refused stayed refused after the binary at it was rebuilt\n")
-	b.WriteString("and re-signed, with no prompt and no grace period. If hubfuse was refused\n")
-	b.WriteString("once, clear it under System Settings rather than reinstalling.\n")
+	b.WriteString("If macOS shows a prompt asking whether hubfuse may access devices on your\n")
+	b.WriteString("local network, allow it.\n\n")
+	b.WriteString("If the agent cannot reach the hub it now retries instead of exiting, so a\n")
+	b.WriteString("Mac that was asleep, a network that is not up yet, or a hub that is still\n")
+	b.WriteString("booting all recover on their own. Watch the log to confirm.\n\n")
+	b.WriteString("If dials to a LAN hub keep failing with \"no route to host\" while the\n")
+	b.WriteString("internet works, that is macOS local-network policy, not routing. A plain\n")
+	b.WriteString("command-line binary has no bundle identifier, so it may never be listed\n")
+	b.WriteString("under System Settings > Privacy & Security > Local Network — an absent entry\n")
+	b.WriteString("is not a setting you can change. Apple documents a machine-wide alternative\n")
+	b.WriteString("in TN3179 (macOS 15.5+): the AllowedWiFiLocalNetworkAddresses and\n")
+	b.WriteString("AllowedEthernetLocalNetworkAddresses keys in the com.apple.network.local-network\n")
+	b.WriteString("defaults domain exempt a whole CIDR range for every program, and take effect\n")
+	b.WriteString("after a restart.\n")
 	return b.String()
 }
