@@ -131,7 +131,17 @@ func Spawn(opts SpawnOpts) error {
 			_ = cmd.Process.Kill()
 			// Drain Wait so we don't leak the goroutine.
 			<-waitErr
-			return fmt.Errorf("daemon did not become ready within %s (check %s)", opts.ReadyTimeout, absLogPath)
+			// The tail matters more here than on the exit branch above, and it
+			// used to be missing. A daemon that exits during startup at least
+			// prints its reason as the process's last act; one that is still
+			// running when the deadline passes is killed by us, so the only
+			// account of what it was doing is the log. Since the agent stopped
+			// exiting on a failed first registration and started retrying
+			// instead, this branch — not the exit branch — is where an
+			// unreachable hub now surfaces, and "did not become ready within 5s"
+			// alone would say nothing about why. (#74)
+			return fmt.Errorf("daemon did not become ready within %s (check %s)\n%s",
+				opts.ReadyTimeout, absLogPath, tailFile(absLogPath, 20))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

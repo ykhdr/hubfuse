@@ -13,8 +13,9 @@ import (
 // TestLaunchAgentPlist_IsWellFormedAndCarriesTheAbsolutePath pins the two
 // properties launchd silently punishes. A malformed plist is IGNORED by
 // launchd — no error, no agent — so "it parses" has to be asserted, not
-// assumed; and the program path has to be the exact binary, because macOS
-// grants local-network access per binary identity (issue #74).
+// assumed; and the program path has to be absolute, because a LaunchAgent has
+// no useful $PATH and a bare name resolves to whatever launchd finds, or to
+// nothing.
 func TestLaunchAgentPlist_IsWellFormedAndCarriesTheAbsolutePath(t *testing.T) {
 	body, err := launchAgentPlist("/Users/alice/go/bin/hubfuse", "/Users/alice/.hubfuse/agent.log")
 	require.NoError(t, err)
@@ -97,25 +98,57 @@ func TestRunInstallAgent_RefusesOffDarwin(t *testing.T) {
 //
 // Both are the difference between a working install and a silent failure, so
 // they are asserted rather than left to whoever edits this text next.
-func TestInstallAgentNextSteps_SaysWhatCannotBeGuessed(t *testing.T) {
+func TestInstallAgentNextSteps_SaysWhatIsTrue(t *testing.T) {
 	got := installAgentNextSteps("/Users/alice/Library/LaunchAgents/x.plist", "/Users/alice/go/bin/hubfuse")
+	low := strings.ToLower(got)
 
 	assert.Contains(t, got, "/Users/alice/go/bin/hubfuse", "the operator must see which binary was wired in")
 	assert.Contains(t, got, "launchctl bootstrap", "the next command must be spelled out")
-	assert.Contains(t, strings.ToLower(got), "not over ssh",
-		"the SSH trap is the whole reason this command exists")
-	assert.Contains(t, got, "Local Network",
-		"the settings pane must be named for anyone who missed the prompt")
-	// Measured on macOS 26.4 AFTER this text first shipped, and it said the
-	// opposite: the decision follows the PATH, not the file. The same bytes,
-	// signed the same way, were refused instantly at a path macOS had already
-	// refused and got the full grace window at a fresh path. So reinstalling
-	// over a refused path does NOT get you a second prompt, and telling an
-	// operator to rebuild would send them in a circle.
-	assert.Contains(t, strings.ToLower(got), "path",
-		"the message must say the decision is keyed to the path")
-	assert.Contains(t, strings.ToLower(got), "system settings",
-		"and point at the only thing that actually clears a refusal")
-	assert.NotContains(t, strings.ToLower(got), "approve it again",
-		"a rebuild does not produce a fresh prompt — that claim was measured false")
+	assert.Contains(t, low, "retries instead of exiting",
+		"an operator who thinks a hubless start is fatal will go restart something that is "+
+			"already recovering")
+	assert.Contains(t, low, "tn3179",
+		"the CIDR keys are Apple's, attributed — this project has not tested them on an "+
+			"RFC1918 range, and Apple documents them only for 169.254.0.0/16")
+
+	// Retracted claims (#74). Both shipped in this very text.
+	assert.NotContains(t, low, "not over ssh",
+		"beside the point once the daemon retries, and TN3179 in fact lists SSH-launched "+
+			"tools as exempt while launchd AGENTS are not")
+	assert.NotContains(t, low, "keyed to the path",
+		"never isolated from launch context")
+	assert.NotContains(t, low, "approve hubfuse under",
+		"a bare Mach-O has no bundle identifier, so there is no entry to approve")
+}
+
+// TestLaunchAgentPlist_DoesNotRestartACleanStop pins the half of #98 that made
+// `hubfuse stop` a no-op.
+//
+// KeepAlive:true relaunches the daemon whatever it exited for, including the
+// clean SIGTERM `hubfuse stop` sends — so stopping a LaunchAgent-managed daemon
+// brought it straight back, and an unrecoverable failure became an unbounded
+// restart loop at launchd's 10s floor. SuccessfulExit:false restarts only on a
+// non-zero exit, and ThrottleInterval bounds what is left.
+func TestLaunchAgentPlist_DoesNotRestartACleanStop(t *testing.T) {
+	body, err := launchAgentPlist("/Users/alice/go/bin/hubfuse", "/Users/alice/.hubfuse/agent.log")
+	require.NoError(t, err)
+	plist := string(body)
+
+	assert.Contains(t, plist, "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>",
+		"KeepAlive must be conditional: `true` relaunches a deliberate stop, which made "+
+			"`hubfuse stop` a no-op against a LaunchAgent-managed daemon")
+	assert.Contains(t, plist, "<key>ThrottleInterval</key>",
+		"and a genuine crash loop must be throttled below launchd's 10s floor behaviour (#98)")
+
+	// Parse it properly rather than trusting substrings: launchd silently
+	// ignores a plist it cannot read, so a malformed KeepAlive dict would turn
+	// the whole agent off with no error anywhere.
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		_, tokErr := dec.Token()
+		if tokErr != nil {
+			require.ErrorContains(t, tokErr, "EOF", "the plist must stay well-formed XML")
+			break
+		}
+	}
 }

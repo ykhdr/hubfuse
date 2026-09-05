@@ -128,22 +128,45 @@ hub version, not just old ones.
 
 ### Running the agent on macOS
 
-macOS gates access to the local network per installed binary, and grants it only
-through a GUI prompt. That has two consequences a HubFuse user will hit:
+macOS polices access to the local network with a policy engine called NECP. When
+it refuses, a connection to a LAN address fails with `connect: no route to host`
+while the internet keeps working — so the symptom looks like broken routing and
+is not. The kernel names it outright in the unified log:
 
-- A daemon started over SSH can never be shown the prompt. It registers with the
-  hub, works for roughly forty seconds, and is then cut off: every dial fails
-  with `connect: no route to host` while `ping` to the same hub keeps working.
-- The decision is bound to the binary's **path**, not to its contents. Rebuilding
-  or reinstalling `hubfuse` in place does not get you a fresh prompt: measured on
-  macOS 26.4, a path that had already been refused stayed refused after the file
-  at it was rebuilt and re-signed — denied immediately, with no prompt and no
-  grace period, while the same bytes at a new path were allowed to run. If
-  hubfuse has been refused once, clear it under System Settings rather than
-  reinstalling and hoping to be asked again.
+```
+kernel  process: hubfuse  t_state: SYN_SENT  error: 65  reason: NECP
+```
 
-The supported way to run it is as a LaunchAgent in your logged-in GUI session,
-where the prompt can actually appear:
+Apple's [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+lists which processes are exempt: a launchd **daemon**, any process running as
+root, and command-line tools run from Terminal or over SSH **including their
+child processes** — but explicitly *not* a launchd **agent**. So where you start
+the daemon from decides what it is allowed to reach, and the exemption lasts only
+as long as the session that carries it.
+
+**`hubfuse` may never appear under System Settings → Privacy & Security → Local
+Network, and that is not something you can fix from there.** It is a plain
+command-line binary with no bundle identifier, and macOS says so when it tries to
+build the entry:
+
+```
+nehelper  Could not find bundle ID or display name for app:
+            (bundleID: hubfuse-<hash>, name: (null), teamID: (null))
+```
+
+With no name and no team ID there is nothing to list, so an absent entry is not a
+setting waiting to be switched on. If macOS *does* show a Local Network prompt
+for hubfuse, allow it.
+
+Since v0.2.0 the agent no longer dies when its first hub connection fails. It
+retries with backoff, so a Mac that was asleep, a network that is not up yet, a
+hub that is still booting — and a first LAN connect macOS refuses while it
+registers the binary — all recover on their own. When dials keep failing this way
+the agent says so once, at error level, and only when the hub address really is
+on the local network; `no route to host` to a routable address is ordinary
+routing and is reported as such.
+
+To have the agent start with your login session and be restarted if it fails:
 
 ```bash
 hubfuse install-agent                                  # writes the plist
@@ -151,14 +174,18 @@ launchctl bootstrap gui/$(id -u) \
     ~/Library/LaunchAgents/com.github.ykhdr.hubfuse.plist
 ```
 
-Run the `launchctl` line **from a terminal on the Mac itself**, not over SSH,
-and approve the local-network prompt when it appears. If you miss it, the
-setting is under System Settings → Privacy & Security → Local Network.
+If a LAN hub stays unreachable, TN3179 documents a machine-wide alternative
+(macOS 15.5+) that works for any program regardless of how it was started or
+signed — it declares a whole range non-local, so weigh that before using it:
 
-From v0.1.4 the agent detects this state and says so once, at error level,
-instead of logging a dial failure every retry forever. It only does so when the
-hub address is actually on the local network — `no route to host` to a routable
-address is an ordinary routing problem and is reported as one.
+```bash
+sudo defaults write com.apple.network.local-network \
+    AllowedWiFiLocalNetworkAddresses -array "192.168.0.0/16"
+# then restart the Mac
+```
+
+Apple documents these keys with `169.254.0.0/16`; whether other ranges are
+accepted has not been tested by this project.
 
 One more macOS detail, unrelated to permissions: binaries that are not
 code-signed are killed on launch by macOS 26 (`Killed: 9`, with no output). A

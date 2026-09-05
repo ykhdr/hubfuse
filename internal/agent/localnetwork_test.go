@@ -139,66 +139,117 @@ func TestIsLocalNetworkAddress(t *testing.T) {
 	}
 }
 
-// TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed pins the three facts
-// that took a live reproduction to establish and that no amount of reading the
-// error would reveal: the block is per binary, an SSH-started daemon can never
-// be approved, and that the decision follows the path so a rebuild is not a way out.
-func TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed(t *testing.T) {
-	for _, evidence := range []string{localNetworkEvidenceStreak, localNetworkEvidenceStartup} {
-		assertDenialMessageIsActionable(t, localNetworkDenialMessage(evidence))
+// TestLocalNetworkDenialMessage_SaysWhatIsTrue pins both halves of a message
+// that was rewritten because it was wrong, not because it was unclear.
+//
+// The positive half is what a live reproduction established and no amount of
+// reading "no route to host" would reveal: that the drop is NECP policy rather
+// than routing, that the daemon is retrying rather than dead, and that Apple
+// documents a machine-wide escape hatch.
+//
+// The negative half matters more, and is the reason this test lists forbidden
+// strings at all. The previous message told operators to approve hubfuse under
+// System Settings — an entry that cannot exist for a binary with no bundle
+// identifier, as `nehelper: Could not find bundle ID or display name` says
+// outright — and asserted that the decision follows the path, which was never
+// isolated from launch context. Both shipped. An assertion of ABSENCE is the
+// only kind that would have caught them coming back.
+func TestLocalNetworkDenialMessage_SaysWhatIsTrue(t *testing.T) {
+	msg := strings.ToLower(localNetworkDenialMessage(localNetworkEvidenceStreak))
+
+	assert.Contains(t, msg, "necp", "the mechanism has a name in the kernel log; using it is the "+
+		"difference between a diagnosis and a guess")
+	assert.Contains(t, msg, "retrying", "the daemon no longer dies on this, and an operator who "+
+		"thinks it did will go restart something that is already recovering")
+	assert.Contains(t, msg, "prompt", "allowing the prompt is the one action that reliably works")
+	assert.Contains(t, msg, "tn3179", "the CIDR keys are attributed, not asserted — this project "+
+		"has not tested them, and Apple documents them only for 169.254.0.0/16")
+	assert.Contains(t, msg, "com.apple.network.local-network")
+
+	// Retracted claims. Both were shipped, and both misled the repo owner.
+	assert.NotContains(t, msg, "per binary",
+		"the grant was never shown to be keyed to the binary")
+	assert.NotContains(t, msg, "follows the path",
+		"nor to the path — every comparison that produced that also changed the launch context")
+	assert.NotContains(t, msg, "approve hubfuse under",
+		"a bare Mach-O has no bundle identifier, so there is no entry to approve")
+	assert.NotContains(t, msg, "install-agent",
+		"install-agent installs a LaunchAgent, and TN3179 lists launchd AGENTS as the one "+
+			"launchd case that is NOT exempt — recommending it as the fix pointed the wrong way")
+}
+
+// TestRegisterAndSubscribe_KeepsRetryingAndNamesAPersistentDenial replaces two
+// tests that pinned the startup path's own diagnostic. That call site is gone,
+// and deleting it was the point rather than a side effect.
+//
+// It existed because "the daemon never reaches the reconnect loop at all": a
+// binary macOS had already refused was refused instantly, so the first
+// registration failed and the process exited. Now it retries, and keeping the
+// old hook would have been actively harmful. The measured NECP shape is
+// `fail, ok, ok` — so it would have logged at Error on the first EHOSTUNREACH of
+// every fresh-identity launch and been contradicted by a successful
+// registration a second later. Worse, localNetworkDeniedOnce is once per
+// process, so that false positive would have permanently suppressed the real
+// message in a daemon that now lives for hours instead of exiting.
+//
+// What replaces it is this: the streak logic inside reconnectSession, which the
+// startup path now runs too. The two halves are asserted together on purpose —
+// a version that named the denial but stopped retrying, or one that retried but
+// went silent, would each pass a test that checked only its own half.
+func TestRegisterAndSubscribe_KeepsRetryingAndNamesAPersistentDenial(t *testing.T) {
+	if syscall.EHOSTUNREACH == 0 {
+		t.Skip("EHOSTUNREACH not defined on this platform")
 	}
-}
 
-func assertDenialMessageIsActionable(t *testing.T, raw string) {
-	t.Helper()
-	msg := strings.ToLower(raw)
-
-	assert.Contains(t, msg, "per binary")
-	assert.Contains(t, msg, "ssh")
-	assert.Contains(t, msg, "install-agent", "the message must name the command that fixes it")
-	assert.Contains(t, msg, "local network", "and the settings pane, for anyone who missed the prompt")
-	// See launchagent_test.go: the "a rebuild voids the approval" claim this
-	// used to pin was measured false after it shipped. The decision follows the
-	// path, so the actionable instruction is to clear it, not to reinstall.
-	assert.Contains(t, msg, "path")
-	assert.Contains(t, msg, "rebuilding hubfuse in place does not produce a fresh prompt")
-}
-
-// TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup covers the case a
-// user hits most and the one the first version of this fix missed entirely: a
-// binary macOS has ALREADY refused is refused instantly, so the daemon fails
-// its very first registration and exits without ever entering the reconnect
-// loop. Observed on the test bed — the installed binary died at t=0 while a
-// freshly-signed copy of the same bytes registered and ran.
-func TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 	d.goos = "darwin"
 	d.config.Hub.Address = "192.168.31.158:9090"
+	d.minReconnectInterval = time.Millisecond
+	d.heartbeatInterval = time.Hour
+	d.heartbeatFn = func(context.Context) error { return nil }
 
 	buf := &syncBuffer{}
 	d.logger = captureLogger(buf)
+
+	var calls atomic.Int32
 	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		calls.Add(1)
 		return nil, macDenialError
 	}
 
-	err := d.registerAndSubscribe(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Long enough for the streak (3) to be reached several times over at a
+		// 1ms floor, so the "exactly once" assertion below is meaningful.
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
 
-	require.Error(t, err, "the daemon must still fail — the diagnostic explains the failure, it does not absorb it")
+	stream, err := d.registerAndSubscribe(ctx)
+
+	require.NoError(t, err, "a stop during the retry is a clean stop")
+	require.Nil(t, stream)
+	assert.Greater(t, calls.Load(), int32(3),
+		"the daemon must keep asking — before this change it asked once and exited")
+
 	logged := buf.String()
-	assert.Contains(t, logged, "install-agent",
-		"a daemon that dies on its first registration is exactly who needs to be told why")
-	assert.Contains(t, logged, "very first dial",
-		"and the message must say what was actually observed: one failure, not a streak")
+	assert.Contains(t, logged, "denied local-network access by macOS",
+		"a denial that never clears must still be named")
+	assert.Equal(t, 1, strings.Count(logged, "denied local-network access by macOS"),
+		"and named once, not once per retry — the answer does not change until a human acts")
 }
 
 // TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure is the negative
-// control for the startup hook. A hub that is simply down at boot is the most
-// common startup failure there is, and it must not be dressed up as a macOS
-// permission problem.
+// control: a hub that is simply down at boot is the most common startup failure
+// there is, and it must not be dressed up as a macOS permission problem — no
+// matter how many times the daemon retries it.
 func TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 	d.goos = "darwin"
 	d.config.Hub.Address = "192.168.31.158:9090"
+	d.minReconnectInterval = time.Millisecond
+	d.heartbeatInterval = time.Hour
+	d.heartbeatFn = func(context.Context) error { return nil }
 
 	buf := &syncBuffer{}
 	d.logger = captureLogger(buf)
@@ -206,10 +257,16 @@ func TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure(t *testing.T)
 		return nil, errors.New("connection refused")
 	}
 
-	err := d.registerAndSubscribe(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
 
-	require.Error(t, err)
-	assert.NotContains(t, buf.String(), "install-agent")
+	_, err := d.registerAndSubscribe(ctx)
+
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), "denied local-network access by macOS")
 }
 
 // TestReconnectSession_NamesLocalNetworkDenialOnceAfterAStreak drives the real
@@ -248,7 +305,11 @@ func TestReconnectSession_NamesLocalNetworkDenialOnceAfterAStreak(t *testing.T) 
 	d.reconnectSession(ctx)
 
 	logged := buf.String()
-	assert.Equal(t, 1, strings.Count(logged, "install-agent"),
+	// The marker is the message's own opening phrase. It used to be
+	// "install-agent", which stopped being a marker when that instruction was
+	// removed: TN3179 lists launchd AGENTS as the one launchd case that is NOT
+	// automatically exempt, so recommending install-agent pointed the wrong way.
+	assert.Equal(t, 1, strings.Count(logged, "denied local-network access by macOS"),
 		"the denial must be named exactly once no matter how long the outage runs")
 	assert.Contains(t, logged, "level=ERROR")
 }
