@@ -248,24 +248,24 @@ bounds a crash loop to two launches a minute.
 - Modify: `internal/agent/localnetwork_test.go`
 - Create: `internal/agent/startupretry_test.go`
 
-- [ ] add `everRegistered atomic.Bool`, set inside the existing `readyOnce` block in `sessionOnce`
-- [ ] change `registerAndSubscribe` to return `(pb.HubFuse_SubscribeClient, error)`, exit on a
+- [x] add `everRegistered atomic.Bool`, set inside the existing `readyOnce` block in `sessionOnce`
+- [x] change `registerAndSubscribe` to return `(pb.HubFuse_SubscribeClient, error)`, exit on a
       first-attempt `ErrHubRejected`, otherwise retry via `reconnectSession` in a goroutine while
       selecting on `d.sshDied`
-- [ ] move `go d.supervise(...)` into `Run` and add the three-outcome branch, including the
+- [x] move `go d.supervise(...)` into `Run` and add the three-outcome branch, including the
       `everRegistered` split on the cancelled path
-- [ ] make `reconnectSession`'s success log read correctly for a first-ever session
-- [ ] delete the startup denial call site and `localNetworkEvidenceStartup`
-- [ ] write a test: 2 transient failures then success → returns a stream, `registerFn` called
+- [x] make `reconnectSession`'s success log read correctly for a first-ever session
+- [x] delete the startup denial call site and `localNetworkEvidenceStartup`
+- [x] write a test: 2 transient failures then success → returns a stream, `registerFn` called
       exactly 3 times, `onReady` fired exactly once
-- [ ] write a test: `ErrHubRejected` on attempt 1 → returns that error, `registerFn` called exactly
+- [x] write a test: `ErrHubRejected` on attempt 1 → returns that error, `registerFn` called exactly
       once, `onReady` never fired
-- [ ] write a test: context cancelled mid-retry → nil stream, nil error, `onReady` never fired
-- [ ] write a test: `sshDied` fires mid-retry → returns the SSH error
-- [ ] rewrite `TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup` and
+- [x] write a test: context cancelled mid-retry → nil stream, nil error, `onReady` never fired
+- [x] write a test: `sshDied` fires mid-retry → returns the SSH error
+- [x] rewrite `TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup` and
       `_StaysQuietOnAnOrdinaryStartupFailure` against the new spec, or delete them if the streak
       test in `reconnectSession` now covers what they asserted
-- [ ] run `go test ./internal/agent/...` and `go test ./tests/scenarios/ -run TestPrunedIdentity`
+- [x] run `go test ./internal/agent/...` and `go test ./tests/scenarios/ -run TestPrunedIdentity`
       — both must pass before Task 3
 
 ### Task 2: Spawn's readiness timeout reports the cause — DONE
@@ -283,13 +283,13 @@ bounds a crash loop to two launches a minute.
 - Modify: `internal/agent/localnetwork.go`
 - Modify: `internal/agent/localnetwork_test.go`
 
-- [ ] rewrite `localNetworkDenialMessage`: name NECP, say the daemon is retrying, say to allow a
+- [x] rewrite `localNetworkDenialMessage`: name NECP, say the daemon is retrying, say to allow a
       Local Network prompt if one appears, attribute the `com.apple.network.local-network` CIDR keys
       to TN3179 rather than asserting them
-- [ ] remove the "per binary PATH" and "rebuilding in place" claims and fix the `isLocalNetworkDenial`
+- [x] remove the "per binary PATH" and "rebuilding in place" claims and fix the `isLocalNetworkDenial`
       doc comment to state only what the logs show
-- [ ] rewrite the message test to pin the new content AND assert the retracted phrases are absent
-- [ ] run `go test ./internal/agent/...` — must pass before Task 4
+- [x] rewrite the message test to pin the new content AND assert the retracted phrases are absent
+- [x] run `go test ./internal/agent/...` — must pass before Task 4
 
 ### Task 4: LaunchAgent stops restart-looping (#98)
 
@@ -297,48 +297,51 @@ bounds a crash loop to two launches a minute.
 - Modify: `cmd/hubfuse/launchagent.go`
 - Modify: `cmd/hubfuse/launchagent_test.go`
 
-- [ ] replace `KeepAlive: true` with `SuccessfulExit: false`, add `ThrottleInterval` 30
-- [ ] rewrite the instructions `install-agent` prints to match the new message
-- [ ] remove the retracted "follows the PATH" claim from the file and its test
-- [ ] write a test pinning `KeepAlive`/`ThrottleInterval` content, including that a zero exit must
+- [x] replace `KeepAlive: true` with `SuccessfulExit: false`, add `ThrottleInterval` 30
+- [x] rewrite the instructions `install-agent` prints to match the new message
+- [x] remove the retracted "follows the PATH" claim from the file and its test
+- [x] write a test pinning `KeepAlive`/`ThrottleInterval` content, including that a zero exit must
       NOT trigger a restart
-- [ ] run `go test ./cmd/...` — must pass before Task 5
+- [x] run `go test ./cmd/...` — must pass before Task 5
 
 ### Task 5: Scenario — the agent starts with the hub down and comes up when it returns
 
 **Files:**
 - Create: `tests/scenarios/startup_retry_test.go`
 
-- [ ] `StartHub` → `Join` (the cert exchange needs a live hub) → `hub.Stop(t)`
-- [ ] `StartDaemon` with the hub down; the launch wait is satisfied by the `ssh server listening`
+- [x] `StartHub` → `Join` (the cert exchange needs a live hub) → `hub.Stop(t)`
+- [x] `StartDaemon` with the hub down; the launch wait is satisfied by the `ssh server listening`
       line, which precedes registration
-- [ ] wait for 3 `"hub session reconnect failed, retrying"` lines via `WaitForDaemonLogCount` — this
+- [x] wait for 3 `"hub session reconnect failed, retrying"` lines via `WaitForDaemonLogCount` — this
       is both the aliveness proof and the positive control that retry actually ran, and it avoids
       `syscall.Kill(pid, 0)`, which CLAUDE.md forbids for this harness
-- [ ] `hub.Restart(t)` after ~3 retries (~8s in, while backoff is still ≤8s — the package timeout is
+- [x] `hub.Restart(t)` after ~3 retries (~8s in, while backoff is still ≤8s — the package timeout is
       300s and backoff caps at 60s, so waiting longer risks the suite)
-- [ ] assert the device reaches `online` within a bounded wait
-- [ ] run the scenario suite — must pass before Task 6
+- [x] assert the device reaches `online` within a bounded wait
+- [x] run the scenario suite — must pass before Task 6
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] `make test` green
-- [ ] `make test-race` green for `./internal/agent/...`
-- [ ] `make vet` and the linter green
-- [ ] grep for "follows the PATH", "per binary", "System Settings" outside `docs/plans/completed/`
-      and confirm nothing operator-facing still asserts them
+- [x] `make test` green
+- [x] `make test-race` green for `./internal/agent/...`
+- [x] `make vet` green; the locally installed golangci-lint is built against an older Go and
+      cannot import `sync/atomic` at all (it fails the same way on untouched files), so the linter
+      is left to CI
+- [x] grep for "follows the PATH", "per binary", "System Settings" outside `docs/plans/completed/`
+      and confirm nothing operator-facing still asserts them — only the retraction text itself and
+      this plan's own description of it remain
 
 ### Task 7: [Final] Documentation
 
-- [ ] CLAUDE.md `localnetwork.go` paragraph: NECP, the `nehelper` evidence, the older unreconciled
+- [x] CLAUDE.md `localnetwork.go` paragraph: NECP, the `nehelper` evidence, the older unreconciled
       evidence named as unreconciled, retry as the fix
-- [ ] CLAUDE.md `client.go` bullet: "a pruned identity now fails to start" stays TRUE (the exit is
+- [x] CLAUDE.md `client.go` bullet: "a pruned identity now fails to start" stays TRUE (the exit is
       preserved) — verify the wording still matches after Task 1
-- [ ] CLAUDE.md `daemon.go` #90 bullet: extend it to say the SSH-death watch now also covers the
+- [x] CLAUDE.md `daemon.go` #90 bullet: extend it to say the SSH-death watch now also covers the
       pre-registration retry window
-- [ ] README.md macOS section: drop the impossible System Settings instruction, add the TN3179 CIDR
+- [x] README.md macOS section: drop the impossible System Settings instruction, add the TN3179 CIDR
       keys as Apple's documented option
-- [ ] move this plan to `docs/plans/completed/` (in this branch, before the merge)
+- [x] move this plan to `docs/plans/completed/` (in this branch, before the merge)
 
 ## Post-Completion
 
