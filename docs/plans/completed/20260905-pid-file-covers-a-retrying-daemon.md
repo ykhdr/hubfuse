@@ -124,30 +124,30 @@ assertion is re-specified rather than deleted.
 - Modify: `internal/agent/startupretry_test.go`
 - Modify: `cmd/hubfuse/main.go`
 
-- [ ] add `markReady()` wrapping `readyOnce.Do(onReady)`; move `everRegistered.Store(true)` out of
+- [x] add `markReady()` wrapping `readyOnce.Do(onReady)`; move `everRegistered.Store(true)` out of
       the closure so it is set on its own, only on an accepted Register
-- [ ] call `markReady()` in `registerAndSubscribe` immediately before entering the retry loop —
+- [x] call `markReady()` in `registerAndSubscribe` immediately before entering the retry loop —
       below the `ErrHubRejected` branch, so a refused daemon still reaches neither call
-- [ ] set `ReadyTimeout` explicitly in `spawnAgentDaemon` (`cmd/hubfuse/main.go:349`) above
+- [x] set `ReadyTimeout` explicitly in `spawnAgentDaemon` (`cmd/hubfuse/main.go:349`) above
       `listDevicesTimeout + registerTimeout`, with the arithmetic in the comment
-- [ ] re-specify `startupretry_test.go:148` and `:186`: `onReady` now FIRES in both, because a daemon
+- [x] re-specify `startupretry_test.go:148` and `:186`: `onReady` now FIRES in both, because a daemon
       stopped or killed mid-retry legitimately had a PID file — `runAgent`'s
       `defer os.Remove(pidPath)` (`cmd/hubfuse/main.go:436`) is what makes that safe
-- [ ] re-specify `startupretry_test.go:79-80` and rewrite the doc comments at `:51-58`, `:121-129`
+- [x] re-specify `startupretry_test.go:79-80` and rewrite the doc comments at `:51-58`, `:121-129`
       and `:154-163` that state the old contract
-- [ ] extend `_ExitsWhenTheHubRefusesTheFirstRegistration` instead of adding a fourth near-identical
+- [x] extend `_ExitsWhenTheHubRefusesTheFirstRegistration` instead of adding a fourth near-identical
       test: its existing `assert.Zero(t, ready.Load())` already carries the #69 property, so widen
       its comment to say `markReady` sits below the refusal branch
-- [ ] write a test for the new event: a transient first failure fires `onReady` exactly once, and
+- [x] write a test for the new event: a transient first failure fires `onReady` exactly once, and
       `everRegistered` is FALSE at that moment — captured INSIDE the `onReady` callback, not checked
       afterwards, so it cannot go racy or vacuous. On revert `onReady` only ever runs with
       `everRegistered` true, so the assertion inverts.
-- [ ] rewrite the stale comments this change falsifies: `daemon.go:34-37` (`DaemonOptions.OnReady`,
+- [x] rewrite the stale comments this change falsifies: `daemon.go:34-37` (`DaemonOptions.OnReady`,
       the public contract), `:733-736` (#90's "no PID file either"), `:795-806`
       (`registerAndSubscribe`'s "no PID file"), `:905-909` (the `readyOnce.Do` comment),
       `internal/common/daemonize/spawn_unix.go:135-142` and `TestSpawn_TimeoutCarriesTheLogTail`'s
       doc comment — an unreachable hub now reaches `Spawn`'s SUCCESS branch for the agent
-- [ ] run `go test ./internal/agent/... ./internal/common/...` and
+- [x] run `go test ./internal/agent/... ./internal/common/...` and
       `go test ./tests/scenarios/ -run 'TestPrunedIdentityFailsToStart|TestSSHBind'`
 
 ### Task 2: Cover `hubfuse start -d` end to end
@@ -160,36 +160,36 @@ rest of the test binary, and across `-count=N`.
 **Files:**
 - Create: `tests/scenarios/detached_start_test.go`
 
-- [ ] `StartHub` → `Join` → `hub.Stop(t)`, then run `hubfuse start -d` and assert it exits ZERO and
+- [x] `StartHub` → `Join` → `hub.Stop(t)`, then run `hubfuse start -d` and assert it exits ZERO and
       prints a pid. Before this change it fails after `ReadyTimeout` with the child killed.
-- [ ] register a `t.Cleanup` FIRST that reads `$HOME/.hubfuse/agent.pid`, sends SIGTERM then SIGKILL,
+- [x] register a `t.Cleanup` FIRST that reads `$HOME/.hubfuse/agent.pid`, sends SIGTERM then SIGKILL,
       and tolerates the file being absent — the detached daemon cannot be reached by the harness's
       process-group kill
-- [ ] read the daemon's log from `$HOME/.hubfuse/agent.log`, not `a.logBuf`: a detached child's
+- [x] read the daemon's log from `$HOME/.hubfuse/agent.log`, not `a.logBuf`: a detached child's
       output goes to the file, so `WaitForDaemonLogCount` and `DumpOnFailure` are blind to it
-- [ ] assert `hubfuse status` OUTPUT contains "is running (pid" — `ReportStatus` returns nil
+- [x] assert `hubfuse status` OUTPUT contains "is running (pid" — `ReportStatus` returns nil
       unconditionally, so asserting a zero exit would be vacuous
-- [ ] assert `hubfuse stop` then removes the PID file. The file's ABSENCE is the primary assertion,
+- [x] assert `hubfuse stop` then removes the PID file. The file's ABSENCE is the primary assertion,
       because it is written by the daemon's own `defer os.Remove`; `SignalStop`'s own exit check
       polls `syscall.Kill(pid, 0)`, which CLAUDE.md rules out for this harness and which misreports
       an orphan under a PID 1 that does not reap.
-- [ ] do NOT re-assert hub-down → retry → `online`: `tests/scenarios/startup_retry_test.go` already
+- [x] do NOT re-assert hub-down → retry → `online`: `tests/scenarios/startup_retry_test.go` already
       owns that end to end, and repeating it would add ~45s for a property this change is not about
-- [ ] run `go test ./tests/scenarios/ -run TestDetachedStart`
+- [x] run `go test ./tests/scenarios/ -run TestDetachedStart`
 
 ### Task 3: Verify acceptance criteria
 
-- [ ] `make test` green
-- [ ] `make test-race` green for `./internal/agent/...`
-- [ ] `make vet` green
-- [ ] confirm `tests/scenarios/prune_test.go` still passes unchanged — a refused identity must still
+- [x] `make test` green
+- [x] `make test-race` green for `./internal/agent/...`
+- [x] `make vet` green
+- [x] confirm `tests/scenarios/prune_test.go` still passes unchanged — a refused identity must still
       exit and leave no PID file
 
 ### Task 4: [Final] Documentation
 
-- [ ] CLAUDE.md: the `daemon.go` bullet gains what the PID file means now and why it is not
+- [x] CLAUDE.md: the `daemon.go` bullet gains what the PID file means now and why it is not
       `everRegistered`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

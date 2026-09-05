@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -284,6 +285,95 @@ func (a *Agent) prepareDaemonRun(t *testing.T) []string {
 		"HUBFUSE_STUB_MOUNT_DIR=" + a.StubMountDir,
 	}
 	return append(daemonEnv, a.envExtra...)
+}
+
+// StartDaemonDetached runs `hubfuse start -d` and returns the combined output
+// and whether it exited zero. It is the only helper that exercises the DETACHED
+// path, which nothing covered before #102: prune_test and sshbind_test both use
+// the foreground StartDaemonExpectFailure, and the daemonize unit tests drive a
+// `sleep 60` stand-in rather than the real binary.
+//
+// Cleanup is the reason this is a helper rather than three lines in a test.
+// Spawn gives the daemon its own session (Setsid), so it is NOT in the test's
+// process group and Agent.Stop — which signals the group, and only knows about
+// daemons launchDaemon started — cannot reach it. A leak here does not merely
+// linger: it holds this agent's SSH port and keeps hammering the hub for the
+// rest of the test binary, and across -count=N. So the cleanup is registered
+// BEFORE the daemon is started, and it works off the PID file the daemon itself
+// wrote, which is the only handle the parent leaves behind.
+func (a *Agent) StartDaemonDetached(t *testing.T) (string, bool) {
+	t.Helper()
+
+	daemonEnv := a.prepareDaemonRun(t)
+	t.Cleanup(func() { a.killDetachedDaemon() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, AgentBinaryPath, "start", "-d")
+	cmd.Env = daemonEnv
+	out, err := cmd.CombinedOutput()
+	_, _ = a.logBuf.Write([]byte("$ hubfuse start -d\n"))
+	_, _ = a.logBuf.Write(out)
+	return string(out), err == nil
+}
+
+// PIDFilePath is where the detached daemon records itself. Its ABSENCE is the
+// honest way to assert a stop completed: the daemon removes it on every exit
+// path, so it needs no process reaper — unlike syscall.Kill(pid, 0), which
+// CLAUDE.md rules out for this harness because it answers nil for an unreaped
+// zombie.
+func (a *Agent) PIDFilePath() string {
+	return filepath.Join(a.HomeDir, ".hubfuse", common.AgentPIDFile)
+}
+
+// DaemonLogFile returns the detached daemon's log. A detached child's output
+// goes to this file, never to a.logBuf, so WaitForDaemonLogCount and
+// DumpOnFailure are blind to it.
+func (a *Agent) DaemonLogFile(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(a.HomeDir, ".hubfuse", common.AgentLogFile))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// WaitForDetachedLog waits for substr to appear in the detached daemon's log
+// file, failing the test with the log's tail if it never does.
+func (a *Agent) WaitForDetachedLog(t *testing.T, substr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(a.DaemonLogFile(t), substr) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("WaitForDetachedLog: %q never appeared in %s's detached log within %s; log:\n%s",
+		substr, a.Nickname, timeout, a.DaemonLogFile(t))
+}
+
+// killDetachedDaemon best-effort terminates a daemon started by
+// StartDaemonDetached, using the PID file it left behind. Tolerates every
+// absence: no file, an unparseable one, or a process already gone.
+func (a *Agent) killDetachedDaemon() {
+	raw, err := os.ReadFile(a.PIDFilePath())
+	if err != nil {
+		return
+	}
+	pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if convErr != nil || pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
 // StartDaemonExpectFailure runs `hubfuse start` in the foreground and waits for
