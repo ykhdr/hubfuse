@@ -164,41 +164,78 @@ func assertDenialMessageIsActionable(t *testing.T, raw string) {
 	assert.Contains(t, msg, "rebuilding hubfuse in place does not produce a fresh prompt")
 }
 
-// TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup covers the case a
-// user hits most and the one the first version of this fix missed entirely: a
-// binary macOS has ALREADY refused is refused instantly, so the daemon fails
-// its very first registration and exits without ever entering the reconnect
-// loop. Observed on the test bed — the installed binary died at t=0 while a
-// freshly-signed copy of the same bytes registered and ran.
-func TestRegisterAndSubscribe_NamesLocalNetworkDenialAtStartup(t *testing.T) {
+// TestRegisterAndSubscribe_KeepsRetryingAndNamesAPersistentDenial replaces two
+// tests that pinned the startup path's own diagnostic. That call site is gone,
+// and deleting it was the point rather than a side effect.
+//
+// It existed because "the daemon never reaches the reconnect loop at all": a
+// binary macOS had already refused was refused instantly, so the first
+// registration failed and the process exited. Now it retries, and keeping the
+// old hook would have been actively harmful. The measured NECP shape is
+// `fail, ok, ok` — so it would have logged at Error on the first EHOSTUNREACH of
+// every fresh-identity launch and been contradicted by a successful
+// registration a second later. Worse, localNetworkDeniedOnce is once per
+// process, so that false positive would have permanently suppressed the real
+// message in a daemon that now lives for hours instead of exiting.
+//
+// What replaces it is this: the streak logic inside reconnectSession, which the
+// startup path now runs too. The two halves are asserted together on purpose —
+// a version that named the denial but stopped retrying, or one that retried but
+// went silent, would each pass a test that checked only its own half.
+func TestRegisterAndSubscribe_KeepsRetryingAndNamesAPersistentDenial(t *testing.T) {
+	if syscall.EHOSTUNREACH == 0 {
+		t.Skip("EHOSTUNREACH not defined on this platform")
+	}
+
 	d, _ := buildTestDaemon(t)
 	d.goos = "darwin"
 	d.config.Hub.Address = "192.168.31.158:9090"
+	d.minReconnectInterval = time.Millisecond
+	d.heartbeatInterval = time.Hour
+	d.heartbeatFn = func(context.Context) error { return nil }
 
 	buf := &syncBuffer{}
 	d.logger = captureLogger(buf)
+
+	var calls atomic.Int32
 	d.registerFn = func(context.Context, []*pb.Share, int) (*pb.RegisterResponse, error) {
+		calls.Add(1)
 		return nil, macDenialError
 	}
 
-	err := d.registerAndSubscribe(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Long enough for the streak (3) to be reached several times over at a
+		// 1ms floor, so the "exactly once" assertion below is meaningful.
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
 
-	require.Error(t, err, "the daemon must still fail — the diagnostic explains the failure, it does not absorb it")
+	stream, err := d.registerAndSubscribe(ctx)
+
+	require.NoError(t, err, "a stop during the retry is a clean stop")
+	require.Nil(t, stream)
+	assert.Greater(t, calls.Load(), int32(3),
+		"the daemon must keep asking — before this change it asked once and exited")
+
 	logged := buf.String()
-	assert.Contains(t, logged, "install-agent",
-		"a daemon that dies on its first registration is exactly who needs to be told why")
-	assert.Contains(t, logged, "very first dial",
-		"and the message must say what was actually observed: one failure, not a streak")
+	assert.Contains(t, logged, "denied local-network access by macOS",
+		"a denial that never clears must still be named")
+	assert.Equal(t, 1, strings.Count(logged, "denied local-network access by macOS"),
+		"and named once, not once per retry — the answer does not change until a human acts")
 }
 
 // TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure is the negative
-// control for the startup hook. A hub that is simply down at boot is the most
-// common startup failure there is, and it must not be dressed up as a macOS
-// permission problem.
+// control: a hub that is simply down at boot is the most common startup failure
+// there is, and it must not be dressed up as a macOS permission problem — no
+// matter how many times the daemon retries it.
 func TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure(t *testing.T) {
 	d, _ := buildTestDaemon(t)
 	d.goos = "darwin"
 	d.config.Hub.Address = "192.168.31.158:9090"
+	d.minReconnectInterval = time.Millisecond
+	d.heartbeatInterval = time.Hour
+	d.heartbeatFn = func(context.Context) error { return nil }
 
 	buf := &syncBuffer{}
 	d.logger = captureLogger(buf)
@@ -206,10 +243,16 @@ func TestRegisterAndSubscribe_StaysQuietOnAnOrdinaryStartupFailure(t *testing.T)
 		return nil, errors.New("connection refused")
 	}
 
-	err := d.registerAndSubscribe(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
 
-	require.Error(t, err)
-	assert.NotContains(t, buf.String(), "install-agent")
+	_, err := d.registerAndSubscribe(ctx)
+
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), "denied local-network access by macOS")
 }
 
 // TestReconnectSession_NamesLocalNetworkDenialOnceAfterAStreak drives the real

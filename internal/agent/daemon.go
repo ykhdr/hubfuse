@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	agentconfig "github.com/ykhdr/hubfuse/internal/agent/config"
@@ -85,6 +86,22 @@ type Daemon struct {
 	// lifetime. The supervisor re-runs sessionOnce on every reconnect, but the
 	// PID-file hook (onReady) must run only on the first successful Register.
 	readyOnce sync.Once
+
+	// everRegistered records whether the hub has ever ACCEPTED a Register from
+	// this process. It is set inside readyOnce, so it means exactly what the
+	// PID file means, and it is set even when onReady is nil (tests, and any
+	// caller that wants no PID hook).
+	//
+	// It exists for one branch: the daemon can now be stopped while it is still
+	// retrying its first session, and what a clean stop has to do there depends
+	// entirely on this flag. With no accepted Register there is nothing to
+	// deregister and the hub may well be unreachable — calling Shutdown would
+	// fail its Deregister, aggregate the error, and exit non-zero, which under
+	// the LaunchAgent's KeepAlive would relaunch the daemon we were asked to
+	// stop. With an accepted Register (Register ok, Subscribe failed, back into
+	// the loop) the PID file exists, the heartbeat runs, mounts were made and
+	// the hub has this device online — that needs the ordinary Shutdown. (#74)
+	everRegistered atomic.Bool
 
 	// sessionCancel ends the current hub session's event stream and
 	// heartbeatFails counts the consecutive heartbeat failures that decide to
@@ -558,9 +575,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// immediately. (#49 guard-target)
 	d.guardConfiguredTargets()
 
-	if err := d.registerAndSubscribe(ctx); err != nil {
+	stream, err := d.registerAndSubscribe(ctx)
+	if err != nil {
 		return err
 	}
+	if stream == nil {
+		// The daemon was stopped while it was still trying to reach the hub for
+		// the first time. That is an ordinary stop and MUST exit zero: a
+		// non-zero exit here is relaunched by the LaunchAgent's KeepAlive, so
+		// reporting a clean stop as a failure would make the daemon impossible
+		// to stop during a hub outage. Which cleanup is owed depends on whether
+		// a Register was ever accepted -- see everRegistered. (#74)
+		if d.everRegistered.Load() {
+			d.logger.Info("daemon shutting down")
+			return d.Shutdown()
+		}
+		d.logger.Info("daemon stopping before it ever registered with the hub")
+		return nil
+	}
+
+	go d.supervise(ctx, stream)
 
 	return d.runServices(ctx, cancel)
 }
@@ -740,27 +774,75 @@ func (d *Daemon) noteSSHDeath(err error) {
 	}
 }
 
-// registerAndSubscribe runs the first hub session synchronously (so a hub that
-// is down at startup still surfaces as a startup error and onReady timing for
-// the PID file is preserved), then hands the live stream to a long-running
-// supervisor goroutine that reconnects whenever the session dies. (#61)
-func (d *Daemon) registerAndSubscribe(ctx context.Context) error {
+// registerAndSubscribe establishes the daemon's FIRST hub session and returns
+// its event stream. It has three outcomes, and Run branches on all three:
+// a stream (running), an error (fatal), or neither (stopped while trying).
+//
+// It used to have one: it returned the first sessionOnce error and Run exited
+// on it. Every LATER session already got reconnectSession's infinite backoff,
+// so the daemon tolerated any failure except the first one -- and that is what
+// made the macOS local-network denial fatal. Measured on the test bed
+// (macOS 26.4, under a LaunchAgent): the first connect() from an identity macOS
+// has not yet registered is refused with EHOSTUNREACH -- the kernel names
+// `reason: NECP` -- and attempts seconds later succeed. Two independent ad-hoc
+// probes gave `fail, ok, ok` and `fail, fail, ok`. Apple documents the shape in
+// TN3179 ("the system may deny the operation immediately before the user
+// responds") and has an open bug, FB16131937, where a short-lived process dies
+// before the grant lands. A daemon that retried would have lived; this one
+// exited. The same retry covers every other cause of a hubless start at once: a
+// Mac waking up, a network that is not up yet, a hub that is still booting.
+//
+// A first-attempt ErrHubRejected is the one failure that still exits, and the
+// asymmetry with reconnectSession -- which retries the same error mid-life -- is
+// deliberate:
+//
+//   - "the hub cannot be reached" is what retry is for. "the hub answered and
+//     said no" needs a human to run `hubfuse join`; retrying cannot fix it, and
+//     tests/scenarios/prune_test.go pins that a pruned identity fails loudly
+//     rather than running on as a ghost -- the first half of #69.
+//   - exiting costs nothing HERE. There is no session, no PID file, no mount and
+//     no peer that has seen this device. Mid-life all four exist, and tearing
+//     them down for a refusal that may be a transient hub-side store error is
+//     worse than logging it and trying again.
+//
+// Only the FIRST attempt is treated that way. If attempt 1 fails transiently and
+// attempt 4 is refused, the daemon is already inside reconnectSession and keeps
+// retrying -- unchanged behaviour.
+//
+// The wait selects on d.sshDied as well as on the retry, because that channel is
+// otherwise read only in runServices, which is unreachable until this function
+// returns. An accept loop that died during a long retry window would sit unread
+// in the buffer; registration would eventually succeed, the hub would be handed
+// d.sshPort, peers would mount from a port this process does not hold, and only
+// then would runServices drain the channel. That is #90's exact harm with a
+// smaller window, so the SSH server's liveness stays a precondition of the
+// daemon existing at all -- in both directions, as it was before. (#74, #90)
+func (d *Daemon) registerAndSubscribe(ctx context.Context) (pb.HubFuse_SubscribeClient, error) {
 	stream, err := d.sessionOnce(ctx)
-	if err != nil {
-		// The startup path needs this diagnostic more than the reconnect loop
-		// does, because a binary macOS has already refused is refused
-		// INSTANTLY: the daemon never reaches the reconnect loop at all, it
-		// fails its first registration and exits. Measured on the test bed, the
-		// installed binary died at t=0 while a freshly-signed copy of the same
-		// bytes registered and ran. Hooking this only into reconnectSession
-		// would have left the most common case of issue #74 silent. (#74)
-		d.noteLocalNetworkDenial(err, localNetworkEvidenceStartup)
-		return err
+	if err == nil {
+		return stream, nil
 	}
 
-	go d.supervise(ctx, stream)
+	if errors.Is(err, ErrHubRejected) {
+		return nil, err
+	}
 
-	return nil
+	d.logger.Warn("first hub session failed, retrying", "error", err)
+
+	// reconnectSession blocks until it succeeds or ctx is cancelled, so it runs
+	// on its own goroutine to leave this one free to watch sshDied. Run's
+	// deferred cancel is what ends it on every exit path below.
+	result := make(chan pb.HubFuse_SubscribeClient, 1)
+	go func() { result <- d.reconnectSession(ctx) }()
+
+	select {
+	case s := <-result:
+		// A nil stream means reconnectSession saw ctx.Done -- a clean stop, not
+		// a failure. Run turns that into exit zero.
+		return s, nil
+	case sshErr := <-d.sshDied:
+		return nil, fmt.Errorf("ssh server died before the daemon reached the hub: %w", sshErr)
+	}
 }
 
 // sessionOnce runs one hub session setup: Register, signal readiness (exactly
@@ -826,6 +908,7 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	// ACCEPTED: a refused registration returns above, so no PID file is written
 	// for a daemon the hub does not know. (#69)
 	d.readyOnce.Do(func() {
+		d.everRegistered.Store(true)
 		if d.onReady != nil {
 			d.onReady()
 		}
@@ -1198,6 +1281,11 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 	// IS the reset. (#74)
 	denialStreak := 0
 
+	// Whether this loop is bringing up the daemon's FIRST session or restoring
+	// a lost one. Read once, here, because sessionOnce sets everRegistered the
+	// moment the hub accepts a Register.
+	firstEver := !d.everRegistered.Load()
+
 	delay := d.minReconnectInterval
 	if delay <= 0 {
 		// Floor the FAILURE backoff so a persistent Register failure cannot
@@ -1216,7 +1304,15 @@ func (d *Daemon) reconnectSession(ctx context.Context) pb.HubFuse_SubscribeClien
 
 		stream, err := d.sessionOnce(ctx)
 		if err == nil {
-			d.logger.Info("hub session re-established")
+			// "re-established" is false for a daemon whose first session never
+			// existed — this loop now also runs before registration, from
+			// registerAndSubscribe. everRegistered is the exact predicate, and
+			// it is read at loop entry because a successful sessionOnce sets it.
+			if firstEver {
+				d.logger.Info("hub session established")
+			} else {
+				d.logger.Info("hub session re-established")
+			}
 			return stream
 		}
 
