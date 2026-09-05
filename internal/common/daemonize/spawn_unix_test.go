@@ -186,12 +186,13 @@ func TestSpawn_Timeout(t *testing.T) {
 // become ready within 5s" and nothing else, and then killed, so its reason died
 // with it.
 //
-// That branch was harmless while the agent exited on a failed first
-// registration, because then it was the exit branch that ran. Now the agent
-// retries instead (#74), so an unreachable hub reaches the operator through
-// THIS branch and only this one. Without the tail, `hubfuse start -d` against a
-// down hub would report a timeout and hide the "cannot reach hub" line the
-// daemon had already written.
+// The agent reaches this branch when it is stuck BEFORE signalling readiness —
+// a hub that black-holes packets for longer than the caller's budget, or a
+// daemon wedged on the way up. (An ordinary down hub no longer gets here: since
+// #102 the agent signals readiness once its first attempt returns and retries in
+// the background.) Those are the cases with nothing else to go on, so the tail
+// is the only account the operator gets of what the daemon was doing when it
+// was killed.
 func TestSpawn_TimeoutCarriesTheLogTail(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "child.log")

@@ -337,6 +337,11 @@ func bestEffortLeave(dataDir string) error {
 	return nil
 }
 
+// agentReadyTimeout bounds how long `hubfuse start -d` waits for the daemon to
+// report itself running. It is the sum of the two bounded calls that precede
+// readiness (10s + 20s) plus margin; keep it above them if either budget grows.
+const agentReadyTimeout = 35 * time.Second
+
 // spawnAgentDaemon re-execs the current binary as a detached agent
 // daemon, after ensuring dataDir exists. childArgs overrides the child's
 // argv: pass nil for the normal `start -d` path (Spawn derives args from
@@ -350,6 +355,18 @@ func spawnAgentDaemon(dataDir, pidPath, logPath string, childArgs []string) erro
 		LogPath:     logPath,
 		PIDFilePath: pidPath,
 		ChildArgs:   childArgs,
+		// Spawn's own default is 5s, which is below what the agent's startup
+		// path can legitimately take before it signals readiness. The daemon
+		// now signals it once the first hub session ATTEMPT has returned (#102),
+		// and two bounded calls sit ahead of that: seedNicknamesFromHub
+		// (listDevicesTimeout, 10s) and the first Register (registerTimeout,
+		// 20s). A hub whose PROCESS is down RSTs instantly and a NECP denial
+		// returns EHOSTUNREACH instantly, so readiness is normally sub-second —
+		// but a hub HOST that is asleep or black-holing packets makes the agent
+		// wait out both budgets, and that is exactly the case an operator most
+		// wants to survive. At 5s Spawn would kill the child there, undoing
+		// #101's whole point on the most interactive path there is.
+		ReadyTimeout: agentReadyTimeout,
 	})
 }
 
