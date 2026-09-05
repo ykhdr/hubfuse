@@ -49,6 +49,14 @@ func TestMain(m *testing.M) {
 		// Never write PID file; just sleep. Parent must time out.
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	case "retrying":
+		// The shape the agent now has: it logs why it cannot come up and keeps
+		// trying instead of exiting, so it is still alive when the parent's
+		// readiness deadline passes. The parent kills it, and the log is the
+		// only account of what went wrong. (#74)
+		_, _ = os.Stderr.WriteString("cannot reach hub at 192.168.0.9:9090, retrying\n")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
 	case "ignore":
 		// Writes pidfile, then ignores SIGTERM/SIGINT and only exits on
 		// SIGKILL (or after a long fallback so a runaway test cleans up).
@@ -167,6 +175,41 @@ func TestSpawn_Timeout(t *testing.T) {
 	})
 	require.Error(t, err, "Spawn: got nil error; want timeout error")
 	assert.Contains(t, err.Error(), "did not become ready", `want substring "did not become ready"`)
+}
+
+// TestSpawn_TimeoutCarriesTheLogTail pins the half of the readiness failure that
+// used to be silent.
+//
+// Both failure branches kill the same expectation — the daemon never came up —
+// but only one of them used to say why. A child that EXITS is reported with 20
+// lines of its log; a child that is merely still trying was reported as "did not
+// become ready within 5s" and nothing else, and then killed, so its reason died
+// with it.
+//
+// That branch was harmless while the agent exited on a failed first
+// registration, because then it was the exit branch that ran. Now the agent
+// retries instead (#74), so an unreachable hub reaches the operator through
+// THIS branch and only this one. Without the tail, `hubfuse start -d` against a
+// down hub would report a timeout and hide the "cannot reach hub" line the
+// daemon had already written.
+func TestSpawn_TimeoutCarriesTheLogTail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "child.log")
+	pidPath := filepath.Join(dir, "child.pid")
+
+	t.Setenv("HUBFUSE_TEST_ROLE", "retrying")
+
+	err := Spawn(SpawnOpts{
+		LogPath:      logPath,
+		PIDFilePath:  pidPath,
+		ReadyTimeout: 500 * time.Millisecond,
+	})
+	require.Error(t, err, "Spawn: got nil error; want timeout error")
+	assert.Contains(t, err.Error(), "did not become ready",
+		"the timeout itself must still be reported")
+	assert.Contains(t, err.Error(), "cannot reach hub",
+		"the daemon's own account of the failure must survive being killed — "+
+			"without it the operator is told only that nothing happened")
 }
 
 func TestSpawn_RemovesDaemonFlag(t *testing.T) {
