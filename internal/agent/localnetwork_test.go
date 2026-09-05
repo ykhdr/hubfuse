@@ -139,29 +139,43 @@ func TestIsLocalNetworkAddress(t *testing.T) {
 	}
 }
 
-// TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed pins the three facts
-// that took a live reproduction to establish and that no amount of reading the
-// error would reveal: the block is per binary, an SSH-started daemon can never
-// be approved, and that the decision follows the path so a rebuild is not a way out.
-func TestLocalNetworkDenialMessage_SaysWhatCannotBeGuessed(t *testing.T) {
-	for _, evidence := range []string{localNetworkEvidenceStreak, localNetworkEvidenceStartup} {
-		assertDenialMessageIsActionable(t, localNetworkDenialMessage(evidence))
-	}
-}
+// TestLocalNetworkDenialMessage_SaysWhatIsTrue pins both halves of a message
+// that was rewritten because it was wrong, not because it was unclear.
+//
+// The positive half is what a live reproduction established and no amount of
+// reading "no route to host" would reveal: that the drop is NECP policy rather
+// than routing, that the daemon is retrying rather than dead, and that Apple
+// documents a machine-wide escape hatch.
+//
+// The negative half matters more, and is the reason this test lists forbidden
+// strings at all. The previous message told operators to approve hubfuse under
+// System Settings — an entry that cannot exist for a binary with no bundle
+// identifier, as `nehelper: Could not find bundle ID or display name` says
+// outright — and asserted that the decision follows the path, which was never
+// isolated from launch context. Both shipped. An assertion of ABSENCE is the
+// only kind that would have caught them coming back.
+func TestLocalNetworkDenialMessage_SaysWhatIsTrue(t *testing.T) {
+	msg := strings.ToLower(localNetworkDenialMessage(localNetworkEvidenceStreak))
 
-func assertDenialMessageIsActionable(t *testing.T, raw string) {
-	t.Helper()
-	msg := strings.ToLower(raw)
+	assert.Contains(t, msg, "necp", "the mechanism has a name in the kernel log; using it is the "+
+		"difference between a diagnosis and a guess")
+	assert.Contains(t, msg, "retrying", "the daemon no longer dies on this, and an operator who "+
+		"thinks it did will go restart something that is already recovering")
+	assert.Contains(t, msg, "prompt", "allowing the prompt is the one action that reliably works")
+	assert.Contains(t, msg, "tn3179", "the CIDR keys are attributed, not asserted — this project "+
+		"has not tested them, and Apple documents them only for 169.254.0.0/16")
+	assert.Contains(t, msg, "com.apple.network.local-network")
 
-	assert.Contains(t, msg, "per binary")
-	assert.Contains(t, msg, "ssh")
-	assert.Contains(t, msg, "install-agent", "the message must name the command that fixes it")
-	assert.Contains(t, msg, "local network", "and the settings pane, for anyone who missed the prompt")
-	// See launchagent_test.go: the "a rebuild voids the approval" claim this
-	// used to pin was measured false after it shipped. The decision follows the
-	// path, so the actionable instruction is to clear it, not to reinstall.
-	assert.Contains(t, msg, "path")
-	assert.Contains(t, msg, "rebuilding hubfuse in place does not produce a fresh prompt")
+	// Retracted claims. Both were shipped, and both misled the repo owner.
+	assert.NotContains(t, msg, "per binary",
+		"the grant was never shown to be keyed to the binary")
+	assert.NotContains(t, msg, "follows the path",
+		"nor to the path — every comparison that produced that also changed the launch context")
+	assert.NotContains(t, msg, "approve hubfuse under",
+		"a bare Mach-O has no bundle identifier, so there is no entry to approve")
+	assert.NotContains(t, msg, "install-agent",
+		"install-agent installs a LaunchAgent, and TN3179 lists launchd AGENTS as the one "+
+			"launchd case that is NOT exempt — recommending it as the fix pointed the wrong way")
 }
 
 // TestRegisterAndSubscribe_KeepsRetryingAndNamesAPersistentDenial replaces two
@@ -291,7 +305,11 @@ func TestReconnectSession_NamesLocalNetworkDenialOnceAfterAStreak(t *testing.T) 
 	d.reconnectSession(ctx)
 
 	logged := buf.String()
-	assert.Equal(t, 1, strings.Count(logged, "install-agent"),
+	// The marker is the message's own opening phrase. It used to be
+	// "install-agent", which stopped being a marker when that instruction was
+	// removed: TN3179 lists launchd AGENTS as the one launchd case that is NOT
+	// automatically exempt, so recommending install-agent pointed the wrong way.
+	assert.Equal(t, 1, strings.Count(logged, "denied local-network access by macOS"),
 		"the denial must be named exactly once no matter how long the outage runs")
 	assert.Contains(t, logged, "level=ERROR")
 }
