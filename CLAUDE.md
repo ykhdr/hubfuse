@@ -14,7 +14,7 @@ every plan the branch completes, including any rework plan that superseded the o
 
 ## Project
 
-HubFuse is a network file sharing system for local networks. Devices mount remote directories transparently via SSHFS, coordinated by a central gRPC hub server. Written in Go 1.25.
+HubFuse is a network file sharing system for local networks. Devices mount remote directories transparently via SSHFS, coordinated by a central gRPC hub server. Written in Go 1.26 — the floor is set by `golang.org/x/crypto` v0.56.0, which is the release that fixes two DoS advisories reachable from the agent's SSH server (issue #107); it cannot be lowered without reopening those.
 
 ## Build & Test Commands
 
