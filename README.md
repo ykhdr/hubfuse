@@ -13,7 +13,7 @@ All communication is secured with mTLS. Devices pair using short-lived invite co
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.26+
 - `protoc` with `protoc-gen-go` and `protoc-gen-go-grpc` (for proto regeneration only)
 - `sshfs` installed on agent machines (see [Installing the mount tool](#installing-the-mount-tool))
 
