@@ -135,11 +135,16 @@ func Spawn(opts SpawnOpts) error {
 			// used to be missing. A daemon that exits during startup at least
 			// prints its reason as the process's last act; one that is still
 			// running when the deadline passes is killed by us, so the only
-			// account of what it was doing is the log. Since the agent stopped
-			// exiting on a failed first registration and started retrying
-			// instead, this branch — not the exit branch — is where an
-			// unreachable hub now surfaces, and "did not become ready within 5s"
-			// alone would say nothing about why. (#74)
+			// account of what it was doing is the log.
+			//
+			// The agent no longer reaches this branch for an unreachable hub —
+			// it signals readiness once its first session attempt returns, so a
+			// down hub now lands on the SUCCESS path and retries in the
+			// background (#102). What is left here is the genuinely stuck
+			// startup: a hub that black-holes packets for longer than the
+			// caller's budget, or a daemon wedged before readiness. Those are
+			// exactly the cases where "did not become ready within Ns" alone
+			// would say nothing about why. (#74, #102)
 			return fmt.Errorf("daemon did not become ready within %s (check %s)\n%s",
 				opts.ReadyTimeout, absLogPath, tailFile(absLogPath, 20))
 		}

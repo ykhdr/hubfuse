@@ -31,9 +31,17 @@ type OnlineDevice struct {
 
 // DaemonOptions configures a Daemon at construction time.
 type DaemonOptions struct {
-	// OnReady, if non-nil, is invoked exactly once by Run, immediately
-	// after successful Register with the hub. The cmd layer uses this
-	// hook to write the PID file.
+	// OnReady, if non-nil, is invoked exactly once for the process, at the
+	// moment the daemon commits to running. The cmd layer uses it to write the
+	// PID file.
+	//
+	// "Commits to running" is not "registered with the hub", and the difference
+	// is deliberate (#102): a daemon retrying an unreachable hub is running, and
+	// while this fired only on an accepted Register such a daemon had no PID
+	// file — so `hubfuse stop` and `hubfuse status` reported it as not running
+	// and `hubfuse start -d` killed it after its readiness timeout. It still
+	// does NOT fire for a device the hub REFUSES: that daemon exits, and #69
+	// requires it to leave nothing behind.
 	OnReady func()
 }
 
@@ -83,24 +91,37 @@ type Daemon struct {
 	onReady func()
 
 	// readyOnce guards onReady so it fires exactly once for the daemon's
-	// lifetime. The supervisor re-runs sessionOnce on every reconnect, but the
-	// PID-file hook (onReady) must run only on the first successful Register.
+	// lifetime. What it now signals is "this daemon is committed to running" —
+	// NOT "the hub accepted a Register", which is what it used to mean and what
+	// everRegistered still means. The two came apart when the daemon started
+	// retrying instead of exiting (#102): a daemon spending minutes in the retry
+	// loop is a running daemon, and while onReady was tied to registration it
+	// had no PID file, so `hubfuse stop` and `hubfuse status` reported it as not
+	// running and `hubfuse start -d` killed it outright.
+	//
+	// It is fired from exactly two places, and readyOnce is what makes them one
+	// event: sessionOnce on an accepted Register, and registerAndSubscribe just
+	// before it enters the retry loop. Both sit BELOW the ErrHubRejected branch,
+	// so a device the hub refuses still reaches neither and still leaves no PID
+	// file behind — the #69 property, carried by a different mechanism than
+	// before and therefore worth its own assertion.
 	readyOnce sync.Once
 
 	// everRegistered records whether the hub has ever ACCEPTED a Register from
-	// this process. It is set inside readyOnce, so it means exactly what the
-	// PID file means, and it is set even when onReady is nil (tests, and any
-	// caller that wants no PID hook).
+	// this process. It is deliberately NOT the same event as readyOnce any more
+	// (see above), and its readers must not drift back into treating it as
+	// "ready": both of them ask a question only an accepted Register answers.
 	//
-	// It exists for one branch: the daemon can now be stopped while it is still
-	// retrying its first session, and what a clean stop has to do there depends
-	// entirely on this flag. With no accepted Register there is nothing to
-	// deregister and the hub may well be unreachable — calling Shutdown would
-	// fail its Deregister, aggregate the error, and exit non-zero, which under
-	// the LaunchAgent's KeepAlive would relaunch the daemon we were asked to
-	// stop. With an accepted Register (Register ok, Subscribe failed, back into
-	// the loop) the PID file exists, the heartbeat runs, mounts were made and
-	// the hub has this device online — that needs the ordinary Shutdown. (#74)
+	//   - Run's clean-stop branch: is a Deregister owed? With no accepted
+	//     Register there is nothing to deregister, and Deregister against an
+	//     unreachable hub would fail, aggregate, and exit non-zero — which under
+	//     the LaunchAgent's KeepAlive would relaunch the daemon we were asked to
+	//     stop.
+	//   - reconnectSession's log wording: "established" for a first-ever session
+	//     versus "re-established" for a restored one.
+	//
+	// It is a monotonic latch, so the repeated Store on every later session is
+	// harmless. (#74, #102)
 	everRegistered atomic.Bool
 
 	// sessionCancel ends the current hub session's event stream and
@@ -730,8 +751,9 @@ func (d *Daemon) connect(ctx context.Context) error {
 // the wrong process. Reproduced in 0.71s on a squatted port. (#90)
 //
 // A daemon that cannot bind has nothing to serve, so this returns the error and
-// Run aborts — the #69 precedent, and the reason no PID file is left behind
-// (onReady fires inside sessionOnce, which is never reached). See SSHServer.Listen
+// Run aborts — the #69 precedent, and the reason no PID file is left behind: the
+// daemon signals readiness only once it reaches the hub session, which a failed
+// bind never lets it do. See SSHServer.Listen
 // for why there is no retry: the transient bind failure that would justify one
 // does not exist in this codebase, and that was measured rather than assumed.
 //
@@ -829,6 +851,15 @@ func (d *Daemon) registerAndSubscribe(ctx context.Context) (pb.HubFuse_Subscribe
 
 	d.logger.Warn("first hub session failed, retrying", "error", err)
 
+	// The daemon is now committed to running: it owns its SSH port, its mount
+	// targets are guarded, and it will keep asking the hub until told to stop.
+	// Signalling readiness HERE rather than at the SSH bind is what keeps the
+	// #69 property intact — a device the hub REFUSES returns above and never
+	// reaches this line, so it still leaves no PID file and `hubfuse start -d`
+	// still reports the refusal instead of printing "started" for a process
+	// that is about to exit. (#102)
+	d.markReady()
+
 	// reconnectSession blocks until it succeeds or ctx is cancelled, so it runs
 	// on its own goroutine to leave this one free to watch sshDied. Run's
 	// deferred cancel is what ends it on every exit path below.
@@ -902,17 +933,12 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	// queue behind it. (#69)
 	d.startHeartbeat(ctx)
 
-	// onReady is optional (nil in tests and when the cmd layer wants no PID
-	// hook), so guard the nil case inside the Once — a bare Do(d.onReady) would
-	// panic on a nil func. Note this runs only after a Register the hub
-	// ACCEPTED: a refused registration returns above, so no PID file is written
-	// for a daemon the hub does not know. (#69)
-	d.readyOnce.Do(func() {
-		d.everRegistered.Store(true)
-		if d.onReady != nil {
-			d.onReady()
-		}
-	})
+	// The hub has accepted a Register. That is what everRegistered means, and it
+	// is recorded on its own rather than inside markReady's Once: the two events
+	// are no longer the same one, and a daemon that reached readiness through
+	// the retry loop must not be recorded as registered. (#102)
+	d.everRegistered.Store(true)
+	d.markReady()
 
 	d.processInitialDevices(regResp.DevicesOnline)
 
@@ -933,6 +959,20 @@ func (d *Daemon) sessionOnce(ctx context.Context) (pb.HubFuse_SubscribeClient, e
 	}
 
 	return stream, nil
+}
+
+// markReady signals that this daemon is committed to running, firing the cmd
+// layer's PID-file hook exactly once for the process.
+//
+// onReady is optional (nil in tests and when the cmd layer wants no PID hook),
+// so the nil case is guarded INSIDE the Once — a bare Do(d.onReady) would panic
+// on a nil func.
+func (d *Daemon) markReady() {
+	d.readyOnce.Do(func() {
+		if d.onReady != nil {
+			d.onReady()
+		}
+	})
 }
 
 // subscribeWithBudget opens the event stream under a deadline on its
