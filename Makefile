@@ -1,4 +1,4 @@
-.PHONY: proto-gen build test test-unit test-integration test-cli test-scenarios test-race vet lint clean install release-snapshot release-check
+.PHONY: proto-gen build test test-unit test-integration test-cli test-scenarios test-race vet vulncheck lint clean install release-snapshot release-check
 
 proto-gen:
 	protoc --go_out=. --go-grpc_out=. --go_opt=paths=source_relative --go-grpc_opt=paths=source_relative proto/hubfuse.proto
@@ -40,6 +40,19 @@ test-scenarios:
 
 test-race:
 	go test -race ./internal/agent/... -timeout 300s
+
+# govulncheck reports only advisories whose vulnerable code is REACHABLE from
+# ours, which is what makes it worth a CI job of its own: it found three that
+# Dependabot's alerts and its own PR both missed (see #107, #110).
+#
+# The TOOL is pinned; the vulnerability database is not. govulncheck fetches
+# vuln.go.dev at scan time, so a pinned binary still sees advisories published
+# after it — pinning buys a reproducible analyser and stops a tool release from
+# reddening a PR that changed nothing, without freezing detection. Verified
+# rather than assumed: v1.1.4 run against the pre-#107 tree reports the same
+# three advisories that @latest did.
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
 vet:
 	go vet ./...
