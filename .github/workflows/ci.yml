@@ -55,6 +55,43 @@ jobs:
       - name: Run go vet
         run: make vet
 
+  vulncheck:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Its own job, not folded into Vet or Lint, so a security finding is never
+      # read as a style failure.
+      #
+      # It earns the slot on measured grounds, not principle. On 2026-09-05 it
+      # reported three advisories against golang.org/x/crypto as reachable — two
+      # of them DoS on ssh.NewServerConn, the path every incoming SSHFS
+      # connection takes on a port the agent exposes to the LAN — while the
+      # Dependabot alert list showed none for that module (they are Go-vulndb
+      # GO-2026-* entries, not GHSA) and the Dependabot PR that did exist
+      # targeted a version that fixed only the one advisory that did NOT apply
+      # to us. Three mechanisms, three answers; this is the one that was right.
+      #
+      # It is also the only one that answers the question that matters — is the
+      # vulnerable code reachable from ours — which is what let #107 rule out
+      # GO-2026-6303 with a reason instead of bumping and hoping.
+      #
+      # Blocking, deliberately: #89 and #107 both existed because nothing was
+      # watching. The cost is that an upstream advisory with no fix released can
+      # redden a PR that changed nothing. When that happens the answer is to fix
+      # the exposure or record why it does not apply — not to make this job
+      # advisory. govulncheck already exits 0 for a module-level advisory in code
+      # we never call, which is the common shape of an unfixable one: GO-2026-5932
+      # (x/crypto/openpgp, unmaintained, no fix version) sits in the tree today
+      # and does not fail this job.
+      - name: Run govulncheck
+        run: make vulncheck
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
