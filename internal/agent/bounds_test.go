@@ -261,6 +261,10 @@ func TestConfigReloadPublishIsBounded(t *testing.T) {
 	t.Parallel()
 
 	d, cfgPath := buildTestDaemon(t)
+	// The bounded publish only happens for a daemon the hub has registered;
+	// before that, onConfigChange skips the RPC entirely (#103). This test is
+	// about the DEADLINE on that call, so it establishes the precondition.
+	d.everRegistered.Store(true)
 
 	got := make(chan context.Context, 1)
 	d.updateSharesFn = func(ctx context.Context, _ []*pb.Share) error {
