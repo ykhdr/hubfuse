@@ -72,6 +72,7 @@ func rootCmd() *cobra.Command {
 		shareCmd,
 		mountCmd,
 		installAgentCmd(),
+		installServiceCmd(),
 		versionCmd(),
 	)
 	return cmd

@@ -192,6 +192,51 @@ code-signed are killed on launch by macOS 26 (`Killed: 9`, with no output). A
 binary you built yourself locally is signed by the toolchain; one copied from
 elsewhere may not be, and `codesign -f -s - ./hubfuse` fixes it.
 
+### Running the hub and agent on Linux
+
+Neither binary survives a reboot on its own. `hubfuse start --daemon` detaches
+but dies with the machine, so both ship a command that writes a systemd **user**
+unit:
+
+```bash
+hubfuse-hub install-service      # writes ~/.config/systemd/user/hubfuse-hub.service
+hubfuse install-service          # writes ~/.config/systemd/user/hubfuse-agent.service
+
+systemctl --user daemon-reload
+systemctl --user enable --now hubfuse-hub.service
+systemctl --user enable --now hubfuse-agent.service
+```
+
+**Then enable lingering, and treat it as part of the installation rather than an
+option:**
+
+```bash
+loginctl enable-linger $USER     # over SSH this usually needs sudo
+```
+
+A user manager stops when you log out. Without lingering the two `enable --now`
+commands above still report success and the services still run — right up to the
+next reboot, after which nothing starts and, if it was the hub, every device
+reads offline. Over SSH the command commonly needs `sudo`, because polkit has no
+active local session to authorise against.
+
+They are user units rather than system units because both processes are per-user
+by construction: the agent mounts into your home directory and holds your SSH
+keys, and the hub keeps its store in `~/.hubfuse-hub`.
+
+Logs go to the journal rather than to a file — note the difference from macOS,
+where the LaunchAgent writes `~/.hubfuse/agent.log`:
+
+```bash
+journalctl --user -u hubfuse-agent.service -f
+journalctl --user -u hubfuse-hub.service -f
+```
+
+Restarting the agent is safe for live mounts. The unit sets `KillMode=mixed`, so
+`systemctl --user restart` signals only the daemon and lets it unmount its own
+shares in order; systemd's default would signal the whole control group and tear
+`sshfs` down underneath it, leaving `Transport endpoint is not connected` behind.
+
 ### Prebuilt binaries
 
 If you don't have Go, prebuilt binaries are published on the project's

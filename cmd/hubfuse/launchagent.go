@@ -156,7 +156,7 @@ func installAgentCmd() *cobra.Command {
 func runInstallAgent(out interface{ Write([]byte) (int, error) }, goos string, force bool) error {
 	if goos != "darwin" {
 		return fmt.Errorf("install-agent is macOS-only (this is %s); "+
-			"on Linux run the daemon under systemd or start it with \"hubfuse start --daemon\"", goos)
+			"on Linux run \"hubfuse install-service\" to install a systemd user unit", goos)
 	}
 
 	execPath, err := os.Executable()
