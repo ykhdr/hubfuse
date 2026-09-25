@@ -121,6 +121,11 @@ If it happens, the agent says so once, at error level, naming the hub as too
 old. Upgrading the hub is the fix; agents do not need to be downgraded or
 restarted in any particular order afterwards.
 
+`HUBFUSE_MOUNT_VERIFY_TIMEOUT` (default 10s) bounds how long the agent waits for a
+mount point to appear before calling the attempt failed. Raise it if your storage
+or network is slow enough that legitimate mounts are being reported as failures;
+there is no reason to lower it.
+
 One related setting: leave `HUBFUSE_HEARTBEAT_INTERVAL` alone unless you have a
 reason. Anything at or above 30 seconds exceeds the hub's own liveness timeout,
 so the hub marks the device offline and peers unmount its shares — against any

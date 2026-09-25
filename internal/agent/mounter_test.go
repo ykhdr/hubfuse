@@ -2396,3 +2396,36 @@ func TestProbeGenerationLocked_StaleGenerationDiscarded(t *testing.T) {
 	// Exactly one checkMountpoint call total.
 	assert.Equal(t, int32(1), checkCalls.Load(), "exactly one checkMountpoint invocation (the stale probe)")
 }
+
+// TestMountVerifyTimeoutFromEnv covers the knob added for #85, including the
+// case a CI typo would produce.
+//
+// The default is deliberately the PRODUCTION value: a real sshfs has to finish
+// an SSH handshake and a FUSE mount, and a shorter budget would turn ordinary
+// latency into a spurious mount error. The override exists to raise it for the
+// scenario suite, where a stub competes with a hub, two daemons and the test
+// binary for a loaded runner's CPU.
+//
+// An unparseable or non-positive value must keep the default rather than
+// removing the bound: a zero or negative timeout would make every mount fail
+// instantly, and a typo in CI config must not do that silently.
+func TestMountVerifyTimeoutFromEnv(t *testing.T) {
+	const def = 10 * time.Second
+
+	cases := []struct {
+		name, raw string
+		want      time.Duration
+		why       string
+	}{
+		{"empty keeps the default", "", def, "an unset knob must not change production behaviour"},
+		{"a valid duration is used", "30s", 30 * time.Second, "the harness raises it for loaded runners"},
+		{"garbage keeps the default", "banana", def, "a CI typo must not remove the bound"},
+		{"zero keeps the default", "0s", def, "a zero budget would fail every mount instantly"},
+		{"negative keeps the default", "-5s", def, "same, and it is the likelier typo of the two"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, mountVerifyTimeoutFromEnv(c.raw, def, discardLogger()), c.why)
+		})
+	}
+}
