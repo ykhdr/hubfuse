@@ -21,7 +21,7 @@ const launchAgentLabel = "com.github.ykhdr.hubfuse"
 
 // launchAgentTemplate is the plist install-agent writes.
 //
-// Three fields are load-bearing and none is a style choice:
+// Four fields are load-bearing and none is a style choice:
 //
 //   - ProgramArguments carries the ABSOLUTE path of the binary, taken from
 //     os.Executable rather than from $PATH. The reason is no longer a claim
@@ -39,6 +39,16 @@ const launchAgentLabel = "com.github.ykhdr.hubfuse"
 //   - ThrottleInterval bounds what remains. launchd's default floor is 10s;
 //     30 makes a genuine crash loop cost two launches a minute rather than six,
 //     which is what kept #98's log growing without bound.
+//   - EnvironmentVariables sets PATH, without which this whole plist produces a
+//     daemon that cannot mount anything. launchd's default is
+//     /usr/bin:/bin:/usr/sbin:/sbin, and every FUSE backend lives outside it:
+//     fuse-t and macFUSE both install sshfs to /usr/local/bin, Homebrew on
+//     Apple silicon to /opt/homebrew/bin. mountBackends runs the bare name
+//     "sshfs", so the agent failed every mount with `exec: "sshfs": executable
+//     file not found in $PATH` while `hubfuse mount list` showed the entry as
+//     configured. It never surfaced in development because an interactive shell
+//     has a fuller PATH — only the LaunchAgent, the path README tells macOS
+//     users to take, was broken (#115).
 //
 // ProcessType Interactive keeps macOS from throttling it as a background batch
 // job; the agent has to answer the hub's heartbeat on a fixed cadence.
@@ -62,6 +72,11 @@ const launchAgentTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>StandardOutPath</key>

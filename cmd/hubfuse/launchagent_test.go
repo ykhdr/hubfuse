@@ -121,6 +121,47 @@ func TestInstallAgentNextSteps_SaysWhatIsTrue(t *testing.T) {
 		"a bare Mach-O has no bundle identifier, so there is no entry to approve")
 }
 
+// TestLaunchAgentPlist_CarriesAPathThatCanFindTheMountTool pins the key whose
+// absence made the documented macOS setup unusable.
+//
+// launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin. Every FUSE backend
+// lives outside it — fuse-t and macFUSE both install sshfs to /usr/local/bin,
+// Homebrew on Apple silicon to /opt/homebrew/bin — and mountBackends runs the
+// bare name "sshfs". So a LaunchAgent-managed daemon failed EVERY mount with
+// `exec: "sshfs": executable file not found in $PATH`, while `hubfuse mount
+// list` showed the mount as configured and nothing in the CLI said why (#115).
+//
+// It never showed up in development because an interactive shell has a fuller
+// PATH: only the path README tells macOS users to take was broken. That is
+// exactly the kind of gap a unit test can hold shut, so this asserts the
+// locations rather than merely that some PATH exists.
+func TestLaunchAgentPlist_CarriesAPathThatCanFindTheMountTool(t *testing.T) {
+	body, err := launchAgentPlist("/Users/alice/go/bin/hubfuse", "/Users/alice/.hubfuse/agent.log")
+	require.NoError(t, err)
+	plist := string(body)
+
+	assert.Contains(t, plist, "<key>EnvironmentVariables</key>",
+		"without this launchd hands the daemon its default PATH and no mount can ever start")
+	assert.Contains(t, plist, "/usr/local/bin",
+		"fuse-t and macFUSE both install sshfs here")
+	assert.Contains(t, plist, "/opt/homebrew/bin",
+		"Homebrew on Apple silicon installs here")
+	assert.Contains(t, plist, "/usr/bin:/bin:/usr/sbin:/sbin",
+		"launchd's own default must be kept, not replaced — everything else the daemon "+
+			"shells out to still lives there")
+
+	// Parsed, not just grepped: launchd silently ignores a plist it cannot
+	// read, so a malformed dict here would turn the agent off with no error.
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		_, tokErr := dec.Token()
+		if tokErr != nil {
+			require.ErrorContains(t, tokErr, "EOF", "the plist must stay well-formed XML")
+			break
+		}
+	}
+}
+
 // TestLaunchAgentPlist_DoesNotRestartACleanStop pins the half of #98 that made
 // `hubfuse stop` a no-op.
 //
