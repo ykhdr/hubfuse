@@ -48,11 +48,16 @@ test-race:
 # The TOOL is pinned; the vulnerability database is not. govulncheck fetches
 # vuln.go.dev at scan time, so a pinned binary still sees advisories published
 # after it — pinning buys a reproducible analyser and stops a tool release from
-# reddening a PR that changed nothing, without freezing detection. Verified
-# rather than assumed: v1.1.4 run against the pre-#107 tree reports the same
-# three advisories that @latest did.
+# reddening a PR that changed nothing, without freezing detection.
+#
+# The pin must track the project's Go floor, which the first one did not:
+# v1.1.4 bundles x/tools v0.29.0, which predates Go 1.26 and PANICS building
+# SSA against it — deterministically, three stack traces per run. Raising the
+# floor to 1.26 for x/crypto (#107) therefore broke this target, and the break
+# was invisible until the scan had something to report. When the Go floor moves
+# again, re-check this version.
 vulncheck:
-	go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+	go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
 vet:
 	go vet ./...
