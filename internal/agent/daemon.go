@@ -596,6 +596,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// immediately. (#49 guard-target)
 	d.guardConfiguredTargets()
 
+	// Ahead of registration on purpose: see startConfigWatcher. A config edit
+	// made while the daemon is still looking for the hub has to be seen, not
+	// lost. (#103)
+	d.startConfigWatcher(ctx)
+
 	stream, err := d.registerAndSubscribe(ctx)
 	if err != nil {
 		return err
@@ -1462,13 +1467,50 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 	}
 }
 
-// runServices starts the mount-health monitor (#67) and the config watcher,
-// then blocks until ctx is cancelled — or until the embedded SSH server dies —
+// startConfigWatcher begins watching the config file. It runs from Run BEFORE
+// registration, and that ordering is the whole point.
+//
+// It used to live in runServices, which Run reaches only once a hub session
+// exists. fsnotify reports only events that happen after watching begins, so an
+// edit made before then was not delayed — it was lost, with nothing to replay
+// it, and the daemon went on running the config it loaded at startup. Since #74
+// that window has no bound: a daemon whose hub is unreachable retries
+// indefinitely instead of exiting, and the watcher's start was deferred with it.
+// The same gap made `tests/scenarios` flaky, because the harness waits for the
+// `ssh server listening` line — emitted before registration — and then writes
+// config (#85, #103).
+//
+// A failure to create the watcher is a Warn rather than fatal: the daemon still
+// serves the config it has, which is strictly better than not starting.
+func (d *Daemon) startConfigWatcher(ctx context.Context) {
+	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
+	if err != nil {
+		d.logger.Warn("could not start config watcher", "error", err)
+		return
+	}
+	d.watcher = watcher
+	go func() {
+		if err := watcher.Start(ctx); err != nil {
+			d.logger.Warn("config watcher stopped", "error", err)
+		}
+	}()
+	d.logger.Info("config watcher started")
+}
+
+// runServices starts the mount-health monitor (#67), then blocks until ctx is
+// cancelled — or until the embedded SSH server dies —
 // before shutting down. The heartbeat loop is normally already running —
 // sessionOnce starts it as soon as the hub accepts the registration, well
 // before this point (#69) — and startHeartbeat is idempotent, so asking again
-// here costs nothing and keeps this the single place that guarantees every
-// background service is up.
+// here costs nothing.
+//
+// The config watcher used to start here too and deliberately does not any more:
+// runServices is unreachable until the first hub session exists, so a config
+// edit made before that was not delayed but LOST — fsnotify reports only events
+// that occur after watching begins, and nothing replays them. Since #74 that
+// window is unbounded, because the daemon now waits for an unreachable hub
+// instead of exiting. startConfigWatcher runs from Run, ahead of registration
+// (#103).
 //
 // Waiting on sshDied alongside ctx is what makes the SSH server's liveness part
 // of what the daemon REPORTS rather than something it merely logs. A daemon
@@ -1495,18 +1537,6 @@ func (d *Daemon) supervise(ctx context.Context, stream pb.HubFuse_SubscribeClien
 func (d *Daemon) runServices(ctx context.Context, stopAll context.CancelFunc) error {
 	d.startHeartbeat(ctx)
 	go d.runMountMonitor(ctx)
-
-	watcher, err := agentconfig.NewWatcher(d.configPath, d.onConfigChange)
-	if err != nil {
-		d.logger.Warn("could not start config watcher", "error", err)
-	} else {
-		d.watcher = watcher
-		go func() {
-			if err := watcher.Start(ctx); err != nil {
-				d.logger.Warn("config watcher stopped", "error", err)
-			}
-		}()
-	}
 
 	select {
 	case <-ctx.Done():

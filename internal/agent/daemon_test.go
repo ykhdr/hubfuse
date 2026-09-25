@@ -712,6 +712,12 @@ func TestOnConfigChange_MountsRemoved(t *testing.T) {
 // shares. The seam captures d.config exactly when the publish fires. (#61)
 func TestOnConfigChange_SwapsConfigBeforePublishingShares(t *testing.T) {
 	d, _ := buildTestDaemon(t)
+	// The publish path this test is about only runs once the hub has accepted a
+	// Register. Since the config watcher moved ahead of registration (#103), a
+	// daemon that has never registered skips the RPC instead of spending a
+	// deadline on a connection that has never completed a call — so the
+	// precondition has to be established rather than assumed.
+	d.everRegistered.Store(true)
 
 	oldCfg := &agentconfig.Config{
 		Shares: []agentconfig.ShareConfig{

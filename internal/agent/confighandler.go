@@ -37,12 +37,28 @@ func (d *Daemon) onConfigChange(old, new *agentconfig.Config) {
 		// share list, so the hub converges on the next session either way. The
 		// deadline is bounded here, at the caller, so the seam that unit tests
 		// replace still sees exactly the context this path uses. (#77)
-		shares := configSharesToProto(new.Shares)
-		updCtx, cancel := context.WithTimeout(context.Background(), updateSharesTimeout)
-		err := d.updateSharesFn(updCtx, shares)
-		cancel()
-		if err != nil {
-			d.logger.Error("failed to update shares on hub", "error", err)
+		//
+		// Unless the hub has never accepted a Register at all. Since the watcher
+		// moved ahead of registration (#103) this path can run while the daemon
+		// is still looking for the hub, and then the RPC is not merely likely to
+		// fail — it is certain to, on a connection that has never completed a
+		// call. Attempting it would spend the deadline and log an Error about a
+		// condition that is expected and self-correcting, which is precisely the
+		// noise #73 exists to stop. Skipping is free: the config swap above
+		// already happened, so the first Register that succeeds carries these
+		// shares. everRegistered is the exact predicate, and it is the one added
+		// for the stop path in #102.
+		if d.everRegistered.Load() {
+			shares := configSharesToProto(new.Shares)
+			updCtx, cancel := context.WithTimeout(context.Background(), updateSharesTimeout)
+			err := d.updateSharesFn(updCtx, shares)
+			cancel()
+			if err != nil {
+				d.logger.Error("failed to update shares on hub", "error", err)
+			}
+		} else {
+			d.logger.Debug("shares changed before the first registration; " +
+				"the first Register will carry them")
 		}
 		// Push ACL snapshot to the SSH server and surface any shares that
 		// the new secure defaults would make inaccessible.
