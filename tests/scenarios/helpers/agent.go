@@ -283,6 +283,13 @@ func (a *Agent) prepareDaemonRun(t *testing.T) []string {
 		"HOME=" + a.HomeDir,
 		"PATH=" + stubDir + ":" + existingPath(),
 		"HUBFUSE_STUB_MOUNT_DIR=" + a.StubMountDir,
+		// Raise the mount-verify budget for the suite rather than lowering the
+		// product's. The default 10s is right for a real sshfs; here a stub is
+		// competing with a hub, two daemons and the test binary for a CI
+		// runner's CPU, and fork+exec+write can miss a budget it would never
+		// miss on idle hardware — which is what made TestMonitorRemountsDeadMount
+		// flaky (#85). Tests that need a mount to FAIL fast set their own value.
+		"HUBFUSE_MOUNT_VERIFY_TIMEOUT=30s",
 	}
 	return append(daemonEnv, a.envExtra...)
 }
@@ -448,6 +455,7 @@ func (a *Agent) launchDaemon(t *testing.T) {
 	// and wait for one MORE below. Waiting for "at least one" would be satisfied
 	// by the previous run's line and would make RestartDaemon's check vacuous.
 	sshListeningSeen := strings.Count(a.logBuf.String(), sshListeningLine)
+	watcherSeen := strings.Count(a.logBuf.String(), configWatcherLine)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, AgentBinaryPath, "start")
@@ -470,12 +478,31 @@ func (a *Agent) launchDaemon(t *testing.T) {
 	// SSH server that said so.
 	WaitForPort(t, a.SSHPort, 5*time.Second)
 	a.WaitForDaemonLogCount(t, sshListeningLine, sshListeningSeen+1, 5*time.Second)
+
+	// And until the config watcher exists, because StartDaemon's very next act is
+	// to write config.kdl. fsnotify reports only events that happen after
+	// watching begins, so a write that lands first is LOST, not delayed — the
+	// share never reaches the SSH server's ACL map and every waiter for it times
+	// out against an empty listing. That is what made TestACL_ReadOnlyRejectsWrites
+	// flaky on loaded runners (#85).
+	//
+	// Waiting for the SSH line alone was never enough: startSSH emits it, and the
+	// watcher starts after it. #103 moved the watcher ahead of REGISTRATION, which
+	// shrank the window from "until the hub answers" to a few microseconds — but a
+	// window a test merely usually wins is the definition of a flake, so the
+	// harness waits for the thing it actually depends on.
+	a.WaitForDaemonLogCount(t, configWatcherLine, watcherSeen+1, 10*time.Second)
 }
 
 // sshListeningLine is what the agent's embedded SSH server logs once it has the
 // port. It is the harness's proof that the listener on a.SSHPort belongs to
 // this daemon rather than to whatever else happens to be there. (#90)
 const sshListeningLine = "ssh server listening"
+
+// configWatcherLine is what the agent logs once fsnotify is watching the config
+// file. It is the harness's proof that a config write will be SEEN rather than
+// silently missed — see launchDaemon. (#85, #103)
+const configWatcherLine = "config watcher started"
 
 // Stop signals the daemon to exit and waits up to 5s for it to do so.
 // Idempotent — safe to call multiple times.

@@ -338,6 +338,46 @@ type Mounter struct {
 	mountVerifyInterval time.Duration
 }
 
+// mountVerifyTimeoutEnv and defaultMountVerifyTimeout bound how long Mount waits
+// for a mountpoint to appear before calling the attempt failed.
+//
+// Ten seconds is right for production: a real sshfs has to complete an SSH
+// handshake and a FUSE mount, and failing faster would turn ordinary latency
+// into a spurious mount error. The knob exists for the other direction — a CI
+// runner where the scenario suite's stub-sshfs competes for CPU with a hub, two
+// daemons and the test binary, and `fork`+`exec`+write can miss a ten-second
+// budget it would never miss on idle hardware. That is what made
+// TestMonitorRemountsDeadMount flaky (#85): the mount was attempted and simply
+// did not finish in time.
+//
+// It is a test handle in the same spirit as HUBFUSE_MOUNT_MONITOR_INTERVAL and
+// HUBFUSE_STUB_MOUNT_DIR — raising it in the harness rather than lowering the
+// product's own guarantee. An unparseable value keeps the default and says so,
+// because a typo in CI config must not silently remove the bound.
+const (
+	mountVerifyTimeoutEnv     = "HUBFUSE_MOUNT_VERIFY_TIMEOUT"
+	defaultMountVerifyTimeout = 10 * time.Second
+)
+
+// mountVerifyTimeoutFromEnv parses the override, falling back to def.
+func mountVerifyTimeoutFromEnv(raw string, def time.Duration, logger *slog.Logger) time.Duration {
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		if logger != nil {
+			logger.Warn("invalid "+mountVerifyTimeoutEnv+"; using default",
+				"value", raw,
+				"default", def,
+				"error", err,
+			)
+		}
+		return def
+	}
+	return d
+}
+
 // NewMounter creates a new Mounter. mountTool selects the mount backend
 // ("sshfs" default, or "fuse-t"); an empty or unknown value falls back to the
 // "sshfs" profile (see resolveBackend).
@@ -372,7 +412,7 @@ func NewMounter(keyPath, knownDevicesDir, knownHostsDir, mountTool string, logge
 		execCommand:         exec.CommandContext,
 		unmount:             unmountFn,
 		checkMountpoint:     check,
-		mountVerifyTimeout:  10 * time.Second,
+		mountVerifyTimeout:  mountVerifyTimeoutFromEnv(os.Getenv(mountVerifyTimeoutEnv), defaultMountVerifyTimeout, logger),
 		mountVerifyInterval: 200 * time.Millisecond,
 	}
 }
