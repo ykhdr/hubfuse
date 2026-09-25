@@ -128,21 +128,21 @@ would be the vacuous kind.
 - Modify: `cmd/hubfuse/launchagent.go` (the refusal names the real command)
 - Modify: `cmd/hubfuse/launchagent_test.go` (it pins that refusal at `:85`)
 
-- [ ] write the unit template with `[Install] WantedBy=default.target`, `Restart=on-failure`,
+- [x] write the unit template with `[Install] WantedBy=default.target`, `Restart=on-failure`,
       `RestartSec=30`, `KillMode=mixed`, `Environment=PATH=…`, no `After=network-online.target`
-- [ ] each setting carries a comment stating what justifies it, with the PATH one saying the
+- [x] each setting carries a comment stating what justifies it, with the PATH one saying the
       narrow measured truth rather than the macOS story
-- [ ] `systemdEscapeExec` mirroring `xmlEscape`: double `%`, quote a path containing whitespace
-- [ ] `runInstallService(out, goos, force)` mirroring `runInstallAgent`'s seam; refuse on non-Linux
+- [x] `systemdEscapeExec` mirroring `xmlEscape`: double `%`, quote a path containing whitespace
+- [x] `runInstallService(out, goos, force)` mirroring `runInstallAgent`'s seam; refuse on non-Linux
       naming `install-agent` for darwin
-- [ ] `installServiceNextSteps`: `systemctl --user daemon-reload`, `enable --now`,
+- [x] `installServiceNextSteps`: `systemctl --user daemon-reload`, `enable --now`,
       `loginctl enable-linger` (noting it usually needs sudo over SSH — polkit has no active
       session there), and `journalctl --user -u` for logs
-- [ ] update `install-agent`'s Linux refusal to name `install-service`, keeping the literal word
+- [x] update `install-agent`'s Linux refusal to name `install-service`, keeping the literal word
       "systemd" so `launchagent_test.go:85` stays honest rather than being edited to match
-- [ ] tests: each setting pinned with its reason; `[Install]` pinned separately; escaping tested on
+- [x] tests: each setting pinned with its reason; `[Install]` pinned separately; escaping tested on
       a path with a space and with `%`; next-steps text pinned including the linger line
-- [ ] `go test ./cmd/...`
+- [x] `go test ./cmd/...`
 
 ### Task 2: `hubfuse-hub install-service`
 
@@ -151,27 +151,27 @@ would be the vacuous kind.
 - Create: `cmd/hubfuse-hub/systemdunit_test.go`
 - Modify: `cmd/hubfuse-hub/main.go`
 
-- [ ] same shape, with **no** `Environment=PATH=` and **no** `KillMode=mixed`: the hub shells out to
+- [x] same shape, with **no** `Environment=PATH=` and **no** `KillMode=mixed`: the hub shells out to
       nothing and spawns no children, and the test states that absence is deliberate so neither is
       added later by symmetry
-- [ ] `Restart=on-failure` + `RestartSec=30` for the #98 reason
-- [ ] next-steps mirroring Task 1
-- [ ] tests mirroring Task 1, including the two deliberate absences
-- [ ] `go test ./cmd/...`
+- [x] `Restart=on-failure` + `RestartSec=30` for the #98 reason
+- [x] next-steps mirroring Task 1
+- [x] tests mirroring Task 1, including the two deliberate absences
+- [x] `go test ./cmd/...`
 
 ### Task 3: Verify acceptance criteria
 
-- [ ] `make test`, `make vet`, `make vulncheck` green
-- [ ] `systemd-analyze --user verify` clean on both generated units
-- [ ] both commands refuse cleanly on darwin
+- [x] `make test`, `make vet`, `make vulncheck` green
+- [x] `systemd-analyze --user verify` clean on both generated units
+- [x] both commands refuse cleanly on darwin
 
 ### Task 4: [Final] Documentation
 
-- [ ] README: a Linux section beside the macOS one — the two commands, `enable-linger` with its sudo
+- [x] README: a Linux section beside the macOS one — the two commands, `enable-linger` with its sudo
       caveat, and `journalctl --user -u` for logs
-- [ ] CLAUDE.md: the settings and what justifies each, including the two deliberate absences and the
+- [x] CLAUDE.md: the settings and what justifies each, including the two deliberate absences and the
       corrected PATH rationale
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
